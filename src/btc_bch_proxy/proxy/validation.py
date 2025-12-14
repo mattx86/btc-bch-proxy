@@ -191,7 +191,10 @@ class ShareValidator:
             share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
             if share_key in self._recent_shares:
                 self.duplicates_rejected += 1
-                logger.warning(f"[{self.session_id}] Duplicate share rejected: job={job_id}")
+                logger.warning(
+                    f"[{self.session_id}] Duplicate share rejected: job={job_id}, "
+                    f"nonce={nonce}, version_bits={version_bits}"
+                )
                 return False, "Duplicate share"
 
         # Check for stale job (only if we have received at least one job)

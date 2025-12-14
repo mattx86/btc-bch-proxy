@@ -493,7 +493,10 @@ class MinerSession:
         # Record stats
         stats = ProxyStats.get_instance()
         if accepted:
-            logger.info(f"[{self.session_id}] Share accepted")
+            logger.info(
+                f"[{self.session_id}] Share accepted: job={job_id}, "
+                f"nonce={nonce}, version_bits={version_bits}"
+            )
             asyncio.create_task(stats.record_share_accepted(self._current_server))
         else:
             # Extract rejection reason from error
