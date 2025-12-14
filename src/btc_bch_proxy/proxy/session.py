@@ -193,7 +193,9 @@ class MinerSession:
                     logger.info(f"[{self.session_id}] Miner disconnected")
                     break
 
+                logger.debug(f"[{self.session_id}] Received from miner: {data.decode().strip()}")
                 messages = self._protocol.feed_data(data)
+                logger.debug(f"[{self.session_id}] Parsed {len(messages)} messages from miner")
                 for msg in messages:
                     await self._handle_miner_message(msg)
 
@@ -234,7 +236,9 @@ class MinerSession:
         Args:
             msg: Parsed stratum message.
         """
+        logger.debug(f"[{self.session_id}] Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
+            logger.info(f"[{self.session_id}] Miner request: {msg.method}")
             if msg.method == StratumMethods.MINING_SUBSCRIBE:
                 await self._handle_subscribe(msg)
             elif msg.method == StratumMethods.MINING_AUTHORIZE:
