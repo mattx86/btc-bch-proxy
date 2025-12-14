@@ -334,7 +334,7 @@ class UpstreamConnection:
         Raises:
             asyncio.TimeoutError: If response not received in time.
         """
-        if not self._writer:
+        if not self._writer or not self._reader:
             raise UpstreamConnectionError("Not connected")
 
         # Create future for response
@@ -343,12 +343,41 @@ class UpstreamConnection:
 
         # Send request
         msg = self._protocol.build_request(req_id, method, params)
+        logger.debug(f"Sending to {self.name}: {msg.decode().strip()}")
         self._writer.write(msg)
         await self._writer.drain()
 
         try:
-            # Wait for response
-            return await asyncio.wait_for(future, timeout=self.config.timeout)
+            # Read from socket while waiting for the response
+            deadline = asyncio.get_event_loop().time() + self.config.timeout
+            while not future.done():
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+
+                try:
+                    data = await asyncio.wait_for(
+                        self._reader.read(8192),
+                        timeout=min(remaining, 1.0),
+                    )
+                    if not data:
+                        raise UpstreamConnectionError("Connection closed by server")
+
+                    logger.debug(f"Received from {self.name}: {data.decode().strip()}")
+                    messages = self._protocol.feed_data(data)
+
+                    # Process responses to pending requests
+                    for recv_msg in messages:
+                        if isinstance(recv_msg, StratumResponse):
+                            pending_future = self._pending_requests.get(recv_msg.id)
+                            if pending_future and not pending_future.done():
+                                pending_future.set_result(recv_msg)
+
+                except asyncio.TimeoutError:
+                    # Just a read timeout, keep waiting if we have time left
+                    continue
+
+            return future.result()
         finally:
             self._pending_requests.pop(req_id, None)
 
