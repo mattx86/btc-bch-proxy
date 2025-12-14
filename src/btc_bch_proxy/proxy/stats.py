@@ -142,9 +142,26 @@ class ProxyStats:
 
         return " ".join(parts)
 
-    def log_stats(self) -> None:
-        """Log current statistics."""
+    async def log_stats(self) -> None:
+        """Log current statistics (async-safe)."""
         uptime = self.get_uptime()
+
+        # Copy stats under lock to avoid race conditions
+        async with self._lock:
+            current_miners = self.current_miners
+            total_connections = self.total_miner_connections
+            total_disconnections = self.total_miner_disconnections
+            server_stats_copy = {
+                name: ServerStats(
+                    name=stats.name,
+                    connections=stats.connections,
+                    reconnections=stats.reconnections,
+                    accepted_shares=stats.accepted_shares,
+                    rejected_shares=stats.rejected_shares,
+                    rejection_reasons=dict(stats.rejection_reasons),
+                )
+                for name, stats in self._server_stats.items()
+            }
 
         logger.info("=" * 60)
         logger.info(f"PROXY STATISTICS (uptime: {uptime})")
@@ -152,16 +169,16 @@ class ProxyStats:
 
         # Miner stats
         logger.info(
-            f"Miners: {self.current_miners} active | "
-            f"{self.total_miner_connections} total connections | "
-            f"{self.total_miner_disconnections} disconnections"
+            f"Miners: {current_miners} active | "
+            f"{total_connections} total connections | "
+            f"{total_disconnections} disconnections"
         )
 
         # Per-server stats
-        if not self._server_stats:
+        if not server_stats_copy:
             logger.info("No server statistics yet")
         else:
-            for name, stats in self._server_stats.items():
+            for name, stats in server_stats_copy.items():
                 logger.info("-" * 40)
                 logger.info(f"Server: {name}")
                 logger.info(
@@ -232,4 +249,4 @@ async def run_stats_logger(stop_event: asyncio.Event) -> None:
             break
         except asyncio.TimeoutError:
             # Time to log stats
-            stats.log_stats()
+            await stats.log_stats()

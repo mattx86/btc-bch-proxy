@@ -118,6 +118,29 @@ class FailoverConfig(BaseModel):
     )
 
 
+class ValidationConfig(BaseModel):
+    """Configuration for share validation."""
+
+    reject_duplicates: bool = Field(
+        default=True, description="Reject duplicate share submissions"
+    )
+    reject_stale: bool = Field(
+        default=True, description="Reject shares for stale/unknown jobs"
+    )
+    validate_difficulty: bool = Field(
+        default=False, description="Validate share meets difficulty target (requires hash computation)"
+    )
+    share_cache_size: int = Field(
+        default=1000, ge=100, description="Maximum recent shares to track per session"
+    )
+    share_cache_ttl: int = Field(
+        default=300, ge=60, description="Share cache TTL in seconds"
+    )
+    job_cache_size: int = Field(
+        default=10, ge=2, description="Maximum jobs to track per session"
+    )
+
+
 class Config(BaseModel):
     """Main configuration model."""
 
@@ -126,6 +149,7 @@ class Config(BaseModel):
     schedule: List[TimeFrame] = Field(..., min_length=1)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":

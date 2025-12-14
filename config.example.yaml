@@ -51,3 +51,12 @@ logging:
 # Failover settings
 failover:
   retry_timeout_minutes: 20       # Retry primary server for this long before failover
+
+# Share validation settings
+validation:
+  reject_duplicates: true         # Reject duplicate share submissions
+  reject_stale: true              # Reject shares for stale/unknown jobs
+  validate_difficulty: false      # Validate share hash meets difficulty (CPU intensive)
+  share_cache_size: 1000          # Max recent shares to track per session
+  share_cache_ttl: 300            # Share cache TTL in seconds
+  job_cache_size: 10              # Max jobs to track per session

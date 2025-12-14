@@ -17,6 +17,7 @@ from btc_bch_proxy.stratum.messages import (
 from btc_bch_proxy.stratum.protocol import StratumProtocol
 from btc_bch_proxy.proxy.upstream import UpstreamConnection
 from btc_bch_proxy.proxy.stats import ProxyStats
+from btc_bch_proxy.proxy.validation import ShareValidator
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -79,6 +80,9 @@ class MinerSession:
         # Client address
         peername = writer.get_extra_info("peername")
         self.client_addr = f"{peername[0]}:{peername[1]}" if peername else "unknown"
+
+        # Share validator
+        self._validator = ShareValidator(self.session_id, config.validation)
 
         logger.info(f"[{self.session_id}] New miner session from {self.client_addr}")
 
@@ -372,6 +376,27 @@ class MinerSession:
             + (f", version_bits={version_bits}" if version_bits else "")
         )
 
+        # Validate share locally before submitting
+        valid, reject_reason = self._validator.validate_share(
+            job_id=job_id,
+            extranonce2=extranonce2,
+            ntime=ntime,
+            nonce=nonce,
+            extranonce1=self._upstream.extranonce1,
+            version_bits=version_bits,
+        )
+
+        if not valid:
+            # Reject locally - don't forward to pool
+            error = [20, reject_reason, None]
+            logger.warning(f"[{self.session_id}] Share rejected locally: {reject_reason}")
+            stats = ProxyStats.get_instance()
+            asyncio.create_task(stats.record_share_rejected(self._current_server, reject_reason))
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error)
+            )
+            return
+
         # Submit to upstream
         accepted, error = await self._upstream.submit_share(
             worker_name, job_id, extranonce2, ntime, nonce, version_bits
@@ -424,8 +449,17 @@ class MinerSession:
                 await self._send_to_miner(data)
 
                 if msg.method == StratumMethods.MINING_NOTIFY:
+                    # Track job for validation
+                    self._validator.add_job_from_notify(msg.params)
                     logger.debug(f"[{self.session_id}] Job notification forwarded")
                 elif msg.method == StratumMethods.MINING_SET_DIFFICULTY:
+                    # Track difficulty for validation
+                    if msg.params and len(msg.params) > 0:
+                        try:
+                            difficulty = float(msg.params[0])
+                            self._validator.set_difficulty(difficulty)
+                        except (ValueError, TypeError):
+                            pass
                     logger.debug(f"[{self.session_id}] Difficulty set: {msg.params}")
 
         elif isinstance(msg, StratumResponse):
