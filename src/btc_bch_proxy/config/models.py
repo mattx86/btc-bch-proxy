@@ -85,6 +85,11 @@ class ProxyConfig(BaseModel):
     miner_read_timeout: int = Field(default=600, ge=10, description="Miner read timeout in seconds")
     send_timeout: int = Field(default=30, ge=1, description="Send to miner timeout in seconds")
     pending_shares_timeout: int = Field(default=10, ge=1, description="Timeout waiting for pending shares in seconds")
+    tcp_keepalive: bool = Field(default=True, description="Enable TCP keepalive on connections")
+    keepalive_idle: int = Field(default=60, ge=10, description="Seconds before sending keepalive probes")
+    keepalive_interval: int = Field(default=10, ge=1, description="Seconds between keepalive probes")
+    keepalive_count: int = Field(default=3, ge=1, description="Number of failed probes before connection is dead")
+    share_submit_retries: int = Field(default=3, ge=1, le=10, description="Number of times to retry failed share submissions")
 
 
 class LoggingConfig(BaseModel):

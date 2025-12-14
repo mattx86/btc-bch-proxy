@@ -14,6 +14,7 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 - **Statistics**: Tracks accepts/rejects per pool with periodic logging (every 15 min)
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
+- **Connection health**: TCP keepalives and automatic reconnection on connection failures
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
@@ -183,7 +184,23 @@ proxy:
   miner_read_timeout: 600     # Miner read timeout (seconds, default 10 min)
   send_timeout: 30            # Send to miner timeout (seconds)
   pending_shares_timeout: 10  # Wait for pending shares during switch (seconds)
+  tcp_keepalive: true         # Enable TCP keepalive on connections
+  keepalive_idle: 60          # Seconds before sending keepalive probes
+  keepalive_interval: 10      # Seconds between keepalive probes
+  keepalive_count: 3          # Failed probes before connection is dead
+  share_submit_retries: 3     # Retries for failed share submissions
 ```
+
+**Keepalive Settings:**
+TCP keepalives help detect dead connections at the OS level. When enabled, the OS sends periodic probes to verify connections are still alive. If a connection fails to respond to `keepalive_count` probes sent `keepalive_interval` seconds apart, it is considered dead. The first probe is sent after `keepalive_idle` seconds of inactivity.
+
+**Socket Optimizations (automatic):**
+The proxy automatically applies socket optimizations for low-latency stratum communication:
+- `TCP_NODELAY`: Disables Nagle's algorithm so small JSON-RPC messages are sent immediately
+- `IP_TOS`: Marks packets as low-delay (IPTOS_LOWDELAY) for QoS prioritization by routers
+
+**Share Retry Settings:**
+When a share submission fails due to transient errors (timeouts, connection issues), the proxy will retry up to `share_submit_retries` times with exponential backoff. Explicit pool rejections (duplicate, stale, low difficulty) are not retried.
 
 ### Server Settings
 

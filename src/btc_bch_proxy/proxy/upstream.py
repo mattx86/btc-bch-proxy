@@ -20,7 +20,7 @@ from btc_bch_proxy.stratum.protocol import StratumProtocol
 from btc_bch_proxy.proxy.stats import ProxyStats
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import StratumServerConfig
+    from btc_bch_proxy.config.models import ProxyConfig, StratumServerConfig
 
 
 class UpstreamConnectionError(Exception):
@@ -39,16 +39,19 @@ class UpstreamConnection:
     - mining.subscribe and mining.authorize
     - Message sending/receiving
     - Pending share submission tracking
+    - TCP keepalive for connection health
     """
 
-    def __init__(self, config: StratumServerConfig):
+    def __init__(self, config: StratumServerConfig, proxy_config: Optional[ProxyConfig] = None):
         """
         Initialize upstream connection.
 
         Args:
             config: Server configuration.
+            proxy_config: Proxy configuration (for keepalive settings).
         """
         self.config = config
+        self.proxy_config = proxy_config
         self.name = config.name
 
         self._reader: Optional[asyncio.StreamReader] = None
@@ -85,6 +88,10 @@ class UpstreamConnection:
         # Queue for notifications received during handshake
         self._pending_notifications: list[StratumMessage] = []
 
+        # Connection health tracking
+        self._last_message_time: float = 0.0
+        self._connection_health_timeout: float = 300.0  # 5 minutes without messages = unhealthy
+
     @property
     def connected(self) -> bool:
         """Check if connected to the server."""
@@ -109,6 +116,23 @@ class UpstreamConnection:
     def pending_share_count(self) -> int:
         """Get the number of pending shares."""
         return len(self._pending_shares)
+
+    @property
+    def is_healthy(self) -> bool:
+        """Check if the connection is healthy (recently received messages)."""
+        if not self._connected:
+            return False
+        if self._last_message_time == 0:
+            return True  # Just connected, no messages yet
+        elapsed = time_module.time() - self._last_message_time
+        return elapsed < self._connection_health_timeout
+
+    @property
+    def seconds_since_last_message(self) -> float:
+        """Get seconds since last message was received."""
+        if self._last_message_time == 0:
+            return 0.0
+        return time_module.time() - self._last_message_time
 
     def get_pending_notifications(self) -> list[StratumMessage]:
         """
@@ -164,6 +188,12 @@ class UpstreamConnection:
             self._connected = True
             self._retry_count = 0
             self._protocol.reset_buffer()
+            self._last_message_time = time_module.time()  # Reset health timer
+
+            # Enable TCP keepalive
+            if self.proxy_config and self._writer:
+                from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
+                enable_tcp_keepalive(self._writer, self.proxy_config, f"upstream:{self.name}")
 
             # Record connection stats
             stats = ProxyStats.get_instance()
@@ -486,6 +516,8 @@ class UpstreamConnection:
 
                         logger.debug(f"Received from {self.name}: {data.decode().strip()}")
                         messages = self._protocol.feed_data(data)
+                        if messages:
+                            self._last_message_time = time_module.time()
 
                         # Process responses and queue notifications
                         for recv_msg in messages:
@@ -552,6 +584,8 @@ class UpstreamConnection:
                     return []
 
                 messages = self._protocol.feed_data(data)
+                if messages:
+                    self._last_message_time = time_module.time()
 
                 # Process responses to pending requests
                 for msg in messages:
@@ -563,6 +597,12 @@ class UpstreamConnection:
                 return messages
 
             except asyncio.TimeoutError:
+                # Check connection health during timeout
+                if not self.is_healthy:
+                    logger.warning(
+                        f"Connection to {self.name} appears unhealthy "
+                        f"(no messages for {self.seconds_since_last_message:.0f}s)"
+                    )
                 return []
             except Exception as e:
                 logger.error(f"Error reading from {self.name}: {e}")

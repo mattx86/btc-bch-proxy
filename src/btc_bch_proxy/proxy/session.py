@@ -18,6 +18,7 @@ from btc_bch_proxy.stratum.protocol import StratumProtocol
 from btc_bch_proxy.proxy.upstream import UpstreamConnection
 from btc_bch_proxy.proxy.stats import ProxyStats
 from btc_bch_proxy.proxy.validation import ShareValidator
+from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -77,12 +78,19 @@ class MinerSession:
         self._pending_shares: dict[int, asyncio.Future] = {}
         self._miner_request_id = 0
 
+        # Send failure tracking
+        self._consecutive_send_failures = 0
+        self._max_send_failures = 3  # Close session after this many consecutive failures
+
         # Client address
         peername = writer.get_extra_info("peername")
         self.client_addr = f"{peername[0]}:{peername[1]}" if peername else "unknown"
 
         # Share validator
         self._validator = ShareValidator(self.session_id, config.validation)
+
+        # Enable TCP keepalive on miner connection
+        enable_tcp_keepalive(writer, config.proxy, f"miner:{self.session_id}")
 
         logger.info(f"[{self.session_id}] New miner session from {self.client_addr}")
 
@@ -163,7 +171,7 @@ class MinerSession:
             return False
 
         # Create a NEW upstream connection for this session
-        self._upstream = UpstreamConnection(server_config)
+        self._upstream = UpstreamConnection(server_config, self.config.proxy)
 
         # Connect
         if not await self._upstream.connect():
@@ -188,6 +196,34 @@ class MinerSession:
         self._current_server = server_name
         logger.info(f"[{self.session_id}] Connected to upstream {server_name}")
         return True
+
+    async def _reconnect_upstream(self) -> None:
+        """Reconnect to the current upstream server."""
+        if not self._current_server:
+            return
+
+        logger.info(f"[{self.session_id}] Attempting to reconnect to {self._current_server}")
+
+        # Disconnect current connection
+        if self._upstream:
+            await self._upstream.disconnect()
+
+        # Wait a bit before reconnecting
+        await asyncio.sleep(1)
+
+        # Reconnect
+        if await self._connect_upstream(self._current_server):
+            logger.info(f"[{self.session_id}] Reconnected to {self._current_server}")
+
+            # Send set_extranonce to miner with new values
+            if self._upstream and self._upstream.subscribed:
+                notification = StratumNotification(
+                    method=StratumMethods.MINING_SET_EXTRANONCE,
+                    params=[self._upstream.extranonce1, self._upstream.extranonce2_size],
+                )
+                await self._send_to_miner(StratumProtocol.encode_message(notification))
+        else:
+            logger.error(f"[{self.session_id}] Failed to reconnect to {self._current_server}")
 
     async def _miner_read_loop(self) -> None:
         """Read and process messages from the miner."""
@@ -223,6 +259,7 @@ class MinerSession:
 
     async def _upstream_read_loop(self) -> None:
         """Read and forward messages from upstream to miner."""
+        health_check_counter = 0
         while self._running and not self._closing:
             try:
                 if not self._upstream or not self._upstream.connected:
@@ -233,13 +270,22 @@ class MinerSession:
                 for msg in messages:
                     await self._handle_upstream_message(msg)
 
+                # Periodic health check (every ~10 seconds since read timeout is 0.1s)
+                health_check_counter += 1
+                if health_check_counter >= 100:
+                    health_check_counter = 0
+                    if self._upstream and not self._upstream.is_healthy:
+                        logger.warning(
+                            f"[{self.session_id}] Upstream connection unhealthy, reconnecting..."
+                        )
+                        await self._reconnect_upstream()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[{self.session_id}] Error reading from upstream: {e}")
                 # Try to reconnect
-                if self._current_server:
-                    await self._connect_upstream(self._current_server)
+                await self._reconnect_upstream()
                 await asyncio.sleep(1)
 
     async def _handle_miner_message(self, msg) -> None:
@@ -397,10 +443,52 @@ class MinerSession:
             )
             return
 
-        # Submit to upstream
-        accepted, error = await self._upstream.submit_share(
-            worker_name, job_id, extranonce2, ntime, nonce, version_bits
-        )
+        # Submit to upstream with retry logic for transient failures
+        max_retries = self.config.proxy.share_submit_retries
+        retry_delay = 0.5
+        accepted = False
+        error = None
+
+        for attempt in range(max_retries):
+            # Check if upstream is still connected
+            if not self._upstream or not self._upstream.connected:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"[{self.session_id}] Upstream not connected, reconnecting before retry..."
+                    )
+                    await self._reconnect_upstream()
+                    if not self._upstream or not self._upstream.connected:
+                        error = [20, "Upstream connection failed", None]
+                        continue
+                else:
+                    error = [20, "Upstream not connected", None]
+                    break
+
+            accepted, error = await self._upstream.submit_share(
+                worker_name, job_id, extranonce2, ntime, nonce, version_bits
+            )
+
+            if accepted:
+                break  # Success!
+
+            # Check if error is retryable
+            if error and len(error) >= 2:
+                error_msg = str(error[1]).lower()
+                # Retryable errors: timeout, connection issues
+                retryable = any(x in error_msg for x in [
+                    "timeout", "not connected", "connection", "timed out"
+                ])
+                if retryable and attempt < max_retries - 1:
+                    logger.warning(
+                        f"[{self.session_id}] Share submit failed ({error_msg}), "
+                        f"retrying ({attempt + 1}/{max_retries})..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+
+            # Non-retryable error (explicit pool rejection) or last attempt
+            break
 
         # Record stats
         stats = ProxyStats.get_instance()
@@ -473,7 +561,10 @@ class MinerSession:
         Args:
             data: Raw bytes to send.
         """
-        if self._closing or not self.writer:
+        if self._closing:
+            logger.debug(f"[{self.session_id}] Dropping message, session closing")
+            return
+        if not self.writer:
             return
         try:
             self.writer.write(data)
@@ -481,12 +572,29 @@ class MinerSession:
                 self.writer.drain(),
                 timeout=float(self.config.proxy.send_timeout)
             )
+            # Reset failure counter on successful send
+            self._consecutive_send_failures = 0
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.session_id}] Timeout sending to miner")
+            self._consecutive_send_failures += 1
+            logger.warning(
+                f"[{self.session_id}] Timeout sending to miner "
+                f"({self._consecutive_send_failures}/{self._max_send_failures})"
+            )
+            if self._consecutive_send_failures >= self._max_send_failures:
+                logger.error(f"[{self.session_id}] Too many send failures, closing session")
+                self._closing = True
+        except (OSError, ConnectionError) as e:
+            # Connection actually broken - close immediately
+            logger.error(f"[{self.session_id}] Connection error sending to miner: {e}")
             self._closing = True
         except Exception as e:
-            logger.error(f"[{self.session_id}] Error sending to miner: {e}")
-            self._closing = True
+            self._consecutive_send_failures += 1
+            logger.error(
+                f"[{self.session_id}] Error sending to miner: {e} "
+                f"({self._consecutive_send_failures}/{self._max_send_failures})"
+            )
+            if self._consecutive_send_failures >= self._max_send_failures:
+                self._closing = True
 
     async def handle_server_switch(self, new_server: str) -> None:
         """

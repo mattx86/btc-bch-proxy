@@ -340,6 +340,11 @@ proxy:
   miner_read_timeout: 600
   send_timeout: 30
   pending_shares_timeout: 10
+  tcp_keepalive: true
+  keepalive_idle: 60
+  keepalive_interval: 10
+  keepalive_count: 3
+  share_submit_retries: 3
 
 servers:
   - name: "stratum1"
