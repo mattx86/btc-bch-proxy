@@ -39,9 +39,10 @@ class ShareKey:
     extranonce2: str
     ntime: str
     nonce: str
+    version_bits: Optional[str] = None  # For version-rolling (ASICBoost)
 
     def __hash__(self):
-        return hash((self.job_id, self.extranonce2, self.ntime, self.nonce))
+        return hash((self.job_id, self.extranonce2, self.ntime, self.nonce, self.version_bits))
 
     def __eq__(self, other):
         if not isinstance(other, ShareKey):
@@ -51,6 +52,7 @@ class ShareKey:
             and self.extranonce2 == other.extranonce2
             and self.ntime == other.ntime
             and self.nonce == other.nonce
+            and self.version_bits == other.version_bits
         )
 
 
@@ -184,9 +186,9 @@ class ShareValidator:
         # Clean expired shares from cache
         self._clean_share_cache()
 
-        # Check for duplicate
+        # Check for duplicate (include version_bits for version-rolling miners)
         if self._reject_duplicates:
-            share_key = ShareKey(job_id, extranonce2, ntime, nonce)
+            share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
             if share_key in self._recent_shares:
                 self.duplicates_rejected += 1
                 logger.warning(f"[{self.session_id}] Duplicate share rejected: job={job_id}")
@@ -210,7 +212,7 @@ class ShareValidator:
 
         # Share is valid - add to recent shares for duplicate detection
         if self._reject_duplicates:
-            share_key = ShareKey(job_id, extranonce2, ntime, nonce)
+            share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
             self._recent_shares[share_key] = time.time()
 
             # Maintain cache size
