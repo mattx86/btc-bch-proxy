@@ -1,0 +1,50 @@
+# Bitcoin/Bitcoin Cash Stratum Proxy Configuration
+
+proxy:
+  bind_host: "0.0.0.0"           # Listen on all interfaces
+  bind_port: 3333                 # Port for miners to connect
+  max_connections: 100            # Maximum concurrent miner connections
+  connection_timeout: 60          # Miner connection timeout (seconds)
+
+servers:
+  - name: "stratum1"
+    host: "pool1.example.com"
+    port: 3333
+    username: "wallet_address.worker1"
+    password: "x"
+    ssl: false
+    timeout: 30
+    retry_interval: 5
+    max_retries: 240              # 20 minutes at 5 second intervals
+
+  - name: "stratum2"
+    host: "pool2.example.com"
+    port: 3333
+    username: "wallet_address.worker2"
+    password: "x"
+    ssl: false
+    timeout: 30
+    retry_interval: 5
+    max_retries: 240
+
+schedule:
+  # stratum1 for morning/night hours (00:00 to 11:59)
+  - start: "00:00"
+    end: "12:00"
+    server: "stratum1"
+
+  # stratum2 for afternoon/evening hours (12:00 to 23:59)
+  - start: "12:00"
+    end: "24:00"
+    server: "stratum2"
+
+logging:
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  file: null                      # Log file path (null for console only)
+  rotation: "50 MB"               # Log rotation size
+  retention: 10                   # Keep N rotated files
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
+
+# Failover settings
+failover:
+  retry_timeout_minutes: 20       # Retry primary server for this long before failover
