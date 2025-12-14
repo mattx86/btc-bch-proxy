@@ -63,6 +63,10 @@ class UpstreamConnection:
         self.extranonce2_size: Optional[int] = None
         self.subscription_id: Optional[str] = None
 
+        # Version-rolling support (negotiated with pool)
+        self.version_rolling_supported: bool = False
+        self.version_rolling_mask: Optional[str] = None
+
         # Request tracking
         self._request_id = 0
         self._pending_requests: Dict[int, asyncio.Future] = {}
@@ -199,6 +203,60 @@ class UpstreamConnection:
         self._pending_requests.clear()
 
         logger.info(f"Disconnected from upstream {self.name}")
+
+    async def configure(self, extensions: list[str] = None) -> bool:
+        """
+        Send mining.configure to negotiate extensions with the pool.
+
+        Args:
+            extensions: List of extensions to request (default: version-rolling).
+
+        Returns:
+            True if configuration successful (even if no extensions supported).
+        """
+        if not self._connected:
+            return False
+
+        if extensions is None:
+            extensions = ["version-rolling"]
+
+        req_id = self._next_id()
+        # Request version-rolling with full mask
+        params = [extensions, {"version-rolling.mask": "ffffffff"}]
+
+        try:
+            response = await self._send_request(
+                req_id, "mining.configure", params
+            )
+
+            if response.is_error:
+                # Pool doesn't support mining.configure - that's OK
+                logger.debug(f"Pool {self.name} doesn't support mining.configure: {response.error}")
+                return True
+
+            # Parse the response for version-rolling support
+            result = response.result
+            if isinstance(result, dict):
+                if result.get("version-rolling"):
+                    self.version_rolling_supported = True
+                    self.version_rolling_mask = result.get("version-rolling.mask", "ffffffff")
+                    logger.info(
+                        f"Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
+                    )
+                else:
+                    logger.info(f"Pool {self.name} does not support version-rolling")
+            else:
+                logger.debug(f"Pool {self.name} returned unexpected configure result: {result}")
+
+            return True
+
+        except asyncio.TimeoutError:
+            # Timeout on configure is OK - pool might not support it
+            logger.debug(f"Configure timeout for {self.name} (pool may not support it)")
+            return True
+        except Exception as e:
+            logger.debug(f"Configure error for {self.name}: {e}")
+            return True  # Don't fail the connection for configure errors
 
     async def subscribe(self, user_agent: str = "btc-bch-proxy/0.1.0") -> bool:
         """

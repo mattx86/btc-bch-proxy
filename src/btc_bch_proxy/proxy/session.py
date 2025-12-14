@@ -164,6 +164,9 @@ class MinerSession:
             logger.error(f"[{self.session_id}] Failed to connect to {server_name}")
             return False
 
+        # Configure (negotiate version-rolling with pool)
+        await self._upstream.configure()
+
         # Subscribe
         if not await self._upstream.subscribe():
             await self._upstream.disconnect()
@@ -259,22 +262,25 @@ class MinerSession:
         logger.debug(f"[{self.session_id}] Miner configure: {msg.params}")
 
         # mining.configure params: [["extension1", "extension2"], {extension_params}]
-        # We'll respond that we don't support any extensions for now
-        # This is valid and the miner should continue with mining.subscribe
+        # Return the version-rolling settings we negotiated with the upstream pool
         result = {}
 
-        # Check if version-rolling is requested and acknowledge it
-        # (we pass through the work as-is, so version-rolling should work)
         if msg.params and len(msg.params) >= 1:
             extensions = msg.params[0] if isinstance(msg.params[0], list) else []
             if "version-rolling" in extensions:
-                # Accept version-rolling with the mask the miner requested
-                mask = "ffffffff"  # Default full mask
-                if len(msg.params) >= 2 and isinstance(msg.params[1], dict):
-                    mask = msg.params[1].get("version-rolling.mask", mask)
-                result["version-rolling"] = True
-                result["version-rolling.mask"] = mask
-                logger.info(f"[{self.session_id}] Version-rolling enabled with mask {mask}")
+                # Check if upstream supports version-rolling
+                if self._upstream and self._upstream.version_rolling_supported:
+                    result["version-rolling"] = True
+                    result["version-rolling.mask"] = self._upstream.version_rolling_mask
+                    logger.info(
+                        f"[{self.session_id}] Version-rolling enabled with mask "
+                        f"{self._upstream.version_rolling_mask} (from pool)"
+                    )
+                else:
+                    # Pool doesn't support version-rolling
+                    logger.info(
+                        f"[{self.session_id}] Version-rolling requested but pool doesn't support it"
+                    )
 
         await self._send_to_miner(
             self._protocol.build_response(msg.id, result)
