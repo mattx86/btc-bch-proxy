@@ -337,6 +337,9 @@ proxy:
   bind_port: 3333
   max_connections: 100
   connection_timeout: 60
+  miner_read_timeout: 600
+  send_timeout: 30
+  pending_shares_timeout: 10
 
 servers:
   - name: "stratum1"
@@ -373,9 +376,18 @@ logging:
   file: null
   rotation: "50 MB"
   retention: 10
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
 
 failover:
   retry_timeout_minutes: 20
+
+validation:
+  reject_duplicates: true
+  reject_stale: true
+  validate_difficulty: false
+  share_cache_size: 1000
+  share_cache_ttl: 300
+  job_cache_size: 10
 """
 
     dest_path = Path("config.yaml")

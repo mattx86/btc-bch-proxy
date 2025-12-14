@@ -13,6 +13,7 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 - **Config validation**: Detects overlapping timeframes and invalid configurations at startup
 - **Statistics**: Tracks accepts/rejects per pool with periodic logging (every 15 min)
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
+- **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
@@ -175,10 +176,13 @@ Options:
 
 ```yaml
 proxy:
-  bind_host: "0.0.0.0"      # Address to listen on
-  bind_port: 3333           # Port to listen on
-  max_connections: 100      # Maximum concurrent miner connections
-  connection_timeout: 60    # Miner connection timeout (seconds)
+  bind_host: "0.0.0.0"        # Address to listen on
+  bind_port: 3333             # Port to listen on
+  max_connections: 100        # Maximum concurrent miner connections
+  connection_timeout: 60      # Miner connection timeout (seconds)
+  miner_read_timeout: 600     # Miner read timeout (seconds, default 10 min)
+  send_timeout: 30            # Send to miner timeout (seconds)
+  pending_shares_timeout: 10  # Wait for pending shares during switch (seconds)
 ```
 
 ### Server Settings
@@ -219,6 +223,7 @@ logging:
   file: "/var/log/proxy.log"  # Log file path (null for console only)
   rotation: "50 MB"         # Rotate when file reaches this size
   retention: 10             # Keep this many rotated files
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"  # Log format
 ```
 
 ### Failover Settings
@@ -227,6 +232,25 @@ logging:
 failover:
   retry_timeout_minutes: 20  # Retry primary server for this long before failover
 ```
+
+### Share Validation Settings
+
+The proxy can validate shares locally before forwarding to the upstream pool, reducing unnecessary network traffic and improving pool acceptance rates.
+
+```yaml
+validation:
+  reject_duplicates: true     # Reject duplicate share submissions
+  reject_stale: true          # Reject shares for expired/unknown jobs
+  validate_difficulty: false  # Validate share hash meets difficulty (CPU intensive)
+  share_cache_size: 1000      # Max recent shares to track per session
+  share_cache_ttl: 300        # Share cache TTL in seconds
+  job_cache_size: 10          # Max jobs to track per session
+```
+
+**Options:**
+- `reject_duplicates`: Prevents submitting the same share twice (reduces "duplicate share" rejections)
+- `reject_stale`: Prevents submitting shares for jobs that are no longer valid (reduces "stale job" rejections)
+- `validate_difficulty`: Validates that the share hash actually meets the difficulty target before submitting (CPU intensive, disabled by default)
 
 ## How It Works
 

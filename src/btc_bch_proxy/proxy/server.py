@@ -114,7 +114,7 @@ class StratumProxyServer:
                 pass
 
         # Log final stats before shutdown
-        ProxyStats.get_instance().log_stats()
+        await ProxyStats.get_instance().log_stats()
 
         # Close all sessions (each session closes its own upstream connection)
         async with self._session_lock:
