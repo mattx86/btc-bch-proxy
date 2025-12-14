@@ -184,9 +184,11 @@ class MinerSession:
         """Read and process messages from the miner."""
         while self._running and not self._closing:
             try:
+                # Use a long timeout - miners only send data when submitting shares
+                # which can be infrequent depending on difficulty
                 data = await asyncio.wait_for(
                     self.reader.read(8192),
-                    timeout=self.config.proxy.connection_timeout,
+                    timeout=600.0,  # 10 minutes - miners may not submit often
                 )
 
                 if not data:
@@ -200,7 +202,8 @@ class MinerSession:
                     await self._handle_miner_message(msg)
 
             except asyncio.TimeoutError:
-                logger.warning(f"[{self.session_id}] Miner connection timeout")
+                # 10 minutes without any data from miner - likely dead connection
+                logger.warning(f"[{self.session_id}] Miner connection timeout (10 min no data)")
                 break
             except asyncio.CancelledError:
                 break
