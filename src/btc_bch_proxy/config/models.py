@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import time
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -29,6 +29,9 @@ class TimeFrame(BaseModel):
     end: time = Field(..., description="End time (HH:MM)")
     server: str = Field(..., description="Server name to use during this timeframe")
 
+    # Sentinel value for end-of-day (24:00)
+    END_OF_DAY: ClassVar[time] = time(23, 59, 59)
+
     @field_validator("start", "end", mode="before")
     @classmethod
     def parse_time(cls, v):
@@ -44,8 +47,17 @@ class TimeFrame(BaseModel):
             return time(hour, minute, second)
         return v
 
+    @property
+    def is_end_of_day(self) -> bool:
+        """Check if end time represents end of day (24:00)."""
+        return self.end == self.END_OF_DAY
+
     def contains(self, t: time) -> bool:
         """Check if a given time falls within this timeframe."""
+        # Handle end-of-day case (24:00 should include everything up to midnight)
+        if self.is_end_of_day and self.start <= t:
+            return True
+
         # Handle normal case (start < end)
         if self.start <= self.end:
             return self.start <= t <= self.end
@@ -70,6 +82,9 @@ class ProxyConfig(BaseModel):
     bind_port: int = Field(default=3333, ge=1, le=65535, description="Port to listen on")
     max_connections: int = Field(default=100, ge=1, description="Maximum concurrent connections")
     connection_timeout: int = Field(default=60, ge=1, description="Connection timeout in seconds")
+    miner_read_timeout: int = Field(default=600, ge=10, description="Miner read timeout in seconds")
+    send_timeout: int = Field(default=30, ge=1, description="Send to miner timeout in seconds")
+    pending_shares_timeout: int = Field(default=10, ge=1, description="Timeout waiting for pending shares in seconds")
 
 
 class LoggingConfig(BaseModel):

@@ -5,6 +5,9 @@ proxy:
   bind_port: 3333                 # Port for miners to connect
   max_connections: 100            # Maximum concurrent miner connections
   connection_timeout: 60          # Miner connection timeout (seconds)
+  miner_read_timeout: 600         # Miner read timeout in seconds (10 minutes)
+  send_timeout: 30                # Send to miner timeout (seconds)
+  pending_shares_timeout: 10      # Timeout waiting for pending shares (seconds)
 
 servers:
   - name: "stratum1"

@@ -72,6 +72,7 @@ class UpstreamConnection:
         self._request_id = 0
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._pending_shares: Set[int] = set()
+        self._pending_shares_lock = asyncio.Lock()  # Lock for _pending_shares access
 
         # Connection state
         self._retry_count = 0
@@ -249,7 +250,12 @@ class UpstreamConnection:
             if isinstance(result, dict):
                 if result.get("version-rolling"):
                     self.version_rolling_supported = True
-                    self.version_rolling_mask = result.get("version-rolling.mask", "ffffffff")
+                    mask = result.get("version-rolling.mask", "ffffffff")
+                    # Handle mask as int or string
+                    if isinstance(mask, int):
+                        self.version_rolling_mask = f"{mask:08x}"
+                    else:
+                        self.version_rolling_mask = str(mask)
                     logger.info(
                         f"Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
                     )
@@ -294,12 +300,29 @@ class UpstreamConnection:
                 return False
 
             # Parse subscription response
-            # Result format: [[["mining.set_difficulty", "subscription_id"], ["mining.notify", "subscription_id"]], extranonce1, extranonce2_size]
+            # Result format: [[["mining.set_difficulty", "sub_id1"], ["mining.notify", "sub_id2"]], extranonce1, extranonce2_size]
             result = response.result
             if isinstance(result, list) and len(result) >= 3:
-                self.subscription_id = str(result[0])
+                subscriptions = result[0]
                 self.extranonce1 = str(result[1])
                 self.extranonce2_size = int(result[2])
+
+                # Validate extranonce1 is a valid hex string
+                try:
+                    bytes.fromhex(self.extranonce1)
+                except ValueError:
+                    logger.error(f"Invalid extranonce1 from {self.name}: {self.extranonce1}")
+                    return False
+
+                # Extract subscription ID from mining.notify entry if present
+                self.subscription_id = None
+                if isinstance(subscriptions, list):
+                    for sub in subscriptions:
+                        if isinstance(sub, list) and len(sub) >= 2:
+                            if sub[0] == "mining.notify":
+                                self.subscription_id = str(sub[1])
+                                break
+
                 self._subscribed = True
                 logger.info(
                     f"Subscribed to {self.name}: extranonce1={self.extranonce1}, "
@@ -387,7 +410,8 @@ class UpstreamConnection:
         if version_bits is not None and self.version_rolling_supported:
             params.append(version_bits)
 
-        self._pending_shares.add(req_id)
+        async with self._pending_shares_lock:
+            self._pending_shares.add(req_id)
 
         try:
             response = await self._send_request(
@@ -405,7 +429,8 @@ class UpstreamConnection:
             logger.error(f"Share submit error for {self.name}: {e}")
             return False, [20, str(e), None]
         finally:
-            self._pending_shares.discard(req_id)
+            async with self._pending_shares_lock:
+                self._pending_shares.discard(req_id)
 
     async def _send_request(
         self, req_id: int, method: str, params: list
@@ -487,11 +512,21 @@ class UpstreamConnection:
 
         Args:
             data: Raw bytes to send.
+
+        Raises:
+            UpstreamConnectionError: If not connected or send fails.
         """
         if not self._writer:
             raise UpstreamConnectionError("Not connected")
-        self._writer.write(data)
-        await self._writer.drain()
+        try:
+            self._writer.write(data)
+            await asyncio.wait_for(self._writer.drain(), timeout=self.config.timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"Send timeout to {self.name}")
+            raise UpstreamConnectionError(f"Send timeout to {self.name}")
+        except OSError as e:
+            logger.error(f"Send error to {self.name}: {e}")
+            raise UpstreamConnectionError(f"Send error: {e}") from e
 
     async def read_messages(self) -> list[StratumMessage]:
         """

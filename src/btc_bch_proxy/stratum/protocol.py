@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from loguru import logger
 
@@ -30,6 +30,7 @@ class StratumProtocol:
 
     ENCODING = "utf-8"
     DELIMITER = b"\n"
+    MAX_BUFFER_SIZE = 1024 * 1024  # 1MB max buffer to prevent DoS
 
     def __init__(self):
         """Initialize the protocol handler."""
@@ -44,8 +45,19 @@ class StratumProtocol:
 
         Returns:
             List of parsed stratum messages.
+
+        Raises:
+            StratumProtocolError: If buffer exceeds max size (DoS protection).
         """
         self._buffer += data
+
+        # DoS protection: limit buffer size
+        if len(self._buffer) > self.MAX_BUFFER_SIZE:
+            self._buffer = b""
+            raise StratumProtocolError(
+                f"Buffer exceeded max size ({self.MAX_BUFFER_SIZE} bytes), dropping data"
+            )
+
         messages = []
 
         while self.DELIMITER in self._buffer:
@@ -134,7 +146,7 @@ class StratumProtocol:
         return self._encode(msg.to_dict())
 
     def build_response(
-        self, id: int, result: any, error: list = None
+        self, id: int, result: Any, error: list = None
     ) -> bytes:
         """
         Build a stratum response message.
@@ -173,8 +185,14 @@ class StratumProtocol:
 
         Returns:
             JSON bytes with newline delimiter.
+
+        Raises:
+            StratumProtocolError: If encoding fails.
         """
-        return json.dumps(obj, separators=(",", ":")).encode(self.ENCODING) + self.DELIMITER
+        try:
+            return json.dumps(obj, separators=(",", ":")).encode(self.ENCODING) + self.DELIMITER
+        except (TypeError, ValueError) as e:
+            raise StratumProtocolError(f"Failed to encode message: {e}") from e
 
     def reset_buffer(self) -> None:
         """Clear the internal buffer."""
@@ -190,8 +208,14 @@ class StratumProtocol:
 
         Returns:
             Encoded message bytes with newline delimiter.
+
+        Raises:
+            StratumProtocolError: If encoding fails.
         """
-        return json.dumps(msg.to_dict(), separators=(",", ":")).encode("utf-8") + b"\n"
+        try:
+            return json.dumps(msg.to_dict(), separators=(",", ":")).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as e:
+            raise StratumProtocolError(f"Failed to encode message: {e}") from e
 
 
 def parse_raw_message(data: Union[bytes, str]) -> Optional[StratumMessage]:

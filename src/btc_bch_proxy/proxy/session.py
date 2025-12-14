@@ -140,8 +140,9 @@ class MinerSession:
                 f"pending shares before switching"
             )
             start_time = asyncio.get_event_loop().time()
+            timeout = float(self.config.proxy.pending_shares_timeout)
             while self._upstream.has_pending_shares:
-                if asyncio.get_event_loop().time() - start_time > 10.0:
+                if asyncio.get_event_loop().time() - start_time > timeout:
                     logger.warning(f"[{self.session_id}] Timeout waiting for pending shares")
                     break
                 await self._upstream.read_messages()
@@ -192,7 +193,7 @@ class MinerSession:
                 # which can be infrequent depending on difficulty
                 data = await asyncio.wait_for(
                     self.reader.read(8192),
-                    timeout=600.0,  # 10 minutes - miners may not submit often
+                    timeout=float(self.config.proxy.miner_read_timeout),
                 )
 
                 if not data:
@@ -206,8 +207,9 @@ class MinerSession:
                     await self._handle_miner_message(msg)
 
             except asyncio.TimeoutError:
-                # 10 minutes without any data from miner - likely dead connection
-                logger.warning(f"[{self.session_id}] Miner connection timeout (10 min no data)")
+                # Long timeout without any data from miner - likely dead connection
+                timeout_mins = self.config.proxy.miner_read_timeout // 60
+                logger.warning(f"[{self.session_id}] Miner connection timeout ({timeout_mins} min no data)")
                 break
             except asyncio.CancelledError:
                 break
@@ -441,7 +443,13 @@ class MinerSession:
             return
         try:
             self.writer.write(data)
-            await self.writer.drain()
+            await asyncio.wait_for(
+                self.writer.drain(),
+                timeout=float(self.config.proxy.send_timeout)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.session_id}] Timeout sending to miner")
+            self._closing = True
         except Exception as e:
             logger.error(f"[{self.session_id}] Error sending to miner: {e}")
             self._closing = True
