@@ -72,6 +72,9 @@ class UpstreamConnection:
         self._retry_count = 0
         self._last_connect_attempt = 0.0
 
+        # Lock to prevent concurrent socket reads
+        self._read_lock = asyncio.Lock()
+
     @property
     def connected(self) -> bool:
         """Check if connected to the server."""
@@ -348,34 +351,40 @@ class UpstreamConnection:
         await self._writer.drain()
 
         try:
-            # Read from socket while waiting for the response
+            # Read from socket while waiting for the response (with lock to prevent concurrent reads)
             deadline = asyncio.get_event_loop().time() + self.config.timeout
             while not future.done():
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError()
 
-                try:
-                    data = await asyncio.wait_for(
-                        self._reader.read(8192),
-                        timeout=min(remaining, 1.0),
-                    )
-                    if not data:
-                        raise UpstreamConnectionError("Connection closed by server")
+                # Use lock to prevent concurrent socket reads
+                async with self._read_lock:
+                    # Check again if future is done (another coroutine may have resolved it)
+                    if future.done():
+                        break
 
-                    logger.debug(f"Received from {self.name}: {data.decode().strip()}")
-                    messages = self._protocol.feed_data(data)
+                    try:
+                        data = await asyncio.wait_for(
+                            self._reader.read(8192),
+                            timeout=min(remaining, 1.0),
+                        )
+                        if not data:
+                            raise UpstreamConnectionError("Connection closed by server")
 
-                    # Process responses to pending requests
-                    for recv_msg in messages:
-                        if isinstance(recv_msg, StratumResponse):
-                            pending_future = self._pending_requests.get(recv_msg.id)
-                            if pending_future and not pending_future.done():
-                                pending_future.set_result(recv_msg)
+                        logger.debug(f"Received from {self.name}: {data.decode().strip()}")
+                        messages = self._protocol.feed_data(data)
 
-                except asyncio.TimeoutError:
-                    # Just a read timeout, keep waiting if we have time left
-                    continue
+                        # Process responses to pending requests
+                        for recv_msg in messages:
+                            if isinstance(recv_msg, StratumResponse):
+                                pending_future = self._pending_requests.get(recv_msg.id)
+                                if pending_future and not pending_future.done():
+                                    pending_future.set_result(recv_msg)
+
+                    except asyncio.TimeoutError:
+                        # Just a read timeout, keep waiting if we have time left
+                        continue
 
             return future.result()
         finally:
@@ -403,34 +412,36 @@ class UpstreamConnection:
         if not self._reader:
             return []
 
-        try:
-            data = await asyncio.wait_for(
-                self._reader.read(8192),
-                timeout=0.1,  # Short timeout for non-blocking read
-            )
-            if not data:
-                # Connection closed
-                logger.warning(f"Connection closed by {self.name}")
+        # Use lock to prevent concurrent socket reads
+        async with self._read_lock:
+            try:
+                data = await asyncio.wait_for(
+                    self._reader.read(8192),
+                    timeout=0.1,  # Short timeout for non-blocking read
+                )
+                if not data:
+                    # Connection closed
+                    logger.warning(f"Connection closed by {self.name}")
+                    await self.disconnect()
+                    return []
+
+                messages = self._protocol.feed_data(data)
+
+                # Process responses to pending requests
+                for msg in messages:
+                    if isinstance(msg, StratumResponse):
+                        future = self._pending_requests.get(msg.id)
+                        if future and not future.done():
+                            future.set_result(msg)
+
+                return messages
+
+            except asyncio.TimeoutError:
+                return []
+            except Exception as e:
+                logger.error(f"Error reading from {self.name}: {e}")
                 await self.disconnect()
                 return []
-
-            messages = self._protocol.feed_data(data)
-
-            # Process responses to pending requests
-            for msg in messages:
-                if isinstance(msg, StratumResponse):
-                    future = self._pending_requests.get(msg.id)
-                    if future and not future.done():
-                        future.set_result(msg)
-
-            return messages
-
-        except asyncio.TimeoutError:
-            return []
-        except Exception as e:
-            logger.error(f"Error reading from {self.name}: {e}")
-            await self.disconnect()
-            return []
 
     def can_retry(self) -> bool:
         """Check if we can retry connecting."""
