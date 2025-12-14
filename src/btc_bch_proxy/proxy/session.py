@@ -15,11 +15,11 @@ from btc_bch_proxy.stratum.messages import (
     StratumResponse,
 )
 from btc_bch_proxy.stratum.protocol import StratumProtocol
+from btc_bch_proxy.proxy.upstream import UpstreamConnection
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
     from btc_bch_proxy.proxy.router import TimeBasedRouter
-    from btc_bch_proxy.proxy.upstream import UpstreamConnection, UpstreamManager
 
 
 class MinerSession:
@@ -38,7 +38,6 @@ class MinerSession:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         router: TimeBasedRouter,
-        upstream_manager: UpstreamManager,
         config: Config,
     ):
         """
@@ -48,13 +47,11 @@ class MinerSession:
             reader: Async stream reader for miner connection.
             writer: Async stream writer for miner connection.
             router: Time-based router for server selection.
-            upstream_manager: Manager for upstream connections.
             config: Application configuration.
         """
         self.reader = reader
         self.writer = writer
         self.router = router
-        self.upstream_manager = upstream_manager
         self.config = config
 
         self.session_id = uuid.uuid4().hex[:8]
@@ -70,7 +67,7 @@ class MinerSession:
         self.worker_name: Optional[str] = None
         self.user_agent: Optional[str] = None
 
-        # Current upstream
+        # Current upstream - each session gets its OWN connection
         self._current_server: Optional[str] = None
         self._upstream: Optional[UpstreamConnection] = None
 
@@ -127,30 +124,59 @@ class MinerSession:
         """
         Connect to an upstream server.
 
+        Each session creates its OWN upstream connection for isolation.
+
         Args:
             server_name: Name of the server to connect to.
 
         Returns:
             True if connected successfully.
         """
-        # Wait for pending shares on current upstream
+        # Wait for pending shares on current upstream before switching
         if self._upstream and self._upstream.has_pending_shares:
             logger.info(
                 f"[{self.session_id}] Waiting for {self._upstream.pending_share_count} "
                 f"pending shares before switching"
             )
-            await self.upstream_manager.wait_for_pending_shares(
-                self._current_server, timeout=10.0
-            )
+            start_time = asyncio.get_event_loop().time()
+            while self._upstream.has_pending_shares:
+                if asyncio.get_event_loop().time() - start_time > 10.0:
+                    logger.warning(f"[{self.session_id}] Timeout waiting for pending shares")
+                    break
+                await self._upstream.read_messages()
+                await asyncio.sleep(0.1)
 
-        # Get upstream connection
-        if not await self.upstream_manager.connect_server(server_name):
+        # Disconnect old upstream if switching
+        if self._upstream:
+            await self._upstream.disconnect()
+
+        # Get server config
+        server_config = self.router.get_server_config(server_name)
+        if not server_config:
+            logger.error(f"[{self.session_id}] Unknown server: {server_name}")
+            return False
+
+        # Create a NEW upstream connection for this session
+        self._upstream = UpstreamConnection(server_config)
+
+        # Connect
+        if not await self._upstream.connect():
             logger.error(f"[{self.session_id}] Failed to connect to {server_name}")
             return False
 
-        self._upstream = self.upstream_manager.get(server_name)
-        self._current_server = server_name
+        # Subscribe
+        if not await self._upstream.subscribe():
+            await self._upstream.disconnect()
+            logger.error(f"[{self.session_id}] Failed to subscribe to {server_name}")
+            return False
 
+        # Authorize
+        if not await self._upstream.authorize():
+            await self._upstream.disconnect()
+            logger.error(f"[{self.session_id}] Failed to authorize with {server_name}")
+            return False
+
+        self._current_server = server_name
         logger.info(f"[{self.session_id}] Connected to upstream {server_name}")
         return True
 
@@ -398,6 +424,11 @@ class MinerSession:
         self._running = False
 
         logger.info(f"[{self.session_id}] Closing session")
+
+        # Close upstream connection
+        if self._upstream:
+            await self._upstream.disconnect()
+            self._upstream = None
 
         # Close miner connection
         if self.writer:

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import TYPE_CHECKING, Dict, Optional
 
 from loguru import logger
 
 from btc_bch_proxy.proxy.router import TimeBasedRouter
 from btc_bch_proxy.proxy.session import MinerSession
-from btc_bch_proxy.proxy.upstream import UpstreamManager
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -25,6 +23,8 @@ class StratumProxyServer:
     - Managing miner sessions
     - Coordinating with the time-based router
     - Graceful shutdown
+
+    Each miner session creates its own upstream connection for isolation.
     """
 
     def __init__(self, config: Config):
@@ -35,9 +35,6 @@ class StratumProxyServer:
             config: Application configuration.
         """
         self.config = config
-
-        # Create upstream manager for all configured servers
-        self.upstream_manager = UpstreamManager(config.servers)
 
         # Create time-based router
         self.router = TimeBasedRouter(config)
@@ -51,21 +48,13 @@ class StratumProxyServer:
         self._stop_event = asyncio.Event()
         self._scheduler_task: Optional[asyncio.Task] = None
 
-        # Failover tracking
-        self._failover_start_time: Optional[float] = None
-        self._primary_server_retrying = False
-
     async def start(self) -> None:
         """Start the proxy server."""
         logger.info("Starting stratum proxy server...")
 
-        # Pre-connect to the initial server
+        # Log initial server
         initial_server = self.router.get_current_server()
         logger.info(f"Initial server: {initial_server}")
-
-        if not await self.upstream_manager.connect_server(initial_server):
-            logger.warning(f"Failed to connect to initial server {initial_server}")
-            # Will retry during operation
 
         # Register for server switch notifications
         self.router.register_switch_callback(self._on_server_switch)
@@ -109,14 +98,11 @@ class StratumProxyServer:
             except asyncio.CancelledError:
                 pass
 
-        # Close all sessions
+        # Close all sessions (each session closes its own upstream connection)
         async with self._session_lock:
             for session in list(self._sessions.values()):
                 await session.close()
             self._sessions.clear()
-
-        # Disconnect from upstream servers
-        await self.upstream_manager.disconnect_all()
 
         logger.info("Proxy server stopped")
 
@@ -140,12 +126,11 @@ class StratumProxyServer:
                 await writer.wait_closed()
                 return
 
-        # Create session
+        # Create session (each session creates its own upstream connection)
         session = MinerSession(
             reader=reader,
             writer=writer,
             router=self.router,
-            upstream_manager=self.upstream_manager,
             config=self.config,
         )
 
@@ -165,23 +150,15 @@ class StratumProxyServer:
         """
         Handle server switch notification from router.
 
+        Each session manages its own upstream connection, so we just tell
+        all sessions to switch.
+
         Args:
             new_server: Name of the new server.
         """
         logger.info(f"Server switch triggered: switching to {new_server}")
 
-        # Try to connect to new server
-        if not await self.upstream_manager.connect_server(new_server):
-            logger.error(f"Failed to connect to {new_server}")
-            # Start failover logic
-            await self._handle_failover(new_server)
-            return
-
-        # Reset failover state
-        self._failover_start_time = None
-        self._primary_server_retrying = False
-
-        # Switch all active sessions
+        # Switch all active sessions (each session will create its own new connection)
         async with self._session_lock:
             sessions = list(self._sessions.values())
 
@@ -195,48 +172,6 @@ class StratumProxyServer:
             await asyncio.gather(*switch_tasks, return_exceptions=True)
 
         logger.info(f"Switched {len(switch_tasks)} sessions to {new_server}")
-
-    async def _handle_failover(self, failed_server: str) -> None:
-        """
-        Handle failover when a server is unavailable.
-
-        Args:
-            failed_server: Name of the server that failed.
-        """
-        retry_timeout = self.config.failover.retry_timeout_minutes * 60
-
-        # Start tracking retry time
-        if self._failover_start_time is None:
-            self._failover_start_time = time.time()
-            self._primary_server_retrying = True
-            logger.warning(
-                f"Server {failed_server} unavailable, starting {self.config.failover.retry_timeout_minutes}min retry period"
-            )
-
-        # Check if we've exceeded retry timeout
-        elapsed = time.time() - self._failover_start_time
-        if elapsed >= retry_timeout:
-            # Find failover server
-            failover_server = self.router.get_failover_server(failed_server)
-            if failover_server:
-                logger.warning(
-                    f"Retry timeout exceeded, failing over to {failover_server}"
-                )
-                self.router.activate_failover(failover_server)
-
-                # Try to connect to failover
-                if await self.upstream_manager.connect_server(failover_server):
-                    # Switch all sessions to failover
-                    async with self._session_lock:
-                        sessions = list(self._sessions.values())
-
-                    for session in sessions:
-                        if session.is_active:
-                            await session.handle_server_switch(failover_server)
-                else:
-                    logger.error(f"Failover server {failover_server} also unavailable")
-            else:
-                logger.error("No failover server available")
 
     @property
     def active_sessions(self) -> int:
