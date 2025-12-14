@@ -269,6 +269,16 @@ class MinerSession:
             )
             self._subscribed = True
             logger.info(f"[{self.session_id}] Miner subscribed")
+
+            # Forward any notifications received during upstream handshake
+            # These must be sent AFTER the subscribe response
+            pending = self._upstream.get_pending_notifications()
+            if pending:
+                logger.info(
+                    f"[{self.session_id}] Forwarding {len(pending)} queued notifications to miner"
+                )
+                for notification in pending:
+                    await self._handle_upstream_message(notification)
         else:
             # No upstream connected yet
             error = [20, "Upstream not available", None]

@@ -75,6 +75,9 @@ class UpstreamConnection:
         # Lock to prevent concurrent socket reads
         self._read_lock = asyncio.Lock()
 
+        # Queue for notifications received during handshake
+        self._pending_notifications: list[StratumMessage] = []
+
     @property
     def connected(self) -> bool:
         """Check if connected to the server."""
@@ -99,6 +102,17 @@ class UpstreamConnection:
     def pending_share_count(self) -> int:
         """Get the number of pending shares."""
         return len(self._pending_shares)
+
+    def get_pending_notifications(self) -> list[StratumMessage]:
+        """
+        Get and clear any notifications received during handshake.
+
+        Returns:
+            List of queued notifications.
+        """
+        notifications = self._pending_notifications
+        self._pending_notifications = []
+        return notifications
 
     def _next_id(self) -> int:
         """Get the next request ID."""
@@ -375,12 +389,16 @@ class UpstreamConnection:
                         logger.debug(f"Received from {self.name}: {data.decode().strip()}")
                         messages = self._protocol.feed_data(data)
 
-                        # Process responses to pending requests
+                        # Process responses and queue notifications
                         for recv_msg in messages:
                             if isinstance(recv_msg, StratumResponse):
                                 pending_future = self._pending_requests.get(recv_msg.id)
                                 if pending_future and not pending_future.done():
                                     pending_future.set_result(recv_msg)
+                            elif isinstance(recv_msg, StratumNotification):
+                                # Queue notifications for later processing
+                                self._pending_notifications.append(recv_msg)
+                                logger.debug(f"Queued notification: {recv_msg.method}")
 
                     except asyncio.TimeoutError:
                         # Just a read timeout, keep waiting if we have time left
