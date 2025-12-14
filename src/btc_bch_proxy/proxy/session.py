@@ -350,7 +350,8 @@ class MinerSession:
             )
             return
 
-        # Parse submit params: [worker_name, job_id, extranonce2, ntime, nonce]
+        # Parse submit params: [worker_name, job_id, extranonce2, ntime, nonce, version_bits?]
+        # version_bits is optional and only present when version-rolling is enabled
         if len(msg.params) < 5:
             error = [20, "Invalid submit parameters", None]
             await self._send_to_miner(
@@ -359,15 +360,18 @@ class MinerSession:
             return
 
         worker_name, job_id, extranonce2, ntime, nonce = msg.params[:5]
+        # Get version_bits if present (6th param for version-rolling)
+        version_bits = msg.params[5] if len(msg.params) > 5 else None
 
         logger.debug(
             f"[{self.session_id}] Share submit: job={job_id}, "
             f"nonce={nonce}, worker={worker_name}"
+            + (f", version_bits={version_bits}" if version_bits else "")
         )
 
         # Submit to upstream
         accepted, error = await self._upstream.submit_share(
-            worker_name, job_id, extranonce2, ntime, nonce
+            worker_name, job_id, extranonce2, ntime, nonce, version_bits
         )
 
         if accepted:

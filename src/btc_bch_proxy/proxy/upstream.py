@@ -351,6 +351,7 @@ class UpstreamConnection:
         extranonce2: str,
         ntime: str,
         nonce: str,
+        version_bits: Optional[str] = None,
     ) -> tuple[bool, Optional[list]]:
         """
         Submit a share to the pool.
@@ -361,6 +362,7 @@ class UpstreamConnection:
             extranonce2: Extranonce2 value.
             ntime: Block time.
             nonce: Block nonce.
+            version_bits: Version bits for version-rolling (optional).
 
         Returns:
             Tuple of (accepted, error).
@@ -371,6 +373,9 @@ class UpstreamConnection:
         req_id = self._next_id()
         # Use the pool's configured username, not the miner's worker name
         params = [self.config.username, job_id, extranonce2, ntime, nonce]
+        # Include version_bits if version-rolling is enabled
+        if version_bits is not None and self.version_rolling_supported:
+            params.append(version_bits)
 
         self._pending_shares.add(req_id)
 
