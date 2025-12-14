@@ -270,10 +270,6 @@ class TimeBasedRouter:
                 # Cap sleep time to check periodically (every 60 seconds max)
                 sleep_seconds = min(max(sleep_seconds, 1), 60)
 
-                logger.debug(
-                    f"Next switch at {next_switch}, sleeping {sleep_seconds:.1f}s"
-                )
-
                 # Wait with cancellation support
                 try:
                     await asyncio.wait_for(

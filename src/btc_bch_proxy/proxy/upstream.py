@@ -17,6 +17,7 @@ from btc_bch_proxy.stratum.messages import (
     StratumResponse,
 )
 from btc_bch_proxy.stratum.protocol import StratumProtocol
+from btc_bch_proxy.proxy.stats import ProxyStats
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import StratumServerConfig
@@ -75,6 +76,7 @@ class UpstreamConnection:
         # Connection state
         self._retry_count = 0
         self._last_connect_attempt = 0.0
+        self._has_connected_before = False  # Track if this is a reconnection
 
         # Lock to prevent concurrent socket reads
         self._read_lock = asyncio.Lock()
@@ -161,6 +163,14 @@ class UpstreamConnection:
             self._connected = True
             self._retry_count = 0
             self._protocol.reset_buffer()
+
+            # Record connection stats
+            stats = ProxyStats.get_instance()
+            if self._has_connected_before:
+                asyncio.create_task(stats.record_upstream_reconnect(self.name))
+            else:
+                asyncio.create_task(stats.record_upstream_connect(self.name))
+                self._has_connected_before = True
 
             logger.info(f"Connected to upstream {self.name}")
             return True

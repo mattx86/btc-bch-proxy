@@ -11,11 +11,29 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 - **Cross-platform**: Runs on Windows and Linux
 - **Background mode**: Run as a daemon/background service
 - **Config validation**: Detects overlapping timeframes and invalid configurations at startup
+- **Statistics**: Tracks accepts/rejects per pool with periodic logging (every 15 min)
+- **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
 
-### From source
+### Quick Start (Recommended)
+
+```bash
+git clone https://github.com/yourusername/btc-bch-proxy.git
+cd btc-bch-proxy
+
+# Windows
+init.bat
+
+# Linux/Mac
+chmod +x *.sh
+./init.sh
+```
+
+This creates a virtual environment, installs dependencies, and generates `config.yaml`.
+
+### Manual Installation
 
 ```bash
 git clone https://github.com/yourusername/btc-bch-proxy.git
@@ -27,15 +45,8 @@ venv\Scripts\activate     # Windows
 source venv/bin/activate  # Linux/Mac
 
 pip install -e .
-```
-
-### Quick setup after install
-
-```bash
 btc-bch-proxy init --no-venv
 ```
-
-This creates a sample `config.yaml` in the current directory.
 
 ### Dependencies
 
@@ -47,13 +58,17 @@ This creates a sample `config.yaml` in the current directory.
 
 ## Quick Start
 
-1. **Create configuration file:**
+1. **Initialize the project:**
 
    ```bash
-   btc-bch-proxy init --no-venv
+   # Windows
+   init.bat
+
+   # Linux/Mac
+   ./init.sh
    ```
 
-   This creates `config.yaml` in the current directory.
+   This creates a virtual environment, installs dependencies, and generates `config.yaml`.
 
 2. **Edit the configuration** with your pool details:
 
@@ -94,14 +109,34 @@ This creates a sample `config.yaml` in the current directory.
 4. **Start the proxy:**
 
    ```bash
-   # Run in background
-   btc-bch-proxy start -c config.yaml
+   # Windows
+   start.bat              # Run in background
+   start.bat -f           # Run in foreground (for debugging)
 
-   # Or run in foreground (for debugging)
-   btc-bch-proxy start -c config.yaml --foreground
+   # Linux/Mac
+   ./start.sh             # Run in background
+   ./start.sh -f          # Run in foreground (for debugging)
    ```
 
-5. **Point your miners** to the proxy address (e.g., `stratum+tcp://192.168.1.100:3333`)
+5. **Stop the proxy:**
+
+   ```bash
+   # Windows
+   stop.bat
+
+   # Linux/Mac
+   ./stop.sh
+   ```
+
+6. **Point your miners** to the proxy address (e.g., `stratum+tcp://192.168.1.100:3333`)
+
+## Helper Scripts
+
+| Script | Description |
+|--------|-------------|
+| `init.bat` / `init.sh` | Initialize: create venv, install deps, create config |
+| `start.bat` / `start.sh` | Start the proxy (pass `-f` for foreground) |
+| `stop.bat` / `stop.sh` | Stop the running proxy |
 
 ## CLI Commands
 

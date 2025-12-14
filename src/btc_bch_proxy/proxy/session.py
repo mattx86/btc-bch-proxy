@@ -16,6 +16,7 @@ from btc_bch_proxy.stratum.messages import (
 )
 from btc_bch_proxy.stratum.protocol import StratumProtocol
 from btc_bch_proxy.proxy.upstream import UpstreamConnection
+from btc_bch_proxy.proxy.stats import ProxyStats
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -374,10 +375,18 @@ class MinerSession:
             worker_name, job_id, extranonce2, ntime, nonce, version_bits
         )
 
+        # Record stats
+        stats = ProxyStats.get_instance()
         if accepted:
             logger.info(f"[{self.session_id}] Share accepted")
+            asyncio.create_task(stats.record_share_accepted(self._current_server))
         else:
+            # Extract rejection reason from error
+            reason = "unknown"
+            if error and len(error) >= 2:
+                reason = str(error[1])
             logger.warning(f"[{self.session_id}] Share rejected: {error}")
+            asyncio.create_task(stats.record_share_rejected(self._current_server, reason))
 
         await self._send_to_miner(
             self._protocol.build_response(msg.id, accepted, error)

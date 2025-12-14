@@ -9,6 +9,7 @@ from loguru import logger
 
 from btc_bch_proxy.proxy.router import TimeBasedRouter
 from btc_bch_proxy.proxy.session import MinerSession
+from btc_bch_proxy.proxy.stats import ProxyStats, run_stats_logger
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -47,6 +48,7 @@ class StratumProxyServer:
         self._server: Optional[asyncio.Server] = None
         self._stop_event = asyncio.Event()
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._stats_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the proxy server."""
@@ -62,6 +64,11 @@ class StratumProxyServer:
         # Start the time-based scheduler
         self._scheduler_task = asyncio.create_task(
             self.router.run_scheduler(self._stop_event)
+        )
+
+        # Start the stats logger (logs at minute 0, 15, 30, 45 of every hour)
+        self._stats_task = asyncio.create_task(
+            run_stats_logger(self._stop_event)
         )
 
         # Start accepting connections
@@ -97,6 +104,17 @@ class StratumProxyServer:
                 await self._scheduler_task
             except asyncio.CancelledError:
                 pass
+
+        # Stop stats logger
+        if self._stats_task:
+            self._stats_task.cancel()
+            try:
+                await self._stats_task
+            except asyncio.CancelledError:
+                pass
+
+        # Log final stats before shutdown
+        ProxyStats.get_instance().log_stats()
 
         # Close all sessions (each session closes its own upstream connection)
         async with self._session_lock:
@@ -134,6 +152,10 @@ class StratumProxyServer:
             config=self.config,
         )
 
+        # Record miner connection
+        stats = ProxyStats.get_instance()
+        await stats.record_miner_connect()
+
         # Register session
         async with self._session_lock:
             self._sessions[session.session_id] = session
@@ -142,6 +164,9 @@ class StratumProxyServer:
             # Run session
             await session.run()
         finally:
+            # Record miner disconnection
+            await stats.record_miner_disconnect()
+
             # Unregister session
             async with self._session_lock:
                 self._sessions.pop(session.session_id, None)
