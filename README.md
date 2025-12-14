@@ -20,8 +20,22 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 ```bash
 git clone https://github.com/yourusername/btc-bch-proxy.git
 cd btc-bch-proxy
+
+# Create venv and install
+python -m venv venv
+venv\Scripts\activate     # Windows
+source venv/bin/activate  # Linux/Mac
+
 pip install -e .
 ```
+
+### Quick setup after install
+
+```bash
+btc-bch-proxy init --no-venv
+```
+
+This creates a sample `config.yaml` in the current directory.
 
 ### Dependencies
 
@@ -33,10 +47,10 @@ pip install -e .
 
 ## Quick Start
 
-1. **Create a configuration file:**
+1. **Create configuration file:**
 
    ```bash
-   btc-bch-proxy init
+   btc-bch-proxy init --no-venv
    ```
 
    This creates `config.yaml` in the current directory.
@@ -93,11 +107,21 @@ pip install -e .
 
 | Command | Description |
 |---------|-------------|
+| `btc-bch-proxy init` | Initialize project (venv + config) |
 | `btc-bch-proxy start` | Start the proxy |
 | `btc-bch-proxy stop` | Stop the running proxy |
 | `btc-bch-proxy status` | Check if proxy is running |
 | `btc-bch-proxy validate <config>` | Validate a configuration file |
-| `btc-bch-proxy init` | Create a sample configuration file |
+
+### Init Options
+
+```bash
+btc-bch-proxy init [OPTIONS]
+
+Options:
+  --no-venv              Skip virtual environment creation
+  --venv-path PATH       Path for virtual environment (default: ./venv)
+```
 
 ### Start Options
 

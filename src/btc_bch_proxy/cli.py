@@ -231,34 +231,101 @@ def validate(config_path: Path):
 
 
 @main.command()
-def init():
-    """Create a sample configuration file."""
+@click.option(
+    "--no-venv",
+    is_flag=True,
+    help="Skip virtual environment creation",
+)
+@click.option(
+    "--venv-path",
+    type=click.Path(path_type=Path),
+    default="venv",
+    help="Path for virtual environment (default: ./venv)",
+)
+def init(no_venv: bool, venv_path: Path):
+    """Initialize project: create config and virtual environment."""
     import shutil
+    import subprocess
 
-    # Find the example config in the package
-    from importlib.resources import files
+    # Step 1: Create virtual environment
+    if not no_venv:
+        venv_path = Path(venv_path)
+        if venv_path.exists():
+            click.echo(f"Virtual environment already exists at {venv_path}")
+        else:
+            click.echo(f"Creating virtual environment at {venv_path}...")
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "venv", str(venv_path)],
+                    check=True,
+                    capture_output=True,
+                )
+                click.echo(f"Created virtual environment: {venv_path}")
+            except subprocess.CalledProcessError as e:
+                click.echo(f"Failed to create virtual environment: {e}", err=True)
+                sys.exit(1)
 
+        # Step 2: Install dependencies
+        if sys.platform == "win32":
+            pip_path = venv_path / "Scripts" / "pip.exe"
+            python_path = venv_path / "Scripts" / "python.exe"
+        else:
+            pip_path = venv_path / "bin" / "pip"
+            python_path = venv_path / "bin" / "python"
+
+        if pip_path.exists():
+            click.echo("Installing dependencies...")
+            try:
+                # Check if we're in the package directory (has pyproject.toml)
+                if Path("pyproject.toml").exists():
+                    subprocess.run(
+                        [str(pip_path), "install", "-e", "."],
+                        check=True,
+                        capture_output=True,
+                    )
+                    click.echo("Installed package in development mode")
+                else:
+                    # Install just the dependencies
+                    subprocess.run(
+                        [str(pip_path), "install", "pydantic", "pyyaml", "loguru", "click"],
+                        check=True,
+                        capture_output=True,
+                    )
+                    click.echo("Installed dependencies")
+            except subprocess.CalledProcessError as e:
+                click.echo(f"Warning: Failed to install dependencies: {e.stderr.decode() if e.stderr else e}", err=True)
+
+        # Show activation instructions
+        click.echo("")
+        if sys.platform == "win32":
+            click.echo(f"To activate: {venv_path}\\Scripts\\activate")
+        else:
+            click.echo(f"To activate: source {venv_path}/bin/activate")
+        click.echo("")
+
+    # Step 3: Create config file
     try:
-        # Try to find example config in package
         package_dir = Path(__file__).parent.parent.parent
         example_config = package_dir / "config.example.yaml"
 
         if not example_config.exists():
-            # Fallback: create a basic config
             create_sample_config()
-            return
+        else:
+            dest_path = Path("config.yaml")
+            if dest_path.exists():
+                if not click.confirm(f"{dest_path} already exists. Overwrite?"):
+                    click.echo("Skipping config file creation.")
+                    return
+            shutil.copy(example_config, dest_path)
+            click.echo(f"Created {dest_path}")
     except Exception:
         create_sample_config()
-        return
 
-    dest_path = Path("config.yaml")
-    if dest_path.exists():
-        if not click.confirm(f"{dest_path} already exists. Overwrite?"):
-            return
-
-    shutil.copy(example_config, dest_path)
-    click.echo(f"Created {dest_path}")
-    click.echo("Edit this file to configure your stratum servers and schedule.")
+    click.echo("")
+    click.echo("Setup complete! Next steps:")
+    click.echo("  1. Edit config.yaml with your pool settings")
+    click.echo("  2. Run: btc-bch-proxy validate config.yaml")
+    click.echo("  3. Run: btc-bch-proxy start")
 
 
 def create_sample_config():
