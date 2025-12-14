@@ -73,6 +73,7 @@ class StratumMethods:
     MINING_SUBSCRIBE = "mining.subscribe"
     MINING_AUTHORIZE = "mining.authorize"
     MINING_SUBMIT = "mining.submit"
+    MINING_CONFIGURE = "mining.configure"
     MINING_EXTRANONCE_SUBSCRIBE = "mining.extranonce.subscribe"
     MINING_GET_TRANSACTIONS = "mining.get_transactions"
 

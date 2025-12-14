@@ -239,7 +239,9 @@ class MinerSession:
         logger.debug(f"[{self.session_id}] Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
             logger.info(f"[{self.session_id}] Miner request: {msg.method}")
-            if msg.method == StratumMethods.MINING_SUBSCRIBE:
+            if msg.method == StratumMethods.MINING_CONFIGURE:
+                await self._handle_configure(msg)
+            elif msg.method == StratumMethods.MINING_SUBSCRIBE:
                 await self._handle_subscribe(msg)
             elif msg.method == StratumMethods.MINING_AUTHORIZE:
                 await self._handle_authorize(msg)
@@ -248,6 +250,32 @@ class MinerSession:
             else:
                 # Forward other requests to upstream
                 await self._forward_to_upstream(msg)
+
+    async def _handle_configure(self, msg: StratumRequest) -> None:
+        """Handle mining.configure from miner (stratum extension for version-rolling)."""
+        logger.debug(f"[{self.session_id}] Miner configure: {msg.params}")
+
+        # mining.configure params: [["extension1", "extension2"], {extension_params}]
+        # We'll respond that we don't support any extensions for now
+        # This is valid and the miner should continue with mining.subscribe
+        result = {}
+
+        # Check if version-rolling is requested and acknowledge it
+        # (we pass through the work as-is, so version-rolling should work)
+        if msg.params and len(msg.params) >= 1:
+            extensions = msg.params[0] if isinstance(msg.params[0], list) else []
+            if "version-rolling" in extensions:
+                # Accept version-rolling with the mask the miner requested
+                mask = "ffffffff"  # Default full mask
+                if len(msg.params) >= 2 and isinstance(msg.params[1], dict):
+                    mask = msg.params[1].get("version-rolling.mask", mask)
+                result["version-rolling"] = True
+                result["version-rolling.mask"] = mask
+                logger.info(f"[{self.session_id}] Version-rolling enabled with mask {mask}")
+
+        await self._send_to_miner(
+            self._protocol.build_response(msg.id, result)
+        )
 
     async def _handle_subscribe(self, msg: StratumRequest) -> None:
         """Handle mining.subscribe from miner."""
