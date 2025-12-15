@@ -445,6 +445,7 @@ class UpstreamConnection:
             return False, [20, "Not connected or authorized", None]
 
         req_id = self._next_id()
+        logger.info(f"[{self.name}] submit_share: req_id={req_id}")
         # Use the pool's configured username, not the miner's worker name
         params = [self.config.username, job_id, extranonce2, ntime, nonce]
         # Include version_bits if version-rolling is enabled
@@ -455,9 +456,11 @@ class UpstreamConnection:
             self._pending_shares.add(req_id)
 
         try:
+            logger.info(f"[{self.name}] Calling _send_request...")
             response = await self._send_request(
                 req_id, StratumMethods.MINING_SUBMIT, params
             )
+            logger.info(f"[{self.name}] _send_request returned, checking response...")
 
             if response.is_error:
                 return False, response.error
@@ -466,6 +469,9 @@ class UpstreamConnection:
         except asyncio.TimeoutError:
             logger.warning(f"Share submit timeout for {self.name}")
             return False, [20, "Timeout", None]
+        except KeyError as e:
+            logger.error(f"Share submit KeyError for {self.name}: {e}", exc_info=True)
+            raise  # Re-raise to get full traceback
         except Exception as e:
             logger.error(f"Share submit error for {self.name}: {e}")
             return False, [20, str(e), None]
@@ -526,13 +532,18 @@ class UpstreamConnection:
                             raise UpstreamConnectionError("Connection closed by server")
 
                         logger.debug(f"Received from {self.name}: {data.decode().strip()}")
-                        messages = self._protocol.feed_data(data)
+                        try:
+                            messages = self._protocol.feed_data(data)
+                        except KeyError as e:
+                            logger.error(f"KeyError in feed_data: {e}, data={data!r}")
+                            raise
                         if messages:
                             self._last_message_time = time_module.time()
 
                         # Process responses and queue notifications
                         for recv_msg in messages:
                             if isinstance(recv_msg, StratumResponse):
+                                logger.debug(f"Got response id={recv_msg.id}")
                                 pending_future = self._pending_requests.get(recv_msg.id)
                                 if pending_future and not pending_future.done():
                                     pending_future.set_result(recv_msg)
@@ -545,6 +556,7 @@ class UpstreamConnection:
                         # Just a read timeout, keep waiting if we have time left
                         continue
 
+            logger.debug(f"[{self.name}] Got future result")
             return future.result()
         finally:
             self._pending_requests.pop(req_id, None)
