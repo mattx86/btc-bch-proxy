@@ -318,7 +318,7 @@ class MinerSession:
                     # No message available, check if still running
                     continue
 
-                _, queued_msg = priority_tuple
+                _, _, queued_msg = priority_tuple
                 await self._write_to_miner(queued_msg.data)
                 self._miner_send_queue.task_done()
 
@@ -338,7 +338,7 @@ class MinerSession:
         while not self._miner_send_queue.empty():
             try:
                 priority_tuple = self._miner_send_queue.get_nowait()
-                _, queued_msg = priority_tuple
+                _, _, queued_msg = priority_tuple
                 await self._write_to_miner(queued_msg.data)
                 self._miner_send_queue.task_done()
                 drained += 1
