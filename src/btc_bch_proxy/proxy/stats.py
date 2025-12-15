@@ -3,12 +3,60 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Optional
 
 from loguru import logger
+
+
+def normalize_rejection_reason(reason: str) -> str:
+    """
+    Normalize a rejection reason to a category for aggregated stats.
+
+    Converts detailed messages like:
+    - "Duplicate share (job=XXX, nonce=YYY)" → "duplicate share"
+    - "Stale job (job=XXX)" → "stale job"
+    - "low difficulty share (12345.67)" → "low difficulty share"
+
+    Args:
+        reason: The detailed rejection reason.
+
+    Returns:
+        Normalized category string.
+    """
+    if not reason:
+        return "unknown"
+
+    reason_lower = reason.lower()
+
+    # Check for common patterns and normalize
+    if "duplicate" in reason_lower:
+        return "duplicate share"
+    if "stale" in reason_lower:
+        return "stale job"
+    if "low difficulty" in reason_lower:
+        return "low difficulty share"
+    if "job not found" in reason_lower:
+        return "job not found"
+    if "unauthorized" in reason_lower:
+        return "unauthorized"
+    if "timeout" in reason_lower:
+        return "timeout"
+    if "not connected" in reason_lower:
+        return "not connected"
+    if "invalid" in reason_lower:
+        return "invalid share"
+
+    # Remove any parenthetical details for unknown patterns
+    # e.g., "some error (details=xyz)" → "some error"
+    cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', reason).strip()
+    if cleaned:
+        return cleaned.lower()
+
+    return "unknown"
 
 
 @dataclass
@@ -120,11 +168,13 @@ class ProxyStats:
             stats.accepted_shares += 1
 
     async def record_share_rejected(self, server_name: str, reason: str = "unknown") -> None:
-        """Record a rejected share with reason."""
+        """Record a rejected share with normalized reason category."""
         async with self._lock:
             stats = self._get_server_stats(server_name)
             stats.rejected_shares += 1
-            stats.rejection_reasons[reason] += 1
+            # Normalize reason to category for cleaner aggregated stats
+            normalized = normalize_rejection_reason(reason)
+            stats.rejection_reasons[normalized] += 1
 
     def get_uptime(self) -> str:
         """Get formatted uptime string."""
