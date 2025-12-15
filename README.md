@@ -273,6 +273,40 @@ validation:
 - `reject_stale`: Prevents submitting shares for jobs that are no longer valid (reduces "stale job" rejections)
 - `validate_difficulty`: Validates that the share hash actually meets the difficulty target before submitting (CPU intensive, disabled by default)
 
+## Statistics
+
+The proxy logs detailed statistics every 15 minutes (at :00, :15, :30, :45). Example output:
+
+```
+============================================================
+PROXY STATISTICS (uptime: 2h 30m)
+============================================================
+Miners: 3 active | 5 total connections | 2 disconnections | Active server: pool1
+----------------------------------------
+Server: pool1 (active)
+  Connections: 1 | Reconnections: 0
+  Shares: 12729 accepted / 127 rejected (99.0% / 1.0%)
+  Rejection reasons: "duplicate share": 55, "low difficulty share": 45, "stale job": 6
+----------------------------------------
+Server: pool2
+  Connections: 1 | Reconnections: 0
+  Shares: 500 accepted / 10 rejected (98.0% / 2.0%)
+  Rejection reasons: "duplicate share": 5, "job not found": 3
+============================================================
+```
+
+**Tracked metrics:**
+- Active miners and connection history
+- Currently active server (marked with `(active)`)
+- Per-server share acceptance/rejection rates
+- Rejection reasons (normalized into categories):
+  - `duplicate share` - Share already submitted
+  - `stale job` - Job expired or unknown
+  - `low difficulty share` - Share doesn't meet pool difficulty
+  - `job not found` - Pool doesn't recognize the job
+  - `unauthorized` - Worker not authorized
+  - `timeout` - Submission timed out
+
 ## How It Works
 
 ```
