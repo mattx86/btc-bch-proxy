@@ -321,12 +321,6 @@ def init(no_venv: bool, venv_path: Path):
     except Exception:
         create_sample_config()
 
-    click.echo("")
-    click.echo("Setup complete! Next steps:")
-    click.echo("  1. Edit config.yaml with your pool settings")
-    click.echo("  2. Run: btc-bch-proxy validate config.yaml")
-    click.echo("  3. Run: btc-bch-proxy start")
-
 
 def create_sample_config():
     """Create a sample configuration file from scratch."""

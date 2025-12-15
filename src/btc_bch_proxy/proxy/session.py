@@ -99,6 +99,9 @@ class MinerSession:
         self._consecutive_send_failures = 0
         self._max_send_failures = 3  # Close session after this many consecutive failures
 
+        # Difficulty tracking
+        self._current_difficulty: Optional[float] = None
+
         # Client address
         peername = writer.get_extra_info("peername")
         self.client_addr = f"{peername[0]}:{peername[1]}" if peername else "unknown"
@@ -660,9 +663,17 @@ class MinerSession:
                         try:
                             difficulty = float(msg.params[0])
                             self._validator.set_difficulty(difficulty)
+                            # Log initial difficulty or changes
+                            if self._current_difficulty is None:
+                                logger.info(f"[{self.session_id}] Initial difficulty: {difficulty}")
+                            elif difficulty != self._current_difficulty:
+                                logger.info(
+                                    f"[{self.session_id}] Difficulty changed: "
+                                    f"{self._current_difficulty} -> {difficulty}"
+                                )
+                            self._current_difficulty = difficulty
                         except (ValueError, TypeError):
-                            pass
-                    logger.debug(f"[{self.session_id}] Difficulty set: {msg.params}")
+                            logger.warning(f"[{self.session_id}] Invalid difficulty value: {msg.params}")
 
         elif isinstance(msg, StratumResponse):
             # Responses are handled by the upstream connection's pending request system
