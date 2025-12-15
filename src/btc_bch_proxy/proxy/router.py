@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 from loguru import logger
 
+from btc_bch_proxy.proxy.stats import ProxyStats
+
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config, StratumServerConfig, TimeFrame
 
@@ -246,6 +248,16 @@ class TimeBasedRouter:
         """
         logger.info("Starting time-based scheduler")
 
+        # Set initial active server in stats
+        try:
+            initial_server = self.get_current_server()
+            self._current_server = initial_server
+            stats = ProxyStats.get_instance()
+            await stats.set_active_server(initial_server)
+            logger.info(f"Initial active server: {initial_server}")
+        except RuntimeError as e:
+            logger.error(f"Failed to determine initial server: {e}")
+
         while not stop_event.is_set():
             try:
                 # Get current and next server
@@ -261,6 +273,9 @@ class TimeBasedRouter:
                 if self._current_server != current_server:
                     logger.info(f"Server switch: {self._current_server} -> {current_server}")
                     self._current_server = current_server
+                    # Update stats with active server
+                    stats = ProxyStats.get_instance()
+                    await stats.set_active_server(current_server)
                     await self.notify_switch(current_server)
 
                 # Calculate sleep time until next switch

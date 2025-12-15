@@ -113,6 +113,9 @@ class ProxyStats:
         # Per-server stats
         self._server_stats: Dict[str, ServerStats] = {}
 
+        # Currently active server (for display in stats)
+        self._active_server: Optional[str] = None
+
         # Lock for thread safety
         self._lock = asyncio.Lock()
 
@@ -148,6 +151,11 @@ class ProxyStats:
         async with self._lock:
             self.current_miners = max(0, self.current_miners - 1)
             self.total_miner_disconnections += 1
+
+    async def set_active_server(self, server_name: str) -> None:
+        """Set the currently active server for routing."""
+        async with self._lock:
+            self._active_server = server_name
 
     async def record_upstream_connect(self, server_name: str) -> None:
         """Record an upstream server connection."""
@@ -201,6 +209,7 @@ class ProxyStats:
             current_miners = self.current_miners
             total_connections = self.total_miner_connections
             total_disconnections = self.total_miner_disconnections
+            active_server = self._active_server
             server_stats_copy = {
                 name: ServerStats(
                     name=stats.name,
@@ -218,10 +227,11 @@ class ProxyStats:
         logger.info("=" * 60)
 
         # Miner stats
+        active_str = f" | Active server: {active_server}" if active_server else ""
         logger.info(
             f"Miners: {current_miners} active | "
             f"{total_connections} total connections | "
-            f"{total_disconnections} disconnections"
+            f"{total_disconnections} disconnections{active_str}"
         )
 
         # Per-server stats
@@ -230,7 +240,9 @@ class ProxyStats:
         else:
             for name, stats in server_stats_copy.items():
                 logger.info("-" * 40)
-                logger.info(f"Server: {name}")
+                # Show (active) indicator for currently active server
+                active_indicator = " (active)" if name == active_server else ""
+                logger.info(f"Server: {name}{active_indicator}")
                 logger.info(
                     f"  Connections: {stats.connections} | "
                     f"Reconnections: {stats.reconnections}"
