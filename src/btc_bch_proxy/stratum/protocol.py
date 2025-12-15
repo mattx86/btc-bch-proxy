@@ -116,6 +116,19 @@ class StratumProtocol:
         result = obj.get("result")
         error = obj.get("error")
 
+        # Ensure params is always a list (some miners/pools send dict or other types)
+        if not isinstance(params, list):
+            if isinstance(params, dict):
+                # Convert dict with numeric keys to list: {"0": a, "1": b} -> [a, b]
+                try:
+                    max_key = max(int(k) for k in params.keys()) + 1
+                    params = [params.get(str(i), params.get(i)) for i in range(max_key)]
+                except (ValueError, TypeError):
+                    # Keys aren't numeric, just use values in arbitrary order
+                    params = list(params.values())
+            else:
+                params = [params] if params is not None else []
+
         # Response (has id, has result or error, no method)
         if msg_id is not None and (result is not None or error is not None) and method is None:
             return StratumResponse(id=msg_id, result=result, error=error)
