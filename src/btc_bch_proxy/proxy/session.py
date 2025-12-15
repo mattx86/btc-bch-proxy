@@ -395,17 +395,24 @@ class MinerSession:
         logger.debug(f"[{self.session_id}] Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
             logger.info(f"[{self.session_id}] Miner request: {msg.method}")
-            if msg.method == StratumMethods.MINING_CONFIGURE:
-                await self._handle_configure(msg)
-            elif msg.method == StratumMethods.MINING_SUBSCRIBE:
-                await self._handle_subscribe(msg)
-            elif msg.method == StratumMethods.MINING_AUTHORIZE:
-                await self._handle_authorize(msg)
-            elif msg.method == StratumMethods.MINING_SUBMIT:
-                await self._handle_submit(msg)
-            else:
-                # Forward other requests to upstream
-                await self._forward_to_upstream(msg)
+            try:
+                if msg.method == StratumMethods.MINING_CONFIGURE:
+                    await self._handle_configure(msg)
+                elif msg.method == StratumMethods.MINING_SUBSCRIBE:
+                    await self._handle_subscribe(msg)
+                elif msg.method == StratumMethods.MINING_AUTHORIZE:
+                    await self._handle_authorize(msg)
+                elif msg.method == StratumMethods.MINING_SUBMIT:
+                    await self._handle_submit(msg)
+                else:
+                    # Forward other requests to upstream
+                    await self._forward_to_upstream(msg)
+            except KeyError as e:
+                logger.error(
+                    f"[{self.session_id}] KeyError in {msg.method} handler: {e}",
+                    exc_info=True,
+                )
+                raise
 
     async def _handle_configure(self, msg: StratumRequest) -> None:
         """Handle mining.configure from miner (stratum extension for version-rolling)."""
@@ -503,6 +510,21 @@ class MinerSession:
 
         # Parse submit params: [worker_name, job_id, extranonce2, ntime, nonce, version_bits?]
         # version_bits is optional and only present when version-rolling is enabled
+        # Log at INFO temporarily to debug KeyError: 1 issue
+        logger.info(
+            f"[{self.session_id}] Submit params type={type(msg.params).__name__}, "
+            f"len={len(msg.params) if hasattr(msg.params, '__len__') else 'N/A'}"
+        )
+
+        if not isinstance(msg.params, (list, tuple)):
+            error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
+            logger.error(f"[{self.session_id}] {error[1]}")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
         if len(msg.params) < 5:
             error = [20, "Invalid submit parameters", None]
             await self._send_to_miner(
@@ -511,7 +533,16 @@ class MinerSession:
             )
             return
 
-        worker_name, job_id, extranonce2, ntime, nonce = msg.params[:5]
+        try:
+            worker_name, job_id, extranonce2, ntime, nonce = msg.params[:5]
+        except (TypeError, ValueError, KeyError) as e:
+            error = [20, f"Failed to parse params: {type(e).__name__}: {e}", None]
+            logger.error(f"[{self.session_id}] {error[1]}")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
         # Get version_bits if present (6th param for version-rolling)
         version_bits = msg.params[5] if len(msg.params) > 5 else None
 
