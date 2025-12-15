@@ -23,6 +23,33 @@ from btc_bch_proxy.proxy.stats import ProxyStats
 from btc_bch_proxy.proxy.validation import ShareValidator
 from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
 
+
+def _get_error_message(error) -> str:
+    """
+    Extract error message from various error formats.
+
+    Pools return errors in different formats:
+    - Stratum style: [code, "message", traceback] (list)
+    - JSON-RPC 2.0 style: {"code": N, "message": "..."} (dict)
+
+    Args:
+        error: Error in list or dict format.
+
+    Returns:
+        Error message string.
+    """
+    if error is None:
+        return "unknown"
+
+    if isinstance(error, dict):
+        # JSON-RPC 2.0 style: {"code": N, "message": "..."}
+        return str(error.get("message", error.get("code", "unknown")))
+    elif isinstance(error, (list, tuple)) and len(error) >= 2:
+        # Stratum style: [code, "message", traceback]
+        return str(error[1])
+    else:
+        return str(error) if error else "unknown"
+
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
     from btc_bch_proxy.proxy.router import TimeBasedRouter
@@ -395,24 +422,17 @@ class MinerSession:
         logger.debug(f"[{self.session_id}] Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
             logger.info(f"[{self.session_id}] Miner request: {msg.method}")
-            try:
-                if msg.method == StratumMethods.MINING_CONFIGURE:
-                    await self._handle_configure(msg)
-                elif msg.method == StratumMethods.MINING_SUBSCRIBE:
-                    await self._handle_subscribe(msg)
-                elif msg.method == StratumMethods.MINING_AUTHORIZE:
-                    await self._handle_authorize(msg)
-                elif msg.method == StratumMethods.MINING_SUBMIT:
-                    await self._handle_submit(msg)
-                else:
-                    # Forward other requests to upstream
-                    await self._forward_to_upstream(msg)
-            except KeyError as e:
-                logger.error(
-                    f"[{self.session_id}] KeyError in {msg.method} handler: {e}",
-                    exc_info=True,
-                )
-                raise
+            if msg.method == StratumMethods.MINING_CONFIGURE:
+                await self._handle_configure(msg)
+            elif msg.method == StratumMethods.MINING_SUBSCRIBE:
+                await self._handle_subscribe(msg)
+            elif msg.method == StratumMethods.MINING_AUTHORIZE:
+                await self._handle_authorize(msg)
+            elif msg.method == StratumMethods.MINING_SUBMIT:
+                await self._handle_submit(msg)
+            else:
+                # Forward other requests to upstream
+                await self._forward_to_upstream(msg)
 
     async def _handle_configure(self, msg: StratumRequest) -> None:
         """Handle mining.configure from miner (stratum extension for version-rolling)."""
@@ -510,12 +530,6 @@ class MinerSession:
 
         # Parse submit params: [worker_name, job_id, extranonce2, ntime, nonce, version_bits?]
         # version_bits is optional and only present when version-rolling is enabled
-        # Log at INFO temporarily to debug KeyError: 1 issue
-        logger.info(
-            f"[{self.session_id}] Submit params type={type(msg.params).__name__}, "
-            f"len={len(msg.params) if hasattr(msg.params, '__len__') else 'N/A'}"
-        )
-
         if not isinstance(msg.params, (list, tuple)):
             error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
             logger.error(f"[{self.session_id}] {error[1]}")
@@ -546,13 +560,12 @@ class MinerSession:
         # Get version_bits if present (6th param for version-rolling)
         version_bits = msg.params[5] if len(msg.params) > 5 else None
 
-        logger.info(
+        logger.debug(
             f"[{self.session_id}] Share submit: job={job_id}, "
             f"nonce={nonce}, version_bits={version_bits}"
         )
 
         # Validate share locally before submitting
-        logger.info(f"[{self.session_id}] Calling validate_share...")
         valid, reject_reason = self._validator.validate_share(
             job_id=job_id,
             extranonce2=extranonce2,
@@ -561,8 +574,6 @@ class MinerSession:
             extranonce1=self._upstream.extranonce1,
             version_bits=version_bits,
         )
-
-        logger.info(f"[{self.session_id}] validate_share returned: valid={valid}")
 
         if not valid:
             # Reject locally - don't forward to pool
@@ -577,7 +588,6 @@ class MinerSession:
             return
 
         # Submit to upstream with retry logic for transient failures
-        logger.info(f"[{self.session_id}] Calling submit_share...")
         max_retries = self.config.proxy.share_submit_retries
         retry_delay = 0.5
         accepted = False
@@ -606,20 +616,19 @@ class MinerSession:
                 break  # Success!
 
             # Check if error is retryable
-            if error and len(error) >= 2:
-                error_msg = str(error[1]).lower()
-                # Retryable errors: timeout, connection issues
-                retryable = any(x in error_msg for x in [
-                    "timeout", "not connected", "connection", "timed out"
-                ])
-                if retryable and attempt < max_retries - 1:
-                    logger.warning(
-                        f"[{self.session_id}] Share submit failed ({error_msg}), "
-                        f"retrying ({attempt + 1}/{max_retries})..."
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
+            error_msg = _get_error_message(error).lower()
+            # Retryable errors: timeout, connection issues
+            retryable = any(x in error_msg for x in [
+                "timeout", "not connected", "connection", "timed out"
+            ])
+            if retryable and attempt < max_retries - 1:
+                logger.warning(
+                    f"[{self.session_id}] Share submit failed ({error_msg}), "
+                    f"retrying ({attempt + 1}/{max_retries})..."
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
 
             # Non-retryable error (explicit pool rejection) or last attempt
             break
@@ -637,10 +646,8 @@ class MinerSession:
                 job_id, extranonce2, ntime, nonce, version_bits
             )
         else:
-            # Extract rejection reason from error
-            reason = "unknown"
-            if error and len(error) >= 2:
-                reason = str(error[1])
+            # Extract rejection reason from error (handles both list and dict formats)
+            reason = _get_error_message(error)
             logger.warning(f"[{self.session_id}] Share rejected: {error}")
             asyncio.create_task(stats.record_share_rejected(self._current_server, reason))
 
