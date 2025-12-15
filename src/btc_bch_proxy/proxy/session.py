@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
@@ -23,6 +26,20 @@ from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
     from btc_bch_proxy.proxy.router import TimeBasedRouter
+
+
+class MessagePriority(Enum):
+    """Priority levels for queued messages."""
+    HIGH = auto()    # Share responses, critical notifications
+    NORMAL = auto()  # Regular notifications (mining.notify, set_difficulty)
+    LOW = auto()     # Other messages
+
+
+@dataclass
+class QueuedMessage:
+    """A message queued for sending to the miner."""
+    data: bytes
+    priority: MessagePriority = MessagePriority.NORMAL
 
 
 class MinerSession:
@@ -89,6 +106,11 @@ class MinerSession:
         # Share validator
         self._validator = ShareValidator(self.session_id, config.validation)
 
+        # Async queue for miner-bound messages (decouples read from write)
+        # Using PriorityQueue to ensure high-priority messages (share responses) are sent first
+        self._miner_send_queue: asyncio.PriorityQueue[tuple[int, QueuedMessage]] = asyncio.PriorityQueue()
+        self._queue_sequence = 0  # For stable ordering within same priority
+
         # Enable TCP keepalive on miner connection
         enable_tcp_keepalive(writer, config.proxy, f"miner:{self.session_id}")
 
@@ -98,6 +120,11 @@ class MinerSession:
     def is_active(self) -> bool:
         """Check if the session is active."""
         return self._running and not self._closing
+
+    @property
+    def send_queue_depth(self) -> int:
+        """Get the number of messages waiting to be sent to the miner."""
+        return self._miner_send_queue.qsize()
 
     async def run(self) -> None:
         """Main session loop - handle the miner connection lifecycle."""
@@ -111,12 +138,18 @@ class MinerSession:
                 return
 
             # Start relay tasks
-            miner_task = asyncio.create_task(self._miner_read_loop())
-            upstream_task = asyncio.create_task(self._upstream_read_loop())
+            # - miner_read: reads from miner, processes messages
+            # - miner_write: consumes queue and sends to miner (decoupled from reads)
+            # - upstream_read: reads from pool, queues messages for miner
+            miner_read_task = asyncio.create_task(self._miner_read_loop())
+            miner_write_task = asyncio.create_task(self._miner_write_loop())
+            upstream_read_task = asyncio.create_task(self._upstream_read_loop())
 
-            # Wait for either task to complete (connection closed or error)
+            tasks = [miner_read_task, miner_write_task, upstream_read_task]
+
+            # Wait for any task to complete (connection closed or error)
             done, pending = await asyncio.wait(
-                [miner_task, upstream_task],
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -151,10 +184,10 @@ class MinerSession:
                 f"[{self.session_id}] Waiting for {self._upstream.pending_share_count} "
                 f"pending shares before switching"
             )
-            start_time = asyncio.get_event_loop().time()
+            start_time = time.time()
             timeout = float(self.config.proxy.pending_shares_timeout)
             while self._upstream.has_pending_shares:
-                if asyncio.get_event_loop().time() - start_time > timeout:
+                if time.time() - start_time > timeout:
                     logger.warning(f"[{self.session_id}] Timeout waiting for pending shares")
                     break
                 await self._upstream.read_messages()
@@ -253,9 +286,70 @@ class MinerSession:
                 break
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"[{self.session_id}] Error reading from miner: {e}")
+            except (OSError, ConnectionError) as e:
+                logger.error(
+                    f"[{self.session_id}] Miner connection error: {type(e).__name__}: {e}"
+                )
                 break
+            except Exception as e:
+                logger.error(
+                    f"[{self.session_id}] Error reading from miner: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+                break
+
+    async def _miner_write_loop(self) -> None:
+        """
+        Dedicated writer task for sending messages to the miner.
+
+        Consumes messages from the priority queue and sends them.
+        This decouples reads from writes, allowing smooth handling of
+        message bursts and preventing read blocking on slow writes.
+        """
+        while self._running and not self._closing:
+            try:
+                # Wait for a message with timeout (allows periodic state checks)
+                try:
+                    priority_tuple = await asyncio.wait_for(
+                        self._miner_send_queue.get(),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    # No message available, check if still running
+                    continue
+
+                _, queued_msg = priority_tuple
+                await self._write_to_miner(queued_msg.data)
+                self._miner_send_queue.task_done()
+
+            except asyncio.CancelledError:
+                # Drain remaining messages before exiting
+                await self._drain_miner_queue()
+                break
+            except Exception as e:
+                logger.error(f"[{self.session_id}] Error in miner write loop: {e}")
+                if self._closing:
+                    break
+                await asyncio.sleep(0.1)
+
+    async def _drain_miner_queue(self) -> None:
+        """Drain any remaining messages in the queue before shutdown."""
+        drained = 0
+        while not self._miner_send_queue.empty():
+            try:
+                priority_tuple = self._miner_send_queue.get_nowait()
+                _, queued_msg = priority_tuple
+                await self._write_to_miner(queued_msg.data)
+                self._miner_send_queue.task_done()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Error draining queue: {e}")
+                break
+
+        if drained > 0:
+            logger.debug(f"[{self.session_id}] Drained {drained} messages from queue")
 
     async def _upstream_read_loop(self) -> None:
         """Read and forward messages from upstream to miner."""
@@ -399,7 +493,8 @@ class MinerSession:
         if not self._upstream or not self._upstream.authorized:
             error = [24, "Not authorized", None]
             await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error)
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
             )
             return
 
@@ -408,7 +503,8 @@ class MinerSession:
         if len(msg.params) < 5:
             error = [20, "Invalid submit parameters", None]
             await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error)
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
             )
             return
 
@@ -439,7 +535,8 @@ class MinerSession:
             stats = ProxyStats.get_instance()
             asyncio.create_task(stats.record_share_rejected(self._current_server, reject_reason))
             await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error)
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
             )
             return
 
@@ -490,7 +587,7 @@ class MinerSession:
             # Non-retryable error (explicit pool rejection) or last attempt
             break
 
-        # Record stats
+        # Record stats and cache share appropriately
         stats = ProxyStats.get_instance()
         if accepted:
             logger.info(
@@ -498,6 +595,10 @@ class MinerSession:
                 f"nonce={nonce}, version_bits={version_bits}"
             )
             asyncio.create_task(stats.record_share_accepted(self._current_server))
+            # Cache accepted share to prevent duplicate submissions
+            self._validator.record_accepted_share(
+                job_id, extranonce2, ntime, nonce, version_bits
+            )
         else:
             # Extract rejection reason from error
             reason = "unknown"
@@ -506,8 +607,17 @@ class MinerSession:
             logger.warning(f"[{self.session_id}] Share rejected: {error}")
             asyncio.create_task(stats.record_share_rejected(self._current_server, reason))
 
+            # If pool says "duplicate", cache it locally to prevent re-submission
+            # The pool already has this share, so retrying is pointless
+            reason_lower = reason.lower()
+            if "duplicate" in reason_lower:
+                self._validator.record_accepted_share(
+                    job_id, extranonce2, ntime, nonce, version_bits
+                )
+
         await self._send_to_miner(
-            self._protocol.build_response(msg.id, accepted, error)
+            self._protocol.build_response(msg.id, accepted, error),
+            priority=MessagePriority.HIGH,
         )
 
     async def _forward_to_upstream(self, msg: StratumRequest) -> None:
@@ -515,7 +625,8 @@ class MinerSession:
         if not self._upstream or not self._upstream.connected:
             error = [20, "Upstream not connected", None]
             await self._send_to_miner(
-                self._protocol.build_response(msg.id, None, error)
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.NORMAL,
             )
             return
 
@@ -557,18 +668,52 @@ class MinerSession:
             # Responses are handled by the upstream connection's pending request system
             pass
 
-    async def _send_to_miner(self, data: bytes) -> None:
+    async def _send_to_miner(
+        self,
+        data: bytes,
+        priority: MessagePriority = MessagePriority.NORMAL,
+    ) -> None:
         """
-        Send data to the miner.
+        Queue data for sending to the miner.
+
+        Messages are placed in a priority queue and sent by the dedicated
+        writer task. This decouples message production from socket writes.
 
         Args:
             data: Raw bytes to send.
+            priority: Message priority (HIGH for share responses, NORMAL for notifications).
         """
         if self._closing:
             logger.debug(f"[{self.session_id}] Dropping message, session closing")
             return
         if not self.writer:
             return
+
+        # Create queued message with priority
+        queued_msg = QueuedMessage(data=data, priority=priority)
+
+        # Use sequence number for stable ordering within same priority
+        self._queue_sequence += 1
+        priority_tuple = (priority.value, self._queue_sequence, queued_msg)
+
+        try:
+            self._miner_send_queue.put_nowait(priority_tuple)
+        except asyncio.QueueFull:
+            # This shouldn't happen with unbounded queue, but handle it
+            logger.warning(f"[{self.session_id}] Send queue full, dropping message")
+
+    async def _write_to_miner(self, data: bytes) -> None:
+        """
+        Actually write data to the miner socket.
+
+        Called by the writer task. Handles errors and failure tracking.
+
+        Args:
+            data: Raw bytes to send.
+        """
+        if self._closing or not self.writer:
+            return
+
         try:
             self.writer.write(data)
             await asyncio.wait_for(
@@ -642,6 +787,13 @@ class MinerSession:
 
         logger.info(f"[{self.session_id}] Closing session")
 
+        # Drain any remaining queued messages before closing
+        # Give them a chance to be sent to the miner
+        if self.writer and not self._miner_send_queue.empty():
+            queue_size = self._miner_send_queue.qsize()
+            logger.debug(f"[{self.session_id}] Draining {queue_size} queued messages")
+            await self._drain_miner_queue()
+
         # Close upstream connection
         if self._upstream:
             await self._upstream.disconnect()
@@ -652,8 +804,9 @@ class MinerSession:
             try:
                 self.writer.close()
                 await self.writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                # Expected during unclean disconnects, log at debug level
+                logger.debug(f"[{self.session_id}] Error closing miner connection: {e}")
 
         self.reader = None
         self.writer = None

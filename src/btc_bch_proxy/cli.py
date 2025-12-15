@@ -345,6 +345,7 @@ proxy:
   keepalive_interval: 10
   keepalive_count: 3
   share_submit_retries: 3
+  upstream_health_timeout: 300
 
 servers:
   - name: "stratum1"

@@ -189,6 +189,7 @@ proxy:
   keepalive_interval: 10      # Seconds between keepalive probes
   keepalive_count: 3          # Failed probes before connection is dead
   share_submit_retries: 3     # Retries for failed share submissions
+  upstream_health_timeout: 300  # Seconds without upstream messages before reconnecting
 ```
 
 **Keepalive Settings:**
@@ -201,6 +202,9 @@ The proxy automatically applies socket optimizations for low-latency stratum com
 
 **Share Retry Settings:**
 When a share submission fails due to transient errors (timeouts, connection issues), the proxy will retry up to `share_submit_retries` times with exponential backoff. Explicit pool rejections (duplicate, stale, low difficulty) are not retried.
+
+**Upstream Health Timeout:**
+The proxy monitors connection health by tracking when the last message was received from the upstream pool. Pools typically send `mining.notify` messages every 30-60 seconds. If no messages are received for `upstream_health_timeout` seconds (default 300), the connection is considered unhealthy and will be reconnected. This detects zombie connections that TCP keepalive may not catch.
 
 ### Server Settings
 

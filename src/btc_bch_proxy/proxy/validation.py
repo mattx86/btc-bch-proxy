@@ -122,10 +122,18 @@ class ShareValidator:
         self._jobs[job_info.job_id] = job_info
         self._current_job_id = job_info.job_id
 
-        # If clean_jobs is true, clear old jobs
+        # If clean_jobs is true, clear old jobs AND share cache
+        # New block found - all previous work is now stale
         if job_info.clean_jobs:
             # Keep only the current job
             self._jobs = OrderedDict([(job_info.job_id, job_info)])
+            # Clear share cache - old shares are worthless after new block
+            old_share_count = len(self._recent_shares)
+            self._recent_shares.clear()
+            if old_share_count > 0:
+                logger.debug(
+                    f"[{self.session_id}] Cleared {old_share_count} cached shares (new block)"
+                )
         else:
             # Limit job cache size
             while len(self._jobs) > self._max_job_cache:
@@ -213,16 +221,41 @@ class ShareValidator:
                 if not valid:
                     return False, reason
 
-        # Share is valid - add to recent shares for duplicate detection
-        if self._reject_duplicates:
-            share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
-            self._recent_shares[share_key] = time.time()
-
-            # Maintain cache size
-            while len(self._recent_shares) > self._max_share_cache:
-                self._recent_shares.popitem(last=False)
-
+        # Share passes local validation
+        # NOTE: Do NOT add to cache here - only cache after pool accepts
+        # This allows legitimate retries if the pool rejects the share
         return True, None
+
+    def record_accepted_share(
+        self,
+        job_id: str,
+        extranonce2: str,
+        ntime: str,
+        nonce: str,
+        version_bits: Optional[str] = None,
+    ) -> None:
+        """
+        Record a share that was accepted by the upstream pool.
+
+        Call this ONLY after the pool confirms acceptance. This prevents
+        blocking legitimate retries when the pool rejects a share.
+
+        Args:
+            job_id: Job ID.
+            extranonce2: Extranonce2 value.
+            ntime: Block time.
+            nonce: Block nonce.
+            version_bits: Version bits for version-rolling.
+        """
+        if not self._reject_duplicates:
+            return
+
+        share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
+        self._recent_shares[share_key] = time.time()
+
+        # Maintain cache size
+        while len(self._recent_shares) > self._max_share_cache:
+            self._recent_shares.popitem(last=False)
 
     def _clean_share_cache(self) -> None:
         """Remove expired shares from the cache."""

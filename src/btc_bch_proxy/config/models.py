@@ -90,6 +90,7 @@ class ProxyConfig(BaseModel):
     keepalive_interval: int = Field(default=10, ge=1, description="Seconds between keepalive probes")
     keepalive_count: int = Field(default=3, ge=1, description="Number of failed probes before connection is dead")
     share_submit_retries: int = Field(default=3, ge=1, le=10, description="Number of times to retry failed share submissions")
+    upstream_health_timeout: int = Field(default=300, ge=60, description="Seconds without upstream messages before reconnecting")
 
 
 class LoggingConfig(BaseModel):

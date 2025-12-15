@@ -90,7 +90,10 @@ class UpstreamConnection:
 
         # Connection health tracking
         self._last_message_time: float = 0.0
-        self._connection_health_timeout: float = 300.0  # 5 minutes without messages = unhealthy
+        # Use config value if available, otherwise default to 300s (5 minutes)
+        self._connection_health_timeout: float = float(
+            proxy_config.upstream_health_timeout if proxy_config else 300
+        )
 
     @property
     def connected(self) -> bool:
@@ -344,6 +347,14 @@ class UpstreamConnection:
                     logger.error(f"Invalid extranonce1 from {self.name}: {self.extranonce1}")
                     return False
 
+                # Validate extranonce2_size is reasonable (typically 2-8 bytes)
+                if not (1 <= self.extranonce2_size <= 16):
+                    logger.error(
+                        f"Invalid extranonce2_size from {self.name}: {self.extranonce2_size} "
+                        f"(expected 1-16)"
+                    )
+                    return False
+
                 # Extract subscription ID from mining.notify entry if present
                 self.subscription_id = None
                 if isinstance(subscriptions, list):
@@ -494,9 +505,9 @@ class UpstreamConnection:
 
         try:
             # Read from socket while waiting for the response (with lock to prevent concurrent reads)
-            deadline = asyncio.get_event_loop().time() + self.config.timeout
+            deadline = time_module.time() + self.config.timeout
             while not future.done():
-                remaining = deadline - asyncio.get_event_loop().time()
+                remaining = deadline - time_module.time()
                 if remaining <= 0:
                     raise asyncio.TimeoutError()
 
