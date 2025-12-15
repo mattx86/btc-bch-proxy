@@ -546,13 +546,13 @@ class MinerSession:
         # Get version_bits if present (6th param for version-rolling)
         version_bits = msg.params[5] if len(msg.params) > 5 else None
 
-        logger.debug(
+        logger.info(
             f"[{self.session_id}] Share submit: job={job_id}, "
-            f"nonce={nonce}, worker={worker_name}"
-            + (f", version_bits={version_bits}" if version_bits else "")
+            f"nonce={nonce}, version_bits={version_bits}"
         )
 
         # Validate share locally before submitting
+        logger.info(f"[{self.session_id}] Calling validate_share...")
         valid, reject_reason = self._validator.validate_share(
             job_id=job_id,
             extranonce2=extranonce2,
@@ -561,6 +561,8 @@ class MinerSession:
             extranonce1=self._upstream.extranonce1,
             version_bits=version_bits,
         )
+
+        logger.info(f"[{self.session_id}] validate_share returned: valid={valid}")
 
         if not valid:
             # Reject locally - don't forward to pool
@@ -575,6 +577,7 @@ class MinerSession:
             return
 
         # Submit to upstream with retry logic for transient failures
+        logger.info(f"[{self.session_id}] Calling submit_share...")
         max_retries = self.config.proxy.share_submit_retries
         retry_delay = 0.5
         accepted = False
