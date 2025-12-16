@@ -748,7 +748,12 @@ class MinerSession:
         while self._running and not self._closing:
             try:
                 if not self._upstream or not self._upstream.connected:
-                    await asyncio.sleep(POLL_SLEEP_INTERVAL)
+                    # Upstream disconnected - attempt to reconnect
+                    logger.info(f"[{self.session_id}] Upstream disconnected, attempting reconnect...")
+                    await self._reconnect_upstream()
+                    # If still not connected after reconnect attempt, wait before retrying
+                    if not self._upstream or not self._upstream.connected:
+                        await asyncio.sleep(1)
                     continue
 
                 messages = await self._upstream.read_messages()
