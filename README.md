@@ -22,7 +22,7 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 ### Quick Start (Recommended)
 
 ```bash
-git clone https://github.com/yourusername/btc-bch-proxy.git
+git clone https://github.com/mattx86/btc-bch-proxy.git
 cd btc-bch-proxy
 
 # Windows
@@ -38,7 +38,7 @@ This creates a virtual environment, installs dependencies, and generates `config
 ### Manual Installation
 
 ```bash
-git clone https://github.com/yourusername/btc-bch-proxy.git
+git clone https://github.com/mattx86/btc-bch-proxy.git
 cd btc-bch-proxy
 
 # Create venv and install
@@ -66,7 +66,7 @@ btc-bch-proxy init --no-venv
    # Windows
    init.bat
 
-   # Linux/Mac
+   # Linux
    ./init.sh
    ```
 
