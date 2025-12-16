@@ -29,6 +29,7 @@ class JobInfo:
     ntime: str
     clean_jobs: bool
     received_at: float = field(default_factory=time.time)
+    source_server: Optional[str] = None  # Which pool issued this job (for grace period routing)
 
 
 @dataclass
@@ -107,6 +108,11 @@ class ShareValidator:
         self._jobs: OrderedDict[str, JobInfo] = OrderedDict()
         self._current_job_id: Optional[str] = None
 
+        # Job source tracking for grace period routing
+        # Maps job_id -> source_server (persists across cache clears for grace period)
+        self._job_sources: OrderedDict[str, str] = OrderedDict()
+        self._max_job_sources = 100  # Limit to prevent unbounded growth
+
         # Current difficulty
         self._difficulty: float = 1.0
 
@@ -162,13 +168,23 @@ class ShareValidator:
         self._extranonce2_size = size
         logger.debug(f"[{self.session_id}] Extranonce2 size set to {size} bytes")
 
-    def add_job(self, job_info: JobInfo) -> None:
+    def add_job(self, job_info: JobInfo, source_server: Optional[str] = None) -> None:
         """
         Add a new job from mining.notify.
 
         Args:
             job_info: Job information.
+            source_server: Optional server name that issued this job (for grace period routing).
         """
+        # Store source server in job info if provided
+        if source_server:
+            job_info.source_server = source_server
+            # Track in job_sources dict (persists across cache clears for grace period)
+            self._job_sources[job_info.job_id] = source_server
+            # Limit job source tracking to prevent unbounded growth
+            while len(self._job_sources) > self._max_job_sources:
+                self._job_sources.popitem(last=False)
+
         self._jobs[job_info.job_id] = job_info
         self._current_job_id = job_info.job_id
 
@@ -184,22 +200,24 @@ class ShareValidator:
                 logger.debug(
                     f"[{self.session_id}] Cleared {old_share_count} cached shares (new block)"
                 )
+            # NOTE: Do NOT clear _job_sources here - needed for grace period routing
         else:
             # Limit job cache size
             while len(self._jobs) > self._max_job_cache:
                 self._jobs.popitem(last=False)
 
         logger.debug(
-            f"[{self.session_id}] New job {job_info.job_id} "
+            f"[{self.session_id}] New job {job_info.job_id} from {source_server or 'unknown'} "
             f"(clean={job_info.clean_jobs}, total jobs={len(self._jobs)})"
         )
 
-    def add_job_from_notify(self, params: list) -> None:
+    def add_job_from_notify(self, params: list, source_server: Optional[str] = None) -> None:
         """
         Parse and add a job from mining.notify parameters.
 
         Args:
             params: mining.notify parameters.
+            source_server: Optional server name that issued this job (for grace period routing).
         """
         if len(params) < 9:
             logger.warning(f"[{self.session_id}] Invalid mining.notify params: {params}")
@@ -216,7 +234,23 @@ class ShareValidator:
             ntime=str(params[7]),
             clean_jobs=bool(params[8]) if len(params) > 8 else False,
         )
-        self.add_job(job_info)
+        self.add_job(job_info, source_server)
+
+    def get_job_source(self, job_id: str) -> Optional[str]:
+        """
+        Look up which server issued a job.
+
+        Used during grace period to route shares to the correct pool.
+        This lookup persists across cache clears because _job_sources
+        is maintained separately from _jobs.
+
+        Args:
+            job_id: The job ID to look up.
+
+        Returns:
+            Server name that issued the job, or None if unknown.
+        """
+        return self._job_sources.get(job_id)
 
     def validate_share(
         self,

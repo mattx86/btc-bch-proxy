@@ -225,7 +225,6 @@ class MinerSession:
 
         # Old upstream kept alive during grace period for stale share submission
         self._old_upstream: Optional[UpstreamConnection] = None
-        self._old_upstream_extranonce2_size: Optional[int] = None
         self._old_upstream_server_name: Optional[str] = None
 
         # Pending requests and shares
@@ -495,14 +494,13 @@ class MinerSession:
                     await asyncio.sleep(POLL_SLEEP_INTERVAL)
 
             # Keep old upstream alive for grace period to accept stale shares
-            # (miner may have in-flight work with old extranonce2 format)
+            # (miner may have in-flight work with old jobs after switch)
             if old_upstream and is_server_switch:
                 # Clean up any previous old upstream first
                 if self._old_upstream:
                     await self._old_upstream.disconnect()
 
                 self._old_upstream = old_upstream
-                self._old_upstream_extranonce2_size = old_upstream.extranonce2_size
                 self._old_upstream_server_name = self._current_server
                 logger.info(
                     f"[{self.session_id}] Keeping old upstream {self._current_server} alive "
@@ -931,7 +929,6 @@ class MinerSession:
             except Exception as e:
                 logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
             self._old_upstream = None
-            self._old_upstream_extranonce2_size = None
             self._old_upstream_server_name = None
 
         if not self._upstream or not self._upstream.authorized:
@@ -1033,6 +1030,47 @@ class MinerSession:
             f"nonce={nonce}, version_bits={version_bits}"
         )
 
+        # Check job source to determine which pool should receive this share
+        # This is the primary routing mechanism - route to the pool that issued the job
+        job_source = self._validator.get_job_source(job_id)
+        in_grace_period = (
+            self._old_upstream is not None
+            and self._old_upstream.connected
+            and self._last_switch_time > 0
+            and (time.time() - self._last_switch_time) < SERVER_SWITCH_GRACE_PERIOD
+        )
+
+        # Route to old pool if job was issued by old pool and we're in grace period
+        if in_grace_period and job_source == self._old_upstream_server_name:
+            logger.info(
+                f"[{self.session_id}] Routing share to source pool "
+                f"({self._old_upstream_server_name}): job={job_id}"
+            )
+            accepted, error = await self._old_upstream.submit_share(
+                worker_name, job_id, extranonce2, ntime, nonce, version_bits
+            )
+            stats = ProxyStats.get_instance()
+            if accepted:
+                logger.info(
+                    f"[{self.session_id}] Share accepted by source pool "
+                    f"({self._old_upstream_server_name}): job={job_id}"
+                )
+                fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
+            else:
+                reason = _get_error_message(error)
+                logger.info(
+                    f"[{self.session_id}] Share rejected by source pool "
+                    f"({self._old_upstream_server_name}): {reason}"
+                )
+                fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
+
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, accepted, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        # Route to current pool (normal case)
         # Capture upstream reference to avoid null dereference if it changes mid-validation
         upstream = self._upstream
         if not upstream or not upstream.extranonce1:
@@ -1043,7 +1081,7 @@ class MinerSession:
             )
             return
 
-        # Validate share locally before submitting
+        # Validate share locally before submitting to current pool
         valid, reject_reason = self._validator.validate_share(
             job_id=job_id,
             extranonce2=extranonce2,
@@ -1054,49 +1092,7 @@ class MinerSession:
         )
 
         if not valid:
-            # Check if this is a stale share from previous pool during grace period
-            # (miner may have in-flight work with old extranonce2 size after switch)
-            can_submit_to_old_pool = (
-                "extranonce2 length" in reject_reason
-                and self._old_upstream is not None
-                and self._old_upstream.connected
-                and self._last_switch_time > 0
-                and (time.time() - self._last_switch_time) < SERVER_SWITCH_GRACE_PERIOD
-                and self._old_upstream_extranonce2_size is not None
-                and len(extranonce2) == self._old_upstream_extranonce2_size * 2
-            )
-
-            if can_submit_to_old_pool:
-                # Submit to old upstream instead of rejecting
-                logger.info(
-                    f"[{self.session_id}] Routing stale share to old pool "
-                    f"({self._old_upstream_server_name}): job={job_id}"
-                )
-                accepted, error = await self._old_upstream.submit_share(
-                    worker_name, job_id, extranonce2, ntime, nonce, version_bits
-                )
-                stats = ProxyStats.get_instance()
-                if accepted:
-                    logger.info(
-                        f"[{self.session_id}] Stale share accepted by old pool "
-                        f"({self._old_upstream_server_name}): job={job_id}"
-                    )
-                    fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
-                else:
-                    reason = _get_error_message(error)
-                    logger.info(
-                        f"[{self.session_id}] Stale share rejected by old pool "
-                        f"({self._old_upstream_server_name}): {reason}"
-                    )
-                    fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
-
-                await self._send_to_miner(
-                    self._protocol.build_response(msg.id, accepted, error),
-                    priority=MessagePriority.HIGH,
-                )
-                return
-
-            # Regular rejection - can't forward to any pool
+            # Share rejected locally - can't forward to current pool
             logger.warning(f"[{self.session_id}] Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason))
@@ -1265,8 +1261,8 @@ class MinerSession:
                 await self._send_to_miner(data)
 
                 if msg.method == StratumMethods.MINING_NOTIFY:
-                    # Track job for validation
-                    self._validator.add_job_from_notify(msg.params)
+                    # Track job for validation (include source server for grace period routing)
+                    self._validator.add_job_from_notify(msg.params, self._current_server)
                     logger.debug(f"[{self.session_id}] Job notification forwarded")
                 elif msg.method == StratumMethods.MINING_SET_DIFFICULTY:
                     # Track difficulty for validation
