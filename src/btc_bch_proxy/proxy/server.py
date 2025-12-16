@@ -122,10 +122,38 @@ class StratumProxyServer:
         # Signal stop
         self._stop_event.set()
 
-        # Stop accepting new connections
+        # Stop accepting new connections (but don't wait yet - that would deadlock)
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+
+        # CLOSE SESSIONS FIRST - this must happen before wait_closed()
+        # because wait_closed() waits for all _handle_connection callbacks to finish,
+        # and those won't finish until session.run() exits, which requires closing sessions
+        async with self._session_lock:
+            sessions = list(self._sessions.values())
+
+        if sessions:
+            logger.info(f"Closing {len(sessions)} active sessions...")
+            # Close all sessions concurrently with a timeout
+            close_tasks = [session.close() for session in sessions]
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*close_tasks, return_exceptions=True),
+                    timeout=5.0  # 5 second overall timeout for all sessions
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for sessions to close, forcing shutdown")
+
+        # Clear the sessions dict
+        async with self._session_lock:
+            self._sessions.clear()
+
+        # NOW wait for all connection handlers to finish (should be quick since sessions are closed)
+        if self._server:
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for server to close")
 
         # Stop scheduler
         if self._scheduler_task:
@@ -145,27 +173,6 @@ class StratumProxyServer:
 
         # Log final stats before shutdown
         await ProxyStats.get_instance().log_stats()
-
-        # Close all sessions IN PARALLEL (each session closes its own upstream connection)
-        # Don't hold the lock while waiting - just grab the session list
-        async with self._session_lock:
-            sessions = list(self._sessions.values())
-
-        if sessions:
-            logger.info(f"Closing {len(sessions)} active sessions...")
-            # Close all sessions concurrently with a timeout
-            close_tasks = [session.close() for session in sessions]
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*close_tasks, return_exceptions=True),
-                    timeout=5.0  # 5 second overall timeout for all sessions
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for sessions to close, forcing shutdown")
-
-        # Clear the sessions dict
-        async with self._session_lock:
-            self._sessions.clear()
 
         logger.info("Proxy server stopped")
 
