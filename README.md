@@ -28,7 +28,7 @@ cd btc-bch-proxy
 # Windows
 init.bat
 
-# Linux/Mac
+# Linux
 chmod +x *.sh
 ./init.sh
 ```
@@ -44,7 +44,7 @@ cd btc-bch-proxy
 # Create venv and install
 python -m venv venv
 venv\Scripts\activate     # Windows
-source venv/bin/activate  # Linux/Mac
+source venv/bin/activate  # Linux
 
 pip install -e .
 btc-bch-proxy init --no-venv
@@ -80,26 +80,26 @@ btc-bch-proxy init --no-venv
      bind_port: 3333
 
    servers:
-     - name: "pool1"
+     - name: "btc"
        host: "stratum.pool1.com"
        port: 3333
        username: "your_wallet.worker1"
        password: "x"
 
-     - name: "pool2"
+     - name: "bch"
        host: "stratum.pool2.com"
        port: 3333
-       username: "your_wallet.worker2"
+       username: "your_wallet.worker1"
        password: "x"
 
    schedule:
      - start: "00:00"
        end: "12:00"
-       server: "pool1"
+       server: "btc"
 
      - start: "12:00"
        end: "24:00"
-       server: "pool2"
+       server: "bch"
    ```
 
 3. **Validate the configuration:**
@@ -115,7 +115,7 @@ btc-bch-proxy init --no-venv
    start.bat              # Run in background
    start.bat -f           # Run in foreground (for debugging)
 
-   # Linux/Mac
+   # Linux
    ./start.sh             # Run in background
    ./start.sh -f          # Run in foreground (for debugging)
    ```
@@ -126,7 +126,7 @@ btc-bch-proxy init --no-venv
    # Windows
    stop.bat
 
-   # Linux/Mac
+   # Linux
    ./stop.sh
    ```
 
@@ -310,12 +310,12 @@ Server: pool2
 ## How It Works
 
 ```
-┌─────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Miner  │────▶│  Stratum Proxy  │────▶│  Pool 1 (Day)   │
-│  Miner  │────▶│                 │     └─────────────────┘
-│  Miner  │────▶│  Time Router    │────▶┌─────────────────┐
-└─────────┘     └─────────────────┘     │  Pool 2 (Night) │
-                                        └─────────────────┘
++--------+    +------------------+    +------------------+
+| Miners |--->|  Stratum Proxy   |--->|  Pool 1 (Day)    |
+|        |--->|                  |    +------------------+
+|        |--->|  Time Router     |--->+------------------+
++--------+    +------------------+    |  Pool 2 (Night)  |
+                                      +------------------+
 ```
 
 1. Miners connect to the proxy using any credentials
