@@ -7,24 +7,40 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
 from btc_bch_proxy.stratum.messages import (
+    StratumMessage,
     StratumMethods,
     StratumNotification,
     StratumRequest,
     StratumResponse,
 )
-from btc_bch_proxy.stratum.protocol import StratumProtocol
+from btc_bch_proxy.stratum.protocol import StratumProtocol, StratumProtocolError
 from btc_bch_proxy.proxy.upstream import UpstreamConnection
 from btc_bch_proxy.proxy.stats import ProxyStats
 from btc_bch_proxy.proxy.validation import ShareValidator
 from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
+from btc_bch_proxy.proxy.utils import fire_and_forget
+from btc_bch_proxy.proxy.constants import (
+    MAX_ERROR_MESSAGE_LENGTH,
+    MAX_MINER_STRING_LENGTH,
+    MINER_SEND_QUEUE_MAX_SIZE,
+    MINER_WRITE_LOOP_TIMEOUT,
+    POLL_SLEEP_INTERVAL,
+    QUEUE_DRAIN_TIMEOUT,
+    QUEUE_DRAIN_WRITE_TIMEOUT,
+    SHARE_SUBMIT_INITIAL_RETRY_DELAY,
+    SHARE_SUBMIT_MAX_RETRY_DELAY,
+    SHARE_SUBMIT_MAX_TOTAL_TIME,
+    SOCKET_READ_BUFFER_SIZE,
+    UPSTREAM_HEALTH_CHECK_INTERVAL,
+)
 
 
-def _get_error_message(error) -> str:
+def _get_error_message(error: Any, max_length: int = MAX_ERROR_MESSAGE_LENGTH) -> str:
     """
     Extract error message from various error formats.
 
@@ -34,21 +50,75 @@ def _get_error_message(error) -> str:
 
     Args:
         error: Error in list or dict format.
+        max_length: Maximum length for returned message (prevents log bloat).
 
     Returns:
-        Error message string.
+        Error message string (truncated if exceeds max_length).
     """
     if error is None:
         return "unknown"
 
+    result: str
     if isinstance(error, dict):
         # JSON-RPC 2.0 style: {"code": N, "message": "..."}
-        return str(error.get("message", error.get("code", "unknown")))
+        result = str(error.get("message", error.get("code", "unknown")))
     elif isinstance(error, (list, tuple)) and len(error) >= 2:
         # Stratum style: [code, "message", traceback]
-        return str(error[1])
+        result = str(error[1])
     else:
-        return str(error) if error else "unknown"
+        result = str(error) if error else "unknown"
+
+    # Truncate to prevent excessively long error messages in logs/stats
+    if len(result) > max_length:
+        # Log full message at DEBUG level for troubleshooting
+        logger.debug(f"Full error message (truncated in logs): {result}")
+        return result[:max_length] + "..."
+    return result
+
+
+def _sanitize_miner_string(value: str, max_length: int = MAX_MINER_STRING_LENGTH) -> str:
+    """
+    Sanitize a string provided by a miner.
+
+    Prevents log injection and excessive memory usage.
+
+    Args:
+        value: Raw string from miner.
+        max_length: Maximum allowed length.
+
+    Returns:
+        Sanitized string.
+    """
+    if not value:
+        return ""
+    # Truncate to max length
+    value = str(value)[:max_length]
+    # Remove control characters that could affect logging/display
+    # Keep only printable ASCII and common unicode
+    return "".join(c if c.isprintable() or c == " " else "?" for c in value)
+
+
+def _is_valid_hex(value: str, max_length: int = 64) -> bool:
+    """
+    Check if a string is valid hexadecimal.
+
+    Args:
+        value: String to check.
+        max_length: Maximum allowed length.
+
+    Returns:
+        True if valid hex within length limit.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    if len(value) > max_length:
+        return False
+    try:
+        int(value, 16)
+        return True
+    except ValueError:
+        return False
+
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -62,9 +132,16 @@ class MessagePriority(Enum):
     LOW = auto()     # Other messages
 
 
-@dataclass
+@dataclass(order=False)
 class QueuedMessage:
-    """A message queued for sending to the miner."""
+    """
+    A message queued for sending to the miner.
+
+    Note: order=False disables comparison operators (<, <=, >, >=) because
+    this class contains bytes which has non-intuitive ordering behavior.
+    The PriorityQueue uses (priority.value, sequence, message) tuples where
+    comparison should never reach the message element due to unique sequences.
+    """
     data: bytes
     priority: MessagePriority = MessagePriority.NORMAL
 
@@ -78,7 +155,25 @@ class MinerSession:
     - Message relay between miner and upstream
     - Server switching during time-based transitions
     - Graceful handling of pending shares during switches
+
+    Lock Ordering (to prevent deadlocks):
+        When acquiring multiple locks, always acquire in this order:
+        1. _closing_lock - Protects session shutdown state
+        2. _upstream_lock - Protects upstream connection during reconnection/submission
+        3. _queue_sequence_lock - Protects send queue sequence counter
+        4. _queue_drain_lock - Protects queue drain flag
+
+        Individual locks can be acquired independently, but if multiple
+        locks are needed, follow the order above. Currently no code path
+        requires holding multiple locks simultaneously.
+
+    Protocol Error Handling:
+        Consecutive protocol errors are tracked to prevent DoS from malformed
+        data. After MAX_CONSECUTIVE_PROTOCOL_ERRORS, the connection is closed.
     """
+
+    # Maximum consecutive protocol errors before closing connection
+    MAX_CONSECUTIVE_PROTOCOL_ERRORS = 10
 
     def __init__(
         self,
@@ -101,7 +196,9 @@ class MinerSession:
         self.router = router
         self.config = config
 
-        self.session_id = uuid.uuid4().hex[:8]
+        # Use 12 hex chars (48 bits) for session ID to reduce collision probability
+        # With 48 bits, collision probability is ~1 in 1000 at 17 million sessions
+        self.session_id = uuid.uuid4().hex[:12]
         self._protocol = StratumProtocol()
 
         # Session state
@@ -109,6 +206,7 @@ class MinerSession:
         self._authorized = False
         self._running = False
         self._closing = False
+        self._closing_lock = asyncio.Lock()  # Protects _closing flag
 
         # Miner info
         self.worker_name: Optional[str] = None
@@ -117,43 +215,85 @@ class MinerSession:
         # Current upstream - each session gets its OWN connection
         self._current_server: Optional[str] = None
         self._upstream: Optional[UpstreamConnection] = None
+        self._upstream_lock = asyncio.Lock()  # Protects _upstream during reconnection
 
         # Pending requests and shares
         self._pending_shares: dict[int, asyncio.Future] = {}
         self._miner_request_id = 0
 
         # Send failure tracking
+        # Note: Not protected by lock. The += operation is not atomic, so concurrent
+        # increments could be lost. This is acceptable because the counter only affects
+        # when the session closes (off by 1 failure at worst), not correctness.
         self._consecutive_send_failures = 0
         self._max_send_failures = 3  # Close session after this many consecutive failures
 
         # Difficulty tracking
         self._current_difficulty: Optional[float] = None
 
-        # Client address
+        # Client address (defensive check for malformed peername tuple)
         peername = writer.get_extra_info("peername")
-        self.client_addr = f"{peername[0]}:{peername[1]}" if peername else "unknown"
+        if peername and len(peername) >= 2:
+            self.client_addr = f"{peername[0]}:{peername[1]}"
+        else:
+            self.client_addr = "unknown"
 
         # Share validator
         self._validator = ShareValidator(self.session_id, config.validation)
 
         # Async queue for miner-bound messages (decouples read from write)
         # Using PriorityQueue to ensure high-priority messages (share responses) are sent first
-        self._miner_send_queue: asyncio.PriorityQueue[tuple[int, QueuedMessage]] = asyncio.PriorityQueue()
+        # Bounded queue provides backpressure to prevent memory exhaustion
+        self._miner_send_queue: asyncio.PriorityQueue[tuple[int, int, QueuedMessage]] = asyncio.PriorityQueue(
+            maxsize=MINER_SEND_QUEUE_MAX_SIZE
+        )
+        # Priority queue uses tuple comparison: (priority.value, sequence, message)
+        # Python compares tuples element-by-element left-to-right, so lower priority
+        # values are dequeued first, with sequence number as tiebreaker for FIFO within priority
         self._queue_sequence = 0  # For stable ordering within same priority
+        # Wrap at 2^32 - at 1000 msg/sec, wraps after ~50 days continuous operation.
+        # After wrap, messages with same priority may briefly reorder (acceptable trade-off).
+        self._queue_sequence_modulo = 0x100000000
+        self._queue_sequence_lock = asyncio.Lock()  # Lock for _queue_sequence
+        self._queue_drained = False  # Flag to prevent double-draining
+        self._queue_drain_lock = asyncio.Lock()  # Protects _queue_drained flag
 
         # Enable TCP keepalive on miner connection
         enable_tcp_keepalive(writer, config.proxy, f"miner:{self.session_id}")
+
+        # Protocol error tracking (for DoS protection)
+        self._consecutive_protocol_errors = 0
 
         logger.info(f"[{self.session_id}] New miner session from {self.client_addr}")
 
     @property
     def is_active(self) -> bool:
-        """Check if the session is active."""
+        """
+        Check if the session is active (approximate).
+
+        Note: This reads two volatile fields without synchronization.
+        This is acceptable because both are booleans (atomic reads due to
+        Python's GIL), and callers don't rely on strict accuracy.
+
+        WARNING: The returned value may become stale immediately. Do not
+        use this for critical control flow that requires precise state.
+        For server switch coordination, additional synchronization is used.
+        """
         return self._running and not self._closing
+
+    async def _set_closing(self) -> None:
+        """Thread-safe method to set closing flag."""
+        async with self._closing_lock:
+            self._closing = True
 
     @property
     def send_queue_depth(self) -> int:
-        """Get the number of messages waiting to be sent to the miner."""
+        """
+        Get the number of messages waiting to be sent to the miner.
+
+        Note: This returns an approximate value as the queue may be
+        modified concurrently by other tasks.
+        """
         return self._miner_send_queue.qsize()
 
     async def run(self) -> None:
@@ -201,6 +341,8 @@ class MinerSession:
         Connect to an upstream server.
 
         Each session creates its OWN upstream connection for isolation.
+        Protected by _upstream_lock to prevent concurrent access during
+        connection/reconnection.
 
         Args:
             server_name: Name of the server to connect to.
@@ -208,24 +350,49 @@ class MinerSession:
         Returns:
             True if connected successfully.
         """
+        async with self._upstream_lock:
+            return await self._connect_upstream_internal(server_name)
+
+    async def _connect_upstream_internal(self, server_name: str) -> bool:
+        """
+        Internal implementation of upstream connection (must hold _upstream_lock).
+
+        Concurrency Note:
+            While this method holds _upstream_lock, share submissions via _handle_submit()
+            may still be in progress using the old upstream reference. This is safe because:
+            1. Share submits capture self._upstream at the start of each retry attempt
+            2. If the old upstream is disconnected, the submit fails with a retryable error
+            3. The retry logic reconnects and re-captures the new upstream
+            4. The share is then submitted to the new connection
+            So shares are not lost during server switch, though there may be brief retry delays.
+        """
         # Wait for pending shares on current upstream before switching
         if self._upstream and self._upstream.has_pending_shares:
+            initial_pending = self._upstream.pending_share_count
             logger.info(
-                f"[{self.session_id}] Waiting for {self._upstream.pending_share_count} "
+                f"[{self.session_id}] Waiting for {initial_pending} "
                 f"pending shares before switching"
             )
             start_time = time.time()
             timeout = float(self.config.proxy.pending_shares_timeout)
             while self._upstream.has_pending_shares:
                 if time.time() - start_time > timeout:
-                    logger.warning(f"[{self.session_id}] Timeout waiting for pending shares")
+                    remaining = self._upstream.pending_share_count
+                    logger.warning(
+                        f"[{self.session_id}] Timeout waiting for pending shares: "
+                        f"{remaining} shares abandoned (miner may lose these shares)"
+                    )
                     break
                 await self._upstream.read_messages()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(POLL_SLEEP_INTERVAL)
 
         # Disconnect old upstream if switching
         if self._upstream:
             await self._upstream.disconnect()
+
+        # Clear share cache to prevent false duplicate detection with new upstream
+        # New pool may have different job IDs or the old shares are now stale
+        self._validator.clear_share_cache()
 
         # Get server config
         server_config = self.router.get_server_config(server_name)
@@ -261,32 +428,40 @@ class MinerSession:
         return True
 
     async def _reconnect_upstream(self) -> None:
-        """Reconnect to the current upstream server."""
+        """
+        Reconnect to the current upstream server.
+
+        Protected by _upstream_lock to prevent races with handle_server_switch.
+        """
         if not self._current_server:
             return
 
-        logger.info(f"[{self.session_id}] Attempting to reconnect to {self._current_server}")
+        async with self._upstream_lock:
+            logger.info(f"[{self.session_id}] Attempting to reconnect to {self._current_server}")
 
-        # Disconnect current connection
-        if self._upstream:
-            await self._upstream.disconnect()
+            # Disconnect current connection and clear reference
+            if self._upstream:
+                await self._upstream.disconnect()
+                self._upstream = None  # Clear to avoid stale reference
 
-        # Wait a bit before reconnecting
-        await asyncio.sleep(1)
+            # Wait a bit before reconnecting
+            await asyncio.sleep(1)
 
-        # Reconnect
-        if await self._connect_upstream(self._current_server):
-            logger.info(f"[{self.session_id}] Reconnected to {self._current_server}")
+            # Reconnect (calls _connect_upstream_internal since we already hold lock)
+            if await self._connect_upstream_internal(self._current_server):
+                logger.info(f"[{self.session_id}] Reconnected to {self._current_server}")
 
-            # Send set_extranonce to miner with new values
-            if self._upstream and self._upstream.subscribed:
-                notification = StratumNotification(
-                    method=StratumMethods.MINING_SET_EXTRANONCE,
-                    params=[self._upstream.extranonce1, self._upstream.extranonce2_size],
-                )
-                await self._send_to_miner(StratumProtocol.encode_message(notification))
-        else:
-            logger.error(f"[{self.session_id}] Failed to reconnect to {self._current_server}")
+                # Send set_extranonce to miner with new values
+                if self._upstream and self._upstream.subscribed:
+                    notification = StratumNotification(
+                        method=StratumMethods.MINING_SET_EXTRANONCE,
+                        params=[self._upstream.extranonce1, self._upstream.extranonce2_size],
+                    )
+                    await self._send_to_miner(StratumProtocol.encode_message(notification))
+            else:
+                logger.error(f"[{self.session_id}] Failed to reconnect to {self._current_server}")
+                # Ensure upstream is None on failure (defensive)
+                self._upstream = None
 
     async def _miner_read_loop(self) -> None:
         """Read and process messages from the miner."""
@@ -295,7 +470,7 @@ class MinerSession:
                 # Use a long timeout - miners only send data when submitting shares
                 # which can be infrequent depending on difficulty
                 data = await asyncio.wait_for(
-                    self.reader.read(8192),
+                    self.reader.read(SOCKET_READ_BUFFER_SIZE),
                     timeout=float(self.config.proxy.miner_read_timeout),
                 )
 
@@ -303,9 +478,18 @@ class MinerSession:
                     logger.info(f"[{self.session_id}] Miner disconnected")
                     break
 
-                logger.debug(f"[{self.session_id}] Received from miner: {data.decode().strip()}")
+                # Sanitize for logging (prevent log injection via control characters)
+                log_data = data.decode(errors='replace').strip()
+                log_data = "".join(c if c.isprintable() or c == " " else "?" for c in log_data[:500])
+                logger.debug(f"[{self.session_id}] Received from miner: {log_data}")
+
                 messages = self._protocol.feed_data(data)
                 logger.debug(f"[{self.session_id}] Parsed {len(messages)} messages from miner")
+
+                # Reset protocol error counter on successful parse
+                if messages:
+                    self._consecutive_protocol_errors = 0
+
                 for msg in messages:
                     await self._handle_miner_message(msg)
 
@@ -321,6 +505,22 @@ class MinerSession:
                     f"[{self.session_id}] Miner connection error: {type(e).__name__}: {e}"
                 )
                 break
+            except StratumProtocolError as e:
+                # Protocol error - reset buffer and track consecutive errors
+                # This handles malformed JSON or oversized messages
+                self._consecutive_protocol_errors += 1
+                logger.warning(
+                    f"[{self.session_id}] Protocol error from miner: {e} "
+                    f"({self._consecutive_protocol_errors}/{self.MAX_CONSECUTIVE_PROTOCOL_ERRORS})"
+                )
+                self._protocol.reset_buffer()
+
+                # Close connection after too many consecutive errors (DoS protection)
+                if self._consecutive_protocol_errors >= self.MAX_CONSECUTIVE_PROTOCOL_ERRORS:
+                    logger.error(
+                        f"[{self.session_id}] Too many protocol errors, closing connection"
+                    )
+                    break
             except Exception as e:
                 logger.error(
                     f"[{self.session_id}] Error reading from miner: {type(e).__name__}: {e}",
@@ -337,12 +537,13 @@ class MinerSession:
         message bursts and preventing read blocking on slow writes.
         """
         while self._running and not self._closing:
+            priority_tuple = None
             try:
                 # Wait for a message with timeout (allows periodic state checks)
                 try:
                     priority_tuple = await asyncio.wait_for(
                         self._miner_send_queue.get(),
-                        timeout=1.0,
+                        timeout=MINER_WRITE_LOOP_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     # No message available, check if still running
@@ -350,36 +551,82 @@ class MinerSession:
 
                 _, _, queued_msg = priority_tuple
                 await self._write_to_miner(queued_msg.data)
-                self._miner_send_queue.task_done()
 
             except asyncio.CancelledError:
                 # Drain remaining messages before exiting
+                # task_done for current item handled in finally block
                 await self._drain_miner_queue()
                 break
             except Exception as e:
                 logger.error(f"[{self.session_id}] Error in miner write loop: {e}")
                 if self._closing:
                     break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(POLL_SLEEP_INTERVAL)
+            finally:
+                # Always mark queue item as done if we got one (required for join())
+                if priority_tuple is not None:
+                    self._miner_send_queue.task_done()
 
     async def _drain_miner_queue(self) -> None:
-        """Drain any remaining messages in the queue before shutdown."""
-        drained = 0
-        while not self._miner_send_queue.empty():
-            try:
-                priority_tuple = self._miner_send_queue.get_nowait()
-                _, _, queued_msg = priority_tuple
-                await self._write_to_miner(queued_msg.data)
-                self._miner_send_queue.task_done()
-                drained += 1
-            except asyncio.QueueEmpty:
-                break
-            except Exception as e:
-                logger.debug(f"[{self.session_id}] Error draining queue: {e}")
-                break
+        """
+        Drain any remaining messages in the queue before shutdown.
 
-        if drained > 0:
-            logger.debug(f"[{self.session_id}] Drained {drained} messages from queue")
+        Uses timeouts to prevent indefinite blocking if miner socket is broken.
+        The entire drain operation is protected by lock to prevent:
+        1. Concurrent drains from multiple tasks
+        2. Flag being set before drain completes (would prevent retry on failure)
+        """
+        # Lock covers entire drain operation to ensure atomicity
+        async with self._queue_drain_lock:
+            if self._queue_drained:
+                return
+
+            drained = 0
+            should_stop = False
+            drain_start = time.time()
+
+            try:
+                while not self._miner_send_queue.empty() and not should_stop:
+                    # Overall drain timeout
+                    if time.time() - drain_start > QUEUE_DRAIN_TIMEOUT:
+                        remaining = self._miner_send_queue.qsize()
+                        logger.debug(
+                            f"[{self.session_id}] Queue drain timeout, "
+                            f"abandoning {remaining} remaining messages"
+                        )
+                        break
+
+                    try:
+                        priority_tuple = self._miner_send_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    # Ensure task_done is called even if write fails
+                    try:
+                        _, _, queued_msg = priority_tuple
+                        # Use timeout for individual write to prevent hanging
+                        await asyncio.wait_for(
+                            self._write_to_miner(queued_msg.data),
+                            timeout=QUEUE_DRAIN_WRITE_TIMEOUT,
+                        )
+                        drained += 1
+                    except asyncio.TimeoutError:
+                        logger.debug(f"[{self.session_id}] Write timeout during drain, stopping")
+                        should_stop = True
+                    except Exception as e:
+                        logger.debug(f"[{self.session_id}] Error draining queue: {e}")
+                        # Stop draining on write error (connection likely broken)
+                        should_stop = True
+                    finally:
+                        self._miner_send_queue.task_done()
+
+                if drained > 0:
+                    logger.debug(f"[{self.session_id}] Drained {drained} messages from queue")
+            finally:
+                # Set flag AFTER drain attempt (success or failure)
+                # This prevents retries, but that's correct since write failures
+                # indicate broken socket where retries would also fail
+                self._queue_drained = True
 
     async def _upstream_read_loop(self) -> None:
         """Read and forward messages from upstream to miner."""
@@ -387,7 +634,7 @@ class MinerSession:
         while self._running and not self._closing:
             try:
                 if not self._upstream or not self._upstream.connected:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(POLL_SLEEP_INTERVAL)
                     continue
 
                 messages = await self._upstream.read_messages()
@@ -396,13 +643,19 @@ class MinerSession:
 
                 # Periodic health check (every ~10 seconds since read timeout is 0.1s)
                 health_check_counter += 1
-                if health_check_counter >= 100:
+                if health_check_counter >= UPSTREAM_HEALTH_CHECK_INTERVAL:
                     health_check_counter = 0
                     if self._upstream and not self._upstream.is_healthy:
                         logger.warning(
                             f"[{self.session_id}] Upstream connection unhealthy, reconnecting..."
                         )
-                        await self._reconnect_upstream()
+                        try:
+                            await self._reconnect_upstream()
+                        except Exception as reconnect_err:
+                            # Log but don't crash - outer loop will catch and retry
+                            logger.error(
+                                f"[{self.session_id}] Health check reconnect failed: {reconnect_err}"
+                            )
 
             except asyncio.CancelledError:
                 break
@@ -412,7 +665,7 @@ class MinerSession:
                 await self._reconnect_upstream()
                 await asyncio.sleep(1)
 
-    async def _handle_miner_message(self, msg) -> None:
+    async def _handle_miner_message(self, msg: StratumMessage) -> None:
         """
         Handle a message from the miner.
 
@@ -467,12 +720,16 @@ class MinerSession:
         """Handle mining.subscribe from miner."""
         logger.debug(f"[{self.session_id}] Miner subscribe: {msg.params}")
 
-        # Extract user agent if provided
+        # Extract and sanitize user agent if provided
         if msg.params:
-            self.user_agent = str(msg.params[0])
+            self.user_agent = _sanitize_miner_string(str(msg.params[0]))
 
         # Use upstream's subscription data
         if self._upstream and self._upstream.subscribed:
+            # Configure validator with extranonce2 size for length validation
+            if self._upstream.extranonce2_size is not None:
+                self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
+
             # Send response with upstream's extranonce values
             result = [
                 [
@@ -490,7 +747,7 @@ class MinerSession:
 
             # Forward any notifications received during upstream handshake
             # These must be sent AFTER the subscribe response
-            pending = self._upstream.get_pending_notifications()
+            pending = await self._upstream.get_pending_notifications()
             if pending:
                 logger.info(
                     f"[{self.session_id}] Forwarding {len(pending)} queued notifications to miner"
@@ -506,9 +763,9 @@ class MinerSession:
 
     async def _handle_authorize(self, msg: StratumRequest) -> None:
         """Handle mining.authorize from miner."""
-        # Accept any credentials from miner
+        # Accept any credentials from miner (sanitize to prevent log injection)
         if len(msg.params) >= 1:
-            self.worker_name = str(msg.params[0])
+            self.worker_name = _sanitize_miner_string(str(msg.params[0]))
 
         logger.info(f"[{self.session_id}] Miner authorized as {self.worker_name}")
 
@@ -548,8 +805,13 @@ class MinerSession:
             return
 
         try:
-            worker_name, job_id, extranonce2, ntime, nonce = msg.params[:5]
-        except (TypeError, ValueError, KeyError) as e:
+            # Access params by index directly to avoid creating a slice copy
+            worker_name = msg.params[0]
+            job_id = msg.params[1]
+            extranonce2 = msg.params[2]
+            ntime = msg.params[3]
+            nonce = msg.params[4]
+        except (TypeError, ValueError, KeyError, IndexError) as e:
             error = [20, f"Failed to parse params: {type(e).__name__}: {e}", None]
             logger.error(f"[{self.session_id}] {error[1]}")
             await self._send_to_miner(
@@ -560,10 +822,62 @@ class MinerSession:
         # Get version_bits if present (6th param for version-rolling)
         version_bits = msg.params[5] if len(msg.params) > 5 else None
 
+        # Validate types before string conversion (prevents objects with __str__ injection)
+        for field_name, field_val in [
+            ("extranonce2", extranonce2),
+            ("ntime", ntime),
+            ("nonce", nonce),
+            ("version_bits", version_bits),
+        ]:
+            if field_val is not None and not isinstance(field_val, (str, int)):
+                error = [20, f"Invalid type for {field_name}: expected string or int", None]
+                logger.warning(f"[{self.session_id}] {error[1]}")
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, False, error),
+                    priority=MessagePriority.HIGH,
+                )
+                return
+
+        # Convert all values to strings for validation
+        extranonce2 = str(extranonce2) if extranonce2 is not None else ""
+        ntime = str(ntime) if ntime is not None else ""
+        nonce = str(nonce) if nonce is not None else ""
+        version_bits = str(version_bits) if version_bits is not None else None
+
+        # Validate hex fields to prevent invalid data forwarding
+        # Max lengths: extranonce2 (16 for 8 bytes), ntime (8), nonce (8), version_bits (8)
+        hex_fields = [
+            ("extranonce2", extranonce2, 16),
+            ("ntime", ntime, 8),
+            ("nonce", nonce, 8),
+        ]
+        if version_bits:
+            hex_fields.append(("version_bits", version_bits, 8))
+
+        for field_name, field_value, max_len in hex_fields:
+            if not _is_valid_hex(field_value, max_len):
+                error = [20, f"Invalid {field_name}: not valid hexadecimal", None]
+                logger.warning(f"[{self.session_id}] {error[1]}: {field_value!r}")
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, False, error),
+                    priority=MessagePriority.HIGH,
+                )
+                return
+
         logger.debug(
             f"[{self.session_id}] Share submit: job={job_id}, "
             f"nonce={nonce}, version_bits={version_bits}"
         )
+
+        # Capture upstream reference to avoid null dereference if it changes mid-validation
+        upstream = self._upstream
+        if not upstream or not upstream.extranonce1:
+            error = [20, "Upstream not ready", None]
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
 
         # Validate share locally before submitting
         valid, reject_reason = self._validator.validate_share(
@@ -571,7 +885,7 @@ class MinerSession:
             extranonce2=extranonce2,
             ntime=ntime,
             nonce=nonce,
-            extranonce1=self._upstream.extranonce1,
+            extranonce1=upstream.extranonce1,
             version_bits=version_bits,
         )
 
@@ -580,7 +894,7 @@ class MinerSession:
             error = [20, reject_reason, None]
             logger.warning(f"[{self.session_id}] Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
-            asyncio.create_task(stats.record_share_rejected(self._current_server, reject_reason))
+            fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason))
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -589,26 +903,42 @@ class MinerSession:
 
         # Submit to upstream with retry logic for transient failures
         max_retries = self.config.proxy.share_submit_retries
-        retry_delay = 0.5
+        retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
+        start_time = time.time()
         accepted = False
         error = None
 
         for attempt in range(max_retries):
+            # Check overall timeout to prevent indefinite blocking
+            elapsed = time.time() - start_time
+            if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
+                logger.warning(
+                    f"[{self.session_id}] Share submit exceeded max time "
+                    f"({SHARE_SUBMIT_MAX_TOTAL_TIME}s), giving up"
+                )
+                error = [20, "Share submit timeout", None]
+                break
+
+            # Re-capture upstream reference at start of each retry attempt
+            # This ensures we use the current connection after any reconnection
+            current_upstream = self._upstream
+
             # Check if upstream is still connected
-            if not self._upstream or not self._upstream.connected:
+            if not current_upstream or not current_upstream.connected:
                 if attempt < max_retries - 1:
                     logger.warning(
                         f"[{self.session_id}] Upstream not connected, reconnecting before retry..."
                     )
                     await self._reconnect_upstream()
-                    if not self._upstream or not self._upstream.connected:
+                    current_upstream = self._upstream  # Re-capture after reconnect
+                    if not current_upstream or not current_upstream.connected:
                         error = [20, "Upstream connection failed", None]
                         continue
                 else:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error = await self._upstream.submit_share(
+            accepted, error = await current_upstream.submit_share(
                 worker_name, job_id, extranonce2, ntime, nonce, version_bits
             )
 
@@ -616,18 +946,43 @@ class MinerSession:
                 break  # Success!
 
             # Check if error is retryable
-            error_msg = _get_error_message(error).lower()
-            # Retryable errors: timeout, connection issues
-            retryable = any(x in error_msg for x in [
-                "timeout", "not connected", "connection", "timed out"
-            ])
+            # Classify by error code first (more reliable), then by message text
+            retryable = False
+
+            # Check error code if available (Stratum style: [code, message, ...])
+            error_code = None
+            if isinstance(error, (list, tuple)) and len(error) >= 1:
+                try:
+                    error_code = int(error[0])
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(error, dict):
+                error_code = error.get("code")
+
+            # Error code 20 is "unknown error" - often used for connection issues
+            # Other codes (21-25) are explicit pool rejections - don't retry
+            if error_code == 20:
+                # Code 20 could be connection issue - check message
+                error_msg = _get_error_message(error).lower()
+                retryable = any(x in error_msg for x in [
+                    "timeout", "not connected", "connection", "timed out"
+                ])
+            elif error_code is None:
+                # No code - likely our internal error (timeout, connection), retry
+                error_msg = _get_error_message(error).lower()
+                retryable = any(x in error_msg for x in [
+                    "timeout", "not connected", "connection", "timed out"
+                ])
+            # Codes 21-25 are explicit rejections - don't retry
+
             if retryable and attempt < max_retries - 1:
+                retry_reason = _get_error_message(error)
                 logger.warning(
-                    f"[{self.session_id}] Share submit failed ({error_msg}), "
+                    f"[{self.session_id}] Share submit failed ({retry_reason}), "
                     f"retrying ({attempt + 1}/{max_retries})..."
                 )
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)  # Exponential backoff with ceiling
                 continue
 
             # Non-retryable error (explicit pool rejection) or last attempt
@@ -640,7 +995,7 @@ class MinerSession:
                 f"[{self.session_id}] Share accepted: job={job_id}, "
                 f"nonce={nonce}, version_bits={version_bits}"
             )
-            asyncio.create_task(stats.record_share_accepted(self._current_server))
+            fire_and_forget(stats.record_share_accepted(self._current_server))
             # Cache accepted share to prevent duplicate submissions
             self._validator.record_accepted_share(
                 job_id, extranonce2, ntime, nonce, version_bits
@@ -648,13 +1003,21 @@ class MinerSession:
         else:
             # Extract rejection reason from error (handles both list and dict formats)
             reason = _get_error_message(error)
-            logger.warning(f"[{self.session_id}] Share rejected: {error}")
-            asyncio.create_task(stats.record_share_rejected(self._current_server, reason))
+            logger.warning(f"[{self.session_id}] Share rejected: {reason}")
+            fire_and_forget(stats.record_share_rejected(self._current_server, reason))
 
-            # If pool says "duplicate", cache it locally to prevent re-submission
-            # The pool already has this share, so retrying is pointless
-            reason_lower = reason.lower()
-            if "duplicate" in reason_lower:
+            # If pool says "duplicate", cache it locally to prevent re-submission.
+            # This is CORRECT behavior because:
+            # 1. "Duplicate" means the pool already has this exact share
+            # 2. The share IS counted in the pool's accounting (just not credited twice)
+            # 3. Re-submitting would waste bandwidth and get rejected again
+            # 4. Stats correctly count this as rejected (proxy's view), even though
+            #    the pool has the share (the original submission succeeded)
+            #
+            # Edge case: If our original submission succeeded but we didn't get the
+            # response, and miner retries, pool says "duplicate". The share is NOT
+            # lost - it's in the pool. Only our local stats show it as "rejected".
+            if "duplicate" in reason.lower():
                 self._validator.record_accepted_share(
                     job_id, extranonce2, ntime, nonce, version_bits
                 )
@@ -677,7 +1040,7 @@ class MinerSession:
         data = StratumProtocol.encode_message(msg)
         await self._upstream.send_raw(data)
 
-    async def _handle_upstream_message(self, msg) -> None:
+    async def _handle_upstream_message(self, msg: StratumMessage) -> None:
         """
         Handle a message from upstream and forward to miner.
 
@@ -731,6 +1094,25 @@ class MinerSession:
         Messages are placed in a priority queue and sent by the dedicated
         writer task. This decouples message production from socket writes.
 
+        Queue Saturation Behavior:
+            During upstream reconnection, notifications (mining.notify, set_difficulty)
+            continue flowing from the new connection and queue up. If the miner socket
+            is slow and the queue fills (MINER_SEND_QUEUE_MAX_SIZE messages):
+
+            - HIGH priority messages (share responses): Queue full triggers immediate
+              connection close. This prevents miner from waiting indefinitely for a
+              response that will never come.
+
+            - NORMAL/LOW priority messages (notifications): Dropped silently. The
+              miner will miss these updates but continue functioning. The next
+              notification typically supersedes the dropped one anyway.
+
+            This is acceptable because:
+            1. Reconnection is typically fast (1-2 seconds)
+            2. Mining notifications arrive every ~30 seconds during normal operation
+            3. A slow miner that can't keep up should be disconnected anyway
+            4. The queue size (1000) provides substantial buffer capacity
+
         Args:
             data: Raw bytes to send.
             priority: Message priority (HIGH for share responses, NORMAL for notifications).
@@ -738,21 +1120,49 @@ class MinerSession:
         if self._closing:
             logger.debug(f"[{self.session_id}] Dropping message, session closing")
             return
-        if not self.writer:
+        # Capture writer reference to avoid TOCTOU race condition
+        writer = self.writer
+        if not writer:
             return
 
         # Create queued message with priority
         queued_msg = QueuedMessage(data=data, priority=priority)
 
-        # Use sequence number for stable ordering within same priority
-        self._queue_sequence += 1
-        priority_tuple = (priority.value, self._queue_sequence, queued_msg)
+        # Use sequence number for stable ordering within same priority (thread-safe).
+        # Note: The lock only protects sequence assignment, not queue insertion.
+        # This is correct because PriorityQueue sorts by (priority, seq, msg),
+        # so even if insertions complete out of order, dequeue order is correct.
+        async with self._queue_sequence_lock:
+            self._queue_sequence = (self._queue_sequence + 1) % self._queue_sequence_modulo
+            seq = self._queue_sequence
+        priority_tuple = (priority.value, seq, queued_msg)
 
         try:
             self._miner_send_queue.put_nowait(priority_tuple)
         except asyncio.QueueFull:
-            # This shouldn't happen with unbounded queue, but handle it
-            logger.warning(f"[{self.session_id}] Send queue full, dropping message")
+            # Queue is full - miner is likely slow or unresponsive
+            if priority == MessagePriority.HIGH:
+                # For high-priority messages (share responses), this is critical
+                # Miner will hang waiting for response - close connection immediately
+                # to signal error rather than leaving miner waiting indefinitely
+                logger.error(
+                    f"[{self.session_id}] Send queue full ({MINER_SEND_QUEUE_MAX_SIZE}), "
+                    f"dropping HIGH priority message - closing connection immediately"
+                )
+                # Set closing flag FIRST so other tasks see it immediately
+                # This ensures visibility before we close the socket
+                await self._set_closing()
+                # Close socket to signal error to miner
+                if self.writer and not self.writer.is_closing():
+                    try:
+                        self.writer.close()
+                    except Exception:
+                        pass  # Socket may already be broken
+            else:
+                logger.warning(
+                    f"[{self.session_id}] Send queue full ({MINER_SEND_QUEUE_MAX_SIZE}), "
+                    f"dropping message"
+                )
 
     async def _write_to_miner(self, data: bytes) -> None:
         """
@@ -782,11 +1192,11 @@ class MinerSession:
             )
             if self._consecutive_send_failures >= self._max_send_failures:
                 logger.error(f"[{self.session_id}] Too many send failures, closing session")
-                self._closing = True
+                fire_and_forget(self._set_closing())
         except (OSError, ConnectionError) as e:
             # Connection actually broken - close immediately
             logger.error(f"[{self.session_id}] Connection error sending to miner: {e}")
-            self._closing = True
+            fire_and_forget(self._set_closing())
         except Exception as e:
             self._consecutive_send_failures += 1
             logger.error(
@@ -794,7 +1204,7 @@ class MinerSession:
                 f"({self._consecutive_send_failures}/{self._max_send_failures})"
             )
             if self._consecutive_send_failures >= self._max_send_failures:
-                self._closing = True
+                fire_and_forget(self._set_closing())
 
     async def handle_server_switch(self, new_server: str) -> None:
         """
@@ -831,31 +1241,41 @@ class MinerSession:
 
     async def close(self) -> None:
         """Close the session and cleanup resources."""
-        if self._closing:
-            return
-
-        self._closing = True
-        self._running = False
+        async with self._closing_lock:
+            if self._closing:
+                return
+            self._closing = True
+            self._running = False  # Must be inside lock to prevent race condition
 
         logger.info(f"[{self.session_id}] Closing session")
 
+        # Capture references to avoid TOCTOU issues
+        writer = self.writer
+        upstream = self._upstream
+
         # Drain any remaining queued messages before closing
         # Give them a chance to be sent to the miner
-        if self.writer and not self._miner_send_queue.empty():
-            queue_size = self._miner_send_queue.qsize()
-            logger.debug(f"[{self.session_id}] Draining {queue_size} queued messages")
-            await self._drain_miner_queue()
+        # Always call drain - it handles its own locking and idempotency
+        # (avoids TOCTOU race with empty() check)
+        try:
+            if writer:
+                await self._drain_miner_queue()
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] Error draining queue: {e}")
 
         # Close upstream connection
-        if self._upstream:
-            await self._upstream.disconnect()
+        if upstream:
+            try:
+                await upstream.disconnect()
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Error closing upstream: {e}")
             self._upstream = None
 
         # Close miner connection
-        if self.writer:
+        if writer:
             try:
-                self.writer.close()
-                await self.writer.wait_closed()
+                writer.close()
+                await writer.wait_closed()
             except Exception as e:
                 # Expected during unclean disconnects, log at debug level
                 logger.debug(f"[{self.session_id}] Error closing miner connection: {e}")

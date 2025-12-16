@@ -31,6 +31,9 @@ class StratumProtocol:
     ENCODING = "utf-8"
     DELIMITER = b"\n"
     MAX_BUFFER_SIZE = 1024 * 1024  # 1MB max buffer to prevent DoS
+    MAX_PARAMS_LIST_SIZE = 100  # Max size for params list conversion (DoS protection)
+    MAX_RESULT_LIST_SIZE = 1000  # Max size for result arrays (DoS protection)
+    MAX_RESULT_STRING_SIZE = 65536  # Max size for result strings (64KB)
 
     def __init__(self):
         """Initialize the protocol handler."""
@@ -49,14 +52,14 @@ class StratumProtocol:
         Raises:
             StratumProtocolError: If buffer exceeds max size (DoS protection).
         """
-        self._buffer += data
-
-        # DoS protection: limit buffer size
-        if len(self._buffer) > self.MAX_BUFFER_SIZE:
+        # DoS protection: check size BEFORE accumulating to prevent memory exhaustion
+        if len(self._buffer) + len(data) > self.MAX_BUFFER_SIZE:
             self._buffer = b""
             raise StratumProtocolError(
-                f"Buffer exceeded max size ({self.MAX_BUFFER_SIZE} bytes), dropping data"
+                f"Buffer would exceed max size ({self.MAX_BUFFER_SIZE} bytes), dropping data"
             )
+
+        self._buffer += data
 
         messages = []
 
@@ -116,16 +119,36 @@ class StratumProtocol:
         result = obj.get("result")
         error = obj.get("error")
 
+        # DoS protection: limit result field size
+        result = self._limit_result_size(result)
+
         # Ensure params is always a list (some miners/pools send dict or other types)
         if not isinstance(params, list):
             if isinstance(params, dict):
                 # Convert dict with numeric keys to list: {"0": a, "1": b} -> [a, b]
                 try:
                     max_key = max(int(k) for k in params.keys()) + 1
-                    params = [params.get(str(i), params.get(i)) for i in range(max_key)]
+                    # DoS protection: limit max key to prevent huge sparse list allocation
+                    # Also check for sparse arrays: if we'd create many None entries, use values instead
+                    num_entries = len(params)
+                    is_sparse = num_entries < max_key // 2  # More than half would be None
+                    if max_key > self.MAX_PARAMS_LIST_SIZE or is_sparse:
+                        if max_key > self.MAX_PARAMS_LIST_SIZE:
+                            logger.warning(
+                                f"Params dict max key {max_key} exceeds limit "
+                                f"{self.MAX_PARAMS_LIST_SIZE}, using values only"
+                            )
+                        else:
+                            logger.debug(
+                                f"Sparse params dict detected ({num_entries}/{max_key}), "
+                                f"using values only"
+                            )
+                        params = list(params.values())[:self.MAX_PARAMS_LIST_SIZE]
+                    else:
+                        params = [params.get(str(i), params.get(i)) for i in range(max_key)]
                 except (ValueError, TypeError):
                     # Keys aren't numeric, just use values in arbitrary order
-                    params = list(params.values())
+                    params = list(params.values())[:self.MAX_PARAMS_LIST_SIZE]
             else:
                 params = [params] if params is not None else []
 
@@ -142,6 +165,39 @@ class StratumProtocol:
             return StratumNotification(method=method, params=params or [])
 
         raise StratumProtocolError(f"Cannot determine message type: {obj}")
+
+    def _limit_result_size(self, result: Any) -> Any:
+        """
+        Limit the size of result fields to prevent memory exhaustion.
+
+        This protects against malicious pools sending huge result arrays
+        or excessively long strings in responses.
+
+        Args:
+            result: The result value from a response.
+
+        Returns:
+            Size-limited result value.
+        """
+        if result is None:
+            return None
+
+        if isinstance(result, list):
+            if len(result) > self.MAX_RESULT_LIST_SIZE:
+                logger.warning(
+                    f"Result list size {len(result)} exceeds limit "
+                    f"{self.MAX_RESULT_LIST_SIZE}, truncating"
+                )
+                return result[:self.MAX_RESULT_LIST_SIZE]
+        elif isinstance(result, str):
+            if len(result) > self.MAX_RESULT_STRING_SIZE:
+                logger.warning(
+                    f"Result string size {len(result)} exceeds limit "
+                    f"{self.MAX_RESULT_STRING_SIZE}, truncating"
+                )
+                return result[:self.MAX_RESULT_STRING_SIZE]
+
+        return result
 
     def build_request(self, id: int, method: str, params: list = None) -> bytes:
         """

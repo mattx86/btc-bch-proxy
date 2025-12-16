@@ -168,7 +168,7 @@ btc-bch-proxy start [OPTIONS]
 Options:
   -c, --config PATH      Path to configuration file
   -f, --foreground       Run in foreground (don't daemonize)
-  --log-level LEVEL      Override log level (DEBUG, INFO, WARNING, ERROR)
+  --log-level LEVEL      Override log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 ```
 
 ## Configuration Reference
@@ -240,7 +240,7 @@ schedule:
 
 ```yaml
 logging:
-  level: "INFO"             # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"             # DEBUG, INFO, WARNING, ERROR, CRITICAL
   file: "/var/log/proxy.log"  # Log file path (null for console only)
   rotation: "50 MB"         # Rotate when file reaches this size
   retention: 10             # Keep this many rotated files

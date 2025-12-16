@@ -42,16 +42,3 @@ def setup_logging(config: LoggingConfig) -> None:
         )
 
     logger.debug(f"Logging configured: level={config.level}, file={config.file}")
-
-
-def get_logger(name: str):
-    """
-    Get a contextualized logger for a module.
-
-    Args:
-        name: Module name to bind to the logger.
-
-    Returns:
-        Logger instance with module context bound.
-    """
-    return logger.bind(module=name)

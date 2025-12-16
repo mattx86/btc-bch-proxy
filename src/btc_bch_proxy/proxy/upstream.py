@@ -9,15 +9,23 @@ from typing import TYPE_CHECKING, Dict, Optional, Set
 
 from loguru import logger
 
+from btc_bch_proxy import __version__
 from btc_bch_proxy.stratum.messages import (
     StratumMessage,
     StratumMethods,
     StratumNotification,
-    StratumRequest,
     StratumResponse,
 )
 from btc_bch_proxy.stratum.protocol import StratumProtocol
 from btc_bch_proxy.proxy.stats import ProxyStats
+from btc_bch_proxy.proxy.constants import (
+    DEFAULT_PENDING_SHARES_WAIT_TIMEOUT,
+    DEFAULT_UPSTREAM_HEALTH_TIMEOUT,
+    NON_BLOCKING_READ_TIMEOUT,
+    POLL_SLEEP_INTERVAL,
+    SOCKET_READ_BUFFER_SIZE,
+)
+from btc_bch_proxy.proxy.utils import fire_and_forget
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import ProxyConfig, StratumServerConfig
@@ -40,6 +48,27 @@ class UpstreamConnection:
     - Message sending/receiving
     - Pending share submission tracking
     - TCP keepalive for connection health
+
+    Lock Ordering (to prevent deadlocks):
+        When acquiring multiple locks, always acquire in this order:
+        1. _read_lock - Protects socket read operations
+        2. _request_id_lock - Protects request ID counter
+        3. _pending_requests_lock - Protects pending request futures
+        4. _pending_notifications_lock - Protects notification queue
+        5. _pending_shares_lock - Protects share tracking set
+
+        Note: In _next_id(), we acquire _request_id_lock -> _pending_requests_lock.
+        This is the only place where multiple locks are held simultaneously.
+
+    Notification Handling:
+        During the initial handshake (configure, subscribe, authorize), any
+        mining.notify and mining.set_difficulty notifications are queued in
+        _pending_notifications. Call get_pending_notifications() after handshake
+        to retrieve them.
+
+        Note: Notifications that arrive during the brief window between disconnect
+        and reconnect are lost. This is acceptable because the pool will send
+        fresh notifications after reconnection.
     """
 
     def __init__(self, config: StratumServerConfig, proxy_config: Optional[ProxyConfig] = None):
@@ -73,7 +102,9 @@ class UpstreamConnection:
 
         # Request tracking
         self._request_id = 0
+        self._request_id_lock = asyncio.Lock()  # Lock for _request_id increment
         self._pending_requests: Dict[int, asyncio.Future] = {}
+        self._pending_requests_lock = asyncio.Lock()  # Lock for _pending_requests access
         self._pending_shares: Set[int] = set()
         self._pending_shares_lock = asyncio.Lock()  # Lock for _pending_shares access
 
@@ -87,13 +118,17 @@ class UpstreamConnection:
 
         # Queue for notifications received during handshake
         self._pending_notifications: list[StratumMessage] = []
+        self._pending_notifications_lock = asyncio.Lock()  # Lock for _pending_notifications
 
         # Connection health tracking
         self._last_message_time: float = 0.0
-        # Use config value if available, otherwise default to 300s (5 minutes)
+        self._connection_start_time: float = 0.0
+        # Health timeout from config or 5-minute default
         self._connection_health_timeout: float = float(
-            proxy_config.upstream_health_timeout if proxy_config else 300
+            proxy_config.upstream_health_timeout if proxy_config else DEFAULT_UPSTREAM_HEALTH_TIMEOUT
         )
+        # Track whether we've logged the unhealthy state (to avoid log spam)
+        self._unhealthy_logged: bool = False
 
     @property
     def connected(self) -> bool:
@@ -112,46 +147,110 @@ class UpstreamConnection:
 
     @property
     def has_pending_shares(self) -> bool:
-        """Check if there are pending share submissions."""
+        """
+        Check if there are pending share submissions (approximate).
+
+        Note: This is a synchronous property for convenience. For strict
+        consistency in async contexts, use get_pending_share_count() instead.
+        Safe for typical use due to CPython's GIL guaranteeing atomic len().
+
+        WARNING: Do not use this for critical decisions that require exact
+        counts. The value may be stale by the time it's used. For critical
+        paths, use async with _pending_shares_lock directly.
+        """
         return len(self._pending_shares) > 0
 
     @property
     def pending_share_count(self) -> int:
-        """Get the number of pending shares."""
+        """
+        Get the number of pending shares.
+
+        Note: This is a synchronous property for convenience. For strict
+        consistency in async contexts, use get_pending_share_count() instead.
+        """
         return len(self._pending_shares)
+
+    async def get_pending_share_count(self) -> int:
+        """Get the number of pending shares (async-safe)."""
+        async with self._pending_shares_lock:
+            return len(self._pending_shares)
 
     @property
     def is_healthy(self) -> bool:
-        """Check if the connection is healthy (recently received messages)."""
+        """
+        Check if the connection is healthy (recently received messages).
+
+        Note: Reads _last_message_time without lock. This is safe because
+        reading a float is atomic in Python (GIL guarantee), and slight
+        timing inaccuracy is acceptable for health checks.
+        """
         if not self._connected:
             return False
+        now = time_module.time()
         if self._last_message_time == 0:
+            # No messages yet - check how long since connection
+            # If we've been connected for longer than the health timeout without
+            # receiving any messages, that's unhealthy
+            if self._connection_start_time > 0:
+                elapsed_since_connect = now - self._connection_start_time
+                return elapsed_since_connect < self._connection_health_timeout
             return True  # Just connected, no messages yet
-        elapsed = time_module.time() - self._last_message_time
+        elapsed = now - self._last_message_time
         return elapsed < self._connection_health_timeout
 
     @property
     def seconds_since_last_message(self) -> float:
-        """Get seconds since last message was received."""
+        """
+        Get seconds since last message was received.
+
+        Note: Returns approximate value due to concurrent access (see is_healthy).
+        """
         if self._last_message_time == 0:
             return 0.0
         return time_module.time() - self._last_message_time
 
-    def get_pending_notifications(self) -> list[StratumMessage]:
+    async def get_pending_notifications(self) -> list[StratumMessage]:
         """
         Get and clear any notifications received during handshake.
 
         Returns:
             List of queued notifications.
         """
-        notifications = self._pending_notifications
-        self._pending_notifications = []
-        return notifications
+        async with self._pending_notifications_lock:
+            notifications = self._pending_notifications
+            self._pending_notifications = []
+            return notifications
 
-    def _next_id(self) -> int:
-        """Get the next request ID."""
-        self._request_id += 1
-        return self._request_id
+    # Maximum request ID before wrapping (32-bit unsigned max)
+    MAX_REQUEST_ID = 0xFFFFFFFF
+    # Maximum attempts to find an unused ID before giving up
+    MAX_ID_ATTEMPTS = 100
+
+    async def _next_id(self) -> int:
+        """
+        Get the next request ID, wrapping at MAX_REQUEST_ID.
+
+        Avoids IDs that are currently in use by pending requests to prevent
+        ID collisions after wrap-around.
+
+        Lock ordering: _request_id_lock -> _pending_requests_lock
+        This ordering must be maintained to prevent deadlocks.
+        """
+        async with self._request_id_lock:
+            for _ in range(self.MAX_ID_ATTEMPTS):
+                self._request_id = (self._request_id + 1) % self.MAX_REQUEST_ID
+                # Avoid 0 as some pools may treat it as null/missing
+                if self._request_id == 0:
+                    self._request_id = 1
+                # Check for collision with pending requests under lock
+                async with self._pending_requests_lock:
+                    if self._request_id not in self._pending_requests:
+                        return self._request_id
+            # If we couldn't find a free ID after MAX_ID_ATTEMPTS, just use the
+            # current one. This should never happen in practice (would require
+            # 100+ concurrent pending requests with perfect wrap-around collision).
+            logger.warning(f"Could not find unused request ID after {self.MAX_ID_ATTEMPTS} attempts")
+            return self._request_id
 
     async def connect(self) -> bool:
         """
@@ -175,15 +274,26 @@ class UpstreamConnection:
             )
 
             # Setup SSL if needed
+            # create_default_context() enables certificate verification by default.
+            # This is the secure default - pools should have valid certificates.
+            #
+            # SECURITY WARNING: Never set check_hostname=False or verify_mode=CERT_NONE
+            # in production. Disabling verification allows man-in-the-middle attacks
+            # where an attacker can intercept and steal mining rewards.
             ssl_context = None
+            server_hostname = None
             if self.config.ssl:
                 ssl_context = ssl.create_default_context()
+                # Enable hostname verification to prevent MITM attacks
+                ssl_context.check_hostname = True
+                server_hostname = self.config.host
 
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     self.config.host,
                     self.config.port,
                     ssl=ssl_context,
+                    server_hostname=server_hostname,
                 ),
                 timeout=self.config.timeout,
             )
@@ -191,7 +301,12 @@ class UpstreamConnection:
             self._connected = True
             self._retry_count = 0
             self._protocol.reset_buffer()
-            self._last_message_time = time_module.time()  # Reset health timer
+            now = time_module.time()
+            # Don't set _last_message_time here - leave at 0 until we receive a message
+            # This allows is_healthy to distinguish "just connected" from "received messages"
+            self._last_message_time = 0.0
+            self._connection_start_time = now  # Track connection start for health check
+            self._unhealthy_logged = False  # Reset unhealthy log flag on new connection
 
             # Enable TCP keepalive
             if self.proxy_config and self._writer:
@@ -201,21 +316,43 @@ class UpstreamConnection:
             # Record connection stats
             stats = ProxyStats.get_instance()
             if self._has_connected_before:
-                asyncio.create_task(stats.record_upstream_reconnect(self.name))
+                fire_and_forget(stats.record_upstream_reconnect(self.name))
             else:
-                asyncio.create_task(stats.record_upstream_connect(self.name))
+                fire_and_forget(stats.record_upstream_connect(self.name))
                 self._has_connected_before = True
 
             logger.info(f"Connected to upstream {self.name}")
             return True
 
         except asyncio.TimeoutError:
-            logger.warning(f"Connection to {self.name} timed out")
             self._retry_count += 1
+            # Use INFO for first few retries to avoid log spam, WARNING for persistent issues
+            if self._retry_count <= 2:
+                logger.info(f"Connection to {self.name} timed out (attempt {self._retry_count})")
+            else:
+                logger.warning(f"Connection to {self.name} timed out (attempt {self._retry_count})")
             return False
         except OSError as e:
-            logger.warning(f"Connection to {self.name} failed: {e}")
+            # Provide more specific error messages for common connection failures
+            import errno
+            error_msg = str(e)
+            if hasattr(e, 'errno'):
+                if e.errno == errno.ECONNREFUSED:
+                    error_msg = "connection refused (is the pool server running?)"
+                elif e.errno == errno.EHOSTUNREACH:
+                    error_msg = "host unreachable (check network connectivity)"
+                elif e.errno == errno.ENETUNREACH:
+                    error_msg = "network unreachable (check network configuration)"
+                elif e.errno in (errno.ENOENT, getattr(errno, 'EAI_NONAME', -2)):
+                    error_msg = "DNS resolution failed (check hostname)"
+            elif "getaddrinfo failed" in str(e).lower():
+                error_msg = f"DNS resolution failed: {e}"
             self._retry_count += 1
+            # Use INFO for first few retries
+            if self._retry_count <= 2:
+                logger.info(f"Connection to {self.name} failed: {error_msg} (attempt {self._retry_count})")
+            else:
+                logger.warning(f"Connection to {self.name} failed: {error_msg} (attempt {self._retry_count})")
             return False
         except Exception as e:
             logger.error(f"Unexpected error connecting to {self.name}: {e}")
@@ -229,22 +366,48 @@ class UpstreamConnection:
                 self._writer.close()
                 await self._writer.wait_closed()
             except Exception as e:
-                logger.debug(f"Error closing connection to {self.name}: {e}")
+                logger.warning(f"Error closing connection to {self.name}: {e}")
 
-        self._connected = False
-        self._subscribed = False
-        self._authorized = False
-        self._reader = None
-        self._writer = None
-        self.extranonce1 = None
-        self.extranonce2_size = None
-        self.subscription_id = None
+        # Signal pending requests that connection was closed
+        # Use set_exception() instead of cancel() to properly propagate error message
+        # Must hold lock while copying, clearing, AND setting state flags
+        # This prevents TOCTOU race where code sees _connected=False but finds stale futures
+        async with self._pending_requests_lock:
+            # Set state flags inside lock for atomicity
+            self._connected = False
+            self._subscribed = False
+            self._authorized = False
+            self._reader = None
+            self._writer = None
+            self.extranonce1 = None
+            self.extranonce2_size = None
+            self.subscription_id = None
+            # Copy and clear pending requests
+            pending_copy = dict(self._pending_requests)
+            self._pending_requests.clear()
 
-        # Cancel pending requests
-        for future in self._pending_requests.values():
+        # Set exceptions outside the lock to prevent potential deadlocks
+        for req_id, future in pending_copy.items():
             if not future.done():
-                future.cancel()
-        self._pending_requests.clear()
+                try:
+                    future.set_exception(
+                        UpstreamConnectionError(f"Connection to {self.name} closed")
+                    )
+                except (asyncio.InvalidStateError, RuntimeError) as e:
+                    # InvalidStateError: Future already completed
+                    # RuntimeError: Event loop closed (during shutdown)
+                    logger.debug(f"Could not set exception on future {req_id}: {e}")
+                except Exception as e:
+                    # Catch-all for any unexpected errors (defensive)
+                    logger.warning(f"Unexpected error setting exception on future {req_id}: {e}")
+
+        # Clear pending notifications - they're no longer valid after disconnect
+        async with self._pending_notifications_lock:
+            self._pending_notifications.clear()
+
+        # Clear pending shares tracking (under lock)
+        async with self._pending_shares_lock:
+            self._pending_shares.clear()
 
         logger.info(f"Disconnected from upstream {self.name}")
 
@@ -264,7 +427,7 @@ class UpstreamConnection:
         if extensions is None:
             extensions = ["version-rolling"]
 
-        req_id = self._next_id()
+        req_id = await self._next_id()
         # Request version-rolling with full mask
         params = [extensions, {"version-rolling.mask": "ffffffff"}]
 
@@ -282,16 +445,36 @@ class UpstreamConnection:
             result = response.result
             if isinstance(result, dict):
                 if result.get("version-rolling"):
-                    self.version_rolling_supported = True
                     mask = result.get("version-rolling.mask", "ffffffff")
                     # Handle mask as int or string
                     if isinstance(mask, int):
-                        self.version_rolling_mask = f"{mask:08x}"
+                        mask_str = f"{mask:08x}"
                     else:
-                        self.version_rolling_mask = str(mask)
-                    logger.info(
-                        f"Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
-                    )
+                        mask_str = str(mask)
+
+                    # Validate mask is valid hex and fits in 32 bits
+                    # BIP320 version-rolling uses a 32-bit mask (max 0xFFFFFFFF)
+                    try:
+                        # Strip 0x/0X prefix if present (some pools include it)
+                        mask_hex = mask_str.lower().removeprefix("0x")
+                        mask_value = int(mask_hex, 16)
+                        if len(mask_hex) > 8:
+                            raise ValueError(f"mask too long: {len(mask_hex)} hex chars")
+                        if mask_value > 0xFFFFFFFF:
+                            raise ValueError(f"mask exceeds 32-bit range: 0x{mask_value:x}")
+                        self.version_rolling_supported = True
+                        # Store normalized hex (without 0x prefix) for consistency
+                        self.version_rolling_mask = mask_hex
+                        logger.info(
+                            f"Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
+                        )
+                    except ValueError as e:
+                        logger.warning(
+                            f"Pool {self.name} returned invalid version-rolling mask "
+                            f"'{mask_str}': {e}. Disabling version-rolling."
+                        )
+                        self.version_rolling_supported = False
+                        self.version_rolling_mask = None
                 else:
                     logger.info(f"Pool {self.name} does not support version-rolling")
             else:
@@ -302,12 +485,14 @@ class UpstreamConnection:
         except asyncio.TimeoutError:
             # Timeout on configure is OK - pool might not support it
             logger.debug(f"Configure timeout for {self.name} (pool may not support it)")
-            return True
+            # Check if connection is still alive after timeout
+            return self._connected
         except Exception as e:
             logger.debug(f"Configure error for {self.name}: {e}")
-            return True  # Don't fail the connection for configure errors
+            # Don't fail the connection for configure errors, but verify it's still open
+            return self._connected
 
-    async def subscribe(self, user_agent: str = "btc-bch-proxy/0.1.0") -> bool:
+    async def subscribe(self, user_agent: str = None) -> bool:
         """
         Send mining.subscribe to the pool.
 
@@ -320,7 +505,10 @@ class UpstreamConnection:
         if not self._connected:
             return False
 
-        req_id = self._next_id()
+        if user_agent is None:
+            user_agent = f"btc-bch-proxy/{__version__}"
+
+        req_id = await self._next_id()
         params = [user_agent]
 
         try:
@@ -338,20 +526,48 @@ class UpstreamConnection:
             if isinstance(result, list) and len(result) >= 3:
                 subscriptions = result[0]
                 self.extranonce1 = str(result[1])
-                self.extranonce2_size = int(result[2])
 
-                # Validate extranonce1 is a valid hex string
+                # Validate extranonce2_size type before conversion
+                raw_size = result[2]
+                if not isinstance(raw_size, (int, float, str)):
+                    logger.error(
+                        f"Invalid extranonce2_size type from {self.name}: "
+                        f"{type(raw_size).__name__}"
+                    )
+                    return False
+                try:
+                    self.extranonce2_size = int(raw_size)
+                except (ValueError, TypeError) as e:
+                    logger.error(
+                        f"Cannot convert extranonce2_size from {self.name}: "
+                        f"'{raw_size}' ({e})"
+                    )
+                    return False
+
+                # Validate extranonce1 is a valid non-empty hex string
+                # Note: result[1] could be None/null from malformed pool responses,
+                # which str() converts to "None" - check for this case too
+                if not self.extranonce1 or self.extranonce1 == "None":
+                    logger.error(
+                        f"Invalid extranonce1 from {self.name}: "
+                        f"empty or null value received"
+                    )
+                    return False
                 try:
                     bytes.fromhex(self.extranonce1)
-                except ValueError:
-                    logger.error(f"Invalid extranonce1 from {self.name}: {self.extranonce1}")
+                except ValueError as hex_err:
+                    logger.error(
+                        f"Invalid extranonce1 from {self.name}: '{self.extranonce1}' "
+                        f"is not valid hexadecimal ({hex_err})"
+                    )
                     return False
 
                 # Validate extranonce2_size is reasonable (typically 2-8 bytes)
-                if not (1 <= self.extranonce2_size <= 16):
+                # Upper bound of 8 prevents memory issues with very large extranonce2 values
+                if not (1 <= self.extranonce2_size <= 8):
                     logger.error(
                         f"Invalid extranonce2_size from {self.name}: {self.extranonce2_size} "
-                        f"(expected 1-16)"
+                        f"(expected 1-8)"
                     )
                     return False
 
@@ -391,7 +607,7 @@ class UpstreamConnection:
         if not self._connected or not self._subscribed:
             return False
 
-        req_id = self._next_id()
+        req_id = await self._next_id()
         params = [self.config.username, self.config.password]
 
         try:
@@ -444,7 +660,7 @@ class UpstreamConnection:
         if not self._connected or not self._authorized:
             return False, [20, "Not connected or authorized", None]
 
-        req_id = self._next_id()
+        req_id = await self._next_id()
         # Use the pool's configured username, not the miner's worker name
         params = [self.config.username, job_id, extranonce2, ntime, nonce]
         # Include version_bits if version-rolling is enabled
@@ -493,9 +709,10 @@ class UpstreamConnection:
         if not self._writer or not self._reader:
             raise UpstreamConnectionError("Not connected")
 
-        # Create future for response
+        # Create future for response and register it (protected by lock)
         future: asyncio.Future[StratumResponse] = asyncio.Future()
-        self._pending_requests[req_id] = future
+        async with self._pending_requests_lock:
+            self._pending_requests[req_id] = future
 
         # Send request
         msg = self._protocol.build_request(req_id, method, params)
@@ -519,7 +736,7 @@ class UpstreamConnection:
 
                     try:
                         data = await asyncio.wait_for(
-                            self._reader.read(8192),
+                            self._reader.read(SOCKET_READ_BUFFER_SIZE),
                             timeout=min(remaining, 1.0),
                         )
                         if not data:
@@ -530,25 +747,58 @@ class UpstreamConnection:
                         if messages:
                             self._last_message_time = time_module.time()
 
-                        # Process responses and queue notifications
+                        # Separate responses from notifications for efficient lock usage
+                        responses = []
+                        notifications = []
                         for recv_msg in messages:
                             if isinstance(recv_msg, StratumResponse):
-                                logger.debug(f"Got response id={recv_msg.id}")
-                                pending_future = self._pending_requests.get(recv_msg.id)
-                                if pending_future and not pending_future.done():
-                                    pending_future.set_result(recv_msg)
+                                responses.append(recv_msg)
                             elif isinstance(recv_msg, StratumNotification):
-                                # Queue notifications for later processing
-                                self._pending_notifications.append(recv_msg)
-                                logger.debug(f"Queued notification: {recv_msg.method}")
+                                notifications.append(recv_msg)
+
+                        # Process responses under lock (minimal time in lock)
+                        if responses:
+                            async with self._pending_requests_lock:
+                                for resp in responses:
+                                    logger.debug(f"Got response id={resp.id}")
+                                    pending_future = self._pending_requests.get(resp.id)
+                                    if pending_future and not pending_future.done():
+                                        try:
+                                            pending_future.set_result(resp)
+                                        except asyncio.InvalidStateError:
+                                            # Future was cancelled/completed between check and set
+                                            logger.debug(
+                                                f"Future for request {resp.id} already completed"
+                                            )
+
+                        # Queue notifications under lock for thread safety
+                        if notifications:
+                            async with self._pending_notifications_lock:
+                                for notif in notifications:
+                                    self._pending_notifications.append(notif)
+                                    logger.debug(f"Queued notification: {notif.method}")
 
                     except asyncio.TimeoutError:
                         # Just a read timeout, keep waiting if we have time left
                         continue
 
-            return future.result()
+            # Get the result, handling cancellation and exceptions
+            if future.cancelled():
+                raise UpstreamConnectionError(f"Request {req_id} cancelled (connection closed)")
+            try:
+                return future.result()
+            except asyncio.CancelledError:
+                # Future was cancelled between our check and result() call
+                raise UpstreamConnectionError(f"Request {req_id} cancelled (connection closed)")
+            except UpstreamConnectionError:
+                # Re-raise our own exceptions directly
+                raise
+            except Exception as e:
+                # Wrap unexpected exceptions
+                raise UpstreamConnectionError(f"Request {req_id} failed: {e}") from e
         finally:
-            self._pending_requests.pop(req_id, None)
+            async with self._pending_requests_lock:
+                self._pending_requests.pop(req_id, None)
 
     async def send_raw(self, data: bytes) -> None:
         """
@@ -586,8 +836,8 @@ class UpstreamConnection:
         async with self._read_lock:
             try:
                 data = await asyncio.wait_for(
-                    self._reader.read(8192),
-                    timeout=0.1,  # Short timeout for non-blocking read
+                    self._reader.read(SOCKET_READ_BUFFER_SIZE),
+                    timeout=NON_BLOCKING_READ_TIMEOUT,
                 )
                 if not data:
                     # Connection closed
@@ -599,22 +849,28 @@ class UpstreamConnection:
                 if messages:
                     self._last_message_time = time_module.time()
 
-                # Process responses to pending requests
-                for msg in messages:
-                    if isinstance(msg, StratumResponse):
-                        future = self._pending_requests.get(msg.id)
-                        if future and not future.done():
-                            future.set_result(msg)
+                # Process responses to pending requests (protected by lock)
+                async with self._pending_requests_lock:
+                    for msg in messages:
+                        if isinstance(msg, StratumResponse):
+                            future = self._pending_requests.get(msg.id)
+                            if future and not future.done():
+                                try:
+                                    future.set_result(msg)
+                                except asyncio.InvalidStateError:
+                                    # Future was cancelled/completed between check and set
+                                    pass
 
                 return messages
 
             except asyncio.TimeoutError:
-                # Check connection health during timeout
-                if not self.is_healthy:
+                # Check connection health during timeout (log only once per unhealthy period)
+                if not self.is_healthy and not self._unhealthy_logged:
                     logger.warning(
                         f"Connection to {self.name} appears unhealthy "
                         f"(no messages for {self.seconds_since_last_message:.0f}s)"
                     )
+                    self._unhealthy_logged = True
                 return []
             except Exception as e:
                 logger.error(f"Error reading from {self.name}: {e}")
@@ -708,7 +964,7 @@ class UpstreamManager:
             await conn.disconnect()
 
     async def wait_for_pending_shares(
-        self, server_name: str, timeout: float = 10.0
+        self, server_name: str, timeout: float = DEFAULT_PENDING_SHARES_WAIT_TIMEOUT
     ) -> bool:
         """
         Wait for pending shares to be acknowledged.
@@ -734,7 +990,7 @@ class UpstreamManager:
 
             # Process any incoming messages to complete share responses
             await conn.read_messages()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(POLL_SLEEP_INTERVAL)
 
         return True
 

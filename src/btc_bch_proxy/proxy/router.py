@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, time, timedelta
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 
 from loguru import logger
 
 from btc_bch_proxy.proxy.stats import ProxyStats
+from btc_bch_proxy.proxy.constants import SCHEDULER_CHECK_INTERVAL
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config, StratumServerConfig, TimeFrame
@@ -33,14 +34,17 @@ class TimeBasedRouter:
             config: Main configuration object.
         """
         self.config = config
-        self._switch_callbacks: List[Callable[[str], asyncio.Future]] = []
+        self._switch_callbacks: List[Callable[[str], Awaitable[Any]]] = []
+        self._callbacks_lock = asyncio.Lock()  # Lock for callback list modifications
         self._current_server: Optional[str] = None
-        self._failover_active: bool = False
-        self._failover_server: Optional[str] = None
+        # Failover state - stored as tuple for atomic reads (GIL guarantees atomic tuple reads)
+        # Format: (is_active: bool, server_name: Optional[str])
+        self._failover_state: tuple[bool, Optional[str]] = (False, None)
+        self._failover_lock = asyncio.Lock()  # Lock for failover state modifications
 
-    def get_current_server(self) -> str:
+    async def get_current_server_async(self) -> str:
         """
-        Get the server name that should be used for the current time.
+        Get the server name that should be used for the current time (async-safe).
 
         Returns:
             Name of the server to use.
@@ -49,8 +53,16 @@ class TimeBasedRouter:
             RuntimeError: If no server is configured for the current time.
         """
         # If failover is active, use the failover server
-        if self._failover_active and self._failover_server:
-            return self._failover_server
+        async with self._failover_lock:
+            is_active, server = self._failover_state
+            if is_active and server:
+                return server
+
+        # Check for empty schedule first
+        if not self.config.schedule:
+            raise RuntimeError(
+                "No schedule configured. Add schedule entries to your configuration."
+            )
 
         now = datetime.now().time()
         for frame in self.config.schedule:
@@ -59,7 +71,42 @@ class TimeBasedRouter:
 
         raise RuntimeError(
             f"No server configured for current time {now}. "
-            f"Check your schedule configuration."
+            f"Check your schedule configuration covers all hours."
+        )
+
+    def get_current_server(self) -> str:
+        """
+        Get the server name that should be used for the current time.
+
+        Note: This synchronous version reads _failover_state as an atomic tuple
+        (GIL guarantees atomic reads of object references). For strict consistency
+        in async paths, use get_current_server_async().
+
+        Returns:
+            Name of the server to use.
+
+        Raises:
+            RuntimeError: If no server is configured for the current time.
+        """
+        # Atomic read of failover state tuple (GIL-safe)
+        is_active, server = self._failover_state
+        if is_active and server:
+            return server
+
+        # Check for empty schedule first
+        if not self.config.schedule:
+            raise RuntimeError(
+                "No schedule configured. Add schedule entries to your configuration."
+            )
+
+        now = datetime.now().time()
+        for frame in self.config.schedule:
+            if frame.contains(now):
+                return frame.server
+
+        raise RuntimeError(
+            f"No server configured for current time {now}. "
+            f"Check your schedule configuration covers all hours."
         )
 
     def get_scheduled_server(self) -> str:
@@ -114,6 +161,10 @@ class TimeBasedRouter:
         elif end_time > current_time:
             # End time is later today
             next_switch = datetime.combine(now.date(), end_time)
+        elif end_time == current_time:
+            # We're exactly at the switch time - switch is now (or just passed)
+            # Return a time slightly in the future to trigger immediate switch
+            next_switch = now + timedelta(seconds=1)
         else:
             # End time is tomorrow (midnight crossover)
             next_switch = datetime.combine(now.date() + timedelta(days=1), end_time)
@@ -134,8 +185,11 @@ class TimeBasedRouter:
             if frame.contains(test_time):
                 return frame.server
 
-        # Fallback to first server
-        return self.config.schedule[0].server
+        # This should be unreachable if config validation ensures 24-hour coverage
+        raise RuntimeError(
+            f"No server configured for time {test_time}. "
+            f"This indicates a bug in schedule validation."
+        )
 
     def get_server_config(self, server_name: str) -> Optional[StratumServerConfig]:
         """
@@ -179,31 +233,33 @@ class TimeBasedRouter:
 
         return server_names[next_idx]
 
-    def activate_failover(self, failover_server: str) -> None:
+    async def activate_failover(self, failover_server: str) -> None:
         """
         Activate failover mode to use an alternate server.
 
         Args:
             failover_server: Name of the server to fail over to.
         """
-        logger.warning(f"Activating failover to server: {failover_server}")
-        self._failover_active = True
-        self._failover_server = failover_server
+        async with self._failover_lock:
+            logger.warning(f"Activating failover to server: {failover_server}")
+            self._failover_state = (True, failover_server)
 
-    def deactivate_failover(self) -> None:
+    async def deactivate_failover(self) -> None:
         """Deactivate failover mode and return to scheduled server."""
-        if self._failover_active:
-            logger.info("Deactivating failover, returning to scheduled server")
-            self._failover_active = False
-            self._failover_server = None
+        async with self._failover_lock:
+            is_active, _ = self._failover_state
+            if is_active:
+                logger.info("Deactivating failover, returning to scheduled server")
+                self._failover_state = (False, None)
 
     @property
     def is_failover_active(self) -> bool:
         """Check if failover mode is currently active."""
-        return self._failover_active
+        is_active, _ = self._failover_state
+        return is_active
 
-    def register_switch_callback(
-        self, callback: Callable[[str], asyncio.Future]
+    async def register_switch_callback(
+        self, callback: Callable[[str], Awaitable[Any]]
     ) -> None:
         """
         Register a callback to be called when servers switch.
@@ -211,10 +267,11 @@ class TimeBasedRouter:
         Args:
             callback: Async function that takes the new server name.
         """
-        self._switch_callbacks.append(callback)
+        async with self._callbacks_lock:
+            self._switch_callbacks.append(callback)
 
-    def unregister_switch_callback(
-        self, callback: Callable[[str], asyncio.Future]
+    async def unregister_switch_callback(
+        self, callback: Callable[[str], Awaitable[Any]]
     ) -> None:
         """
         Unregister a switch callback.
@@ -222,8 +279,9 @@ class TimeBasedRouter:
         Args:
             callback: Callback to remove.
         """
-        if callback in self._switch_callbacks:
-            self._switch_callbacks.remove(callback)
+        async with self._callbacks_lock:
+            if callback in self._switch_callbacks:
+                self._switch_callbacks.remove(callback)
 
     async def notify_switch(self, new_server: str) -> None:
         """
@@ -232,8 +290,12 @@ class TimeBasedRouter:
         Args:
             new_server: Name of the new server.
         """
-        logger.info(f"Notifying {len(self._switch_callbacks)} callbacks of switch to {new_server}")
-        for callback in self._switch_callbacks:
+        # Copy callbacks under lock to allow safe iteration
+        async with self._callbacks_lock:
+            callbacks = list(self._switch_callbacks)
+
+        logger.info(f"Notifying {len(callbacks)} callbacks of switch to {new_server}")
+        for callback in callbacks:
             try:
                 await callback(new_server)
             except Exception as e:
@@ -264,8 +326,8 @@ class TimeBasedRouter:
                 scheduled_server = self.get_scheduled_server()
 
                 # Check if we need to deactivate failover (scheduled server changed)
-                if self._failover_active and self._current_server != scheduled_server:
-                    self.deactivate_failover()
+                if self.is_failover_active and self._current_server != scheduled_server:
+                    await self.deactivate_failover()
 
                 current_server = self.get_current_server()
 
@@ -282,8 +344,8 @@ class TimeBasedRouter:
                 next_switch = self.get_next_switch_time()
                 sleep_seconds = (next_switch - datetime.now()).total_seconds()
 
-                # Cap sleep time to check periodically (every 60 seconds max)
-                sleep_seconds = min(max(sleep_seconds, 1), 60)
+                # Cap sleep time to check periodically
+                sleep_seconds = min(max(sleep_seconds, 1), SCHEDULER_CHECK_INTERVAL)
 
                 # Wait with cancellation support
                 try:

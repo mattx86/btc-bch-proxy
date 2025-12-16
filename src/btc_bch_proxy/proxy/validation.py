@@ -65,6 +65,16 @@ class ShareValidator:
     - Stale job detection
     - Difficulty validation
     - Optional share hash validation
+
+    Thread Safety:
+        This class is NOT thread-safe. It is designed to be used from a single
+        async task (the MinerSession that owns it). Each MinerSession creates
+        its own ShareValidator instance, so no locking is required.
+
+        IMPORTANT: Do NOT share a ShareValidator instance between tasks or call
+        its methods concurrently. The internal OrderedDict structures are not
+        protected by locks and concurrent access will cause race conditions.
+        If you need thread-safe validation, add asyncio.Lock protection.
     """
 
     def __init__(self, session_id: str, config: Optional[ValidationConfig] = None):
@@ -86,6 +96,11 @@ class ShareValidator:
         self._max_job_cache = config.job_cache_size if config else 10
 
         # Recent shares for duplicate detection (OrderedDict for LRU behavior)
+        # Note: Cache cleanup (_clean_share_cache) runs on each validate_share() call.
+        # Expired entries may persist if no shares are submitted, but this is acceptable:
+        # - Cache size is bounded by _max_share_cache (prevents memory growth)
+        # - Memory overhead is minimal (~100 bytes per entry, max ~100KB total)
+        # - Periodic background cleanup would add complexity without meaningful benefit
         self._recent_shares: OrderedDict[ShareKey, float] = OrderedDict()
 
         # Current and recent jobs
@@ -95,11 +110,19 @@ class ShareValidator:
         # Current difficulty
         self._difficulty: float = 1.0
 
+        # Expected extranonce2 size (in bytes, set by pool)
+        self._extranonce2_size: Optional[int] = None
+
         # Statistics
         self.duplicates_rejected: int = 0
         self.stale_rejected: int = 0
         self.low_diff_rejected: int = 0
         self.over_target_rejected: int = 0
+        self.invalid_format_rejected: int = 0
+
+        # Cache cleanup throttling (cleanup at most once per 60 seconds)
+        self._last_cache_cleanup: float = 0.0
+        self._cache_cleanup_interval: float = 60.0
 
     def set_difficulty(self, difficulty: float) -> None:
         """
@@ -111,6 +134,33 @@ class ShareValidator:
         if difficulty > 0:
             self._difficulty = difficulty
             logger.debug(f"[{self.session_id}] Difficulty set to {difficulty}")
+        else:
+            logger.warning(f"[{self.session_id}] Ignoring invalid difficulty: {difficulty}")
+
+    # Minimum extranonce2 size - values below this are unusual and may indicate
+    # pool misconfiguration. Most pools use 4-8 bytes.
+    MIN_EXTRANONCE2_SIZE = 2
+
+    def set_extranonce2_size(self, size: int) -> None:
+        """
+        Set the expected extranonce2 size from pool subscription.
+
+        Args:
+            size: Size in bytes (e.g., 4 means 8 hex characters).
+        """
+        if size <= 0:
+            logger.warning(f"[{self.session_id}] Ignoring invalid extranonce2 size: {size}")
+            return
+
+        if size < self.MIN_EXTRANONCE2_SIZE:
+            logger.warning(
+                f"[{self.session_id}] Unusually small extranonce2 size: {size} bytes "
+                f"(expected >= {self.MIN_EXTRANONCE2_SIZE}). Pool may be misconfigured."
+            )
+            # Still set it - the pool knows what it's doing (maybe)
+
+        self._extranonce2_size = size
+        logger.debug(f"[{self.session_id}] Extranonce2 size set to {size} bytes")
 
     def add_job(self, job_info: JobInfo) -> None:
         """
@@ -191,8 +241,21 @@ class ShareValidator:
         Returns:
             Tuple of (valid, error_reason).
         """
-        # Clean expired shares from cache
-        self._clean_share_cache()
+        # Clean expired shares from cache (throttled to avoid overhead at high share rates)
+        now = time.time()
+        if now - self._last_cache_cleanup > self._cache_cleanup_interval:
+            self._clean_share_cache()
+            self._last_cache_cleanup = now
+
+        # Validate extranonce2 length if we know the expected size
+        if self._extranonce2_size is not None:
+            expected_hex_len = self._extranonce2_size * 2  # bytes to hex chars
+            if len(extranonce2) != expected_hex_len:
+                self.invalid_format_rejected += 1
+                return False, (
+                    f"Invalid extranonce2 length: expected {expected_hex_len} "
+                    f"hex chars, got {len(extranonce2)}"
+                )
 
         # Check for duplicate (include version_bits for version-rolling miners)
         if self._reject_duplicates:
@@ -266,6 +329,31 @@ class ShareValidator:
         for key in expired:
             del self._recent_shares[key]
 
+    def clear_share_cache(self) -> None:
+        """
+        Clear all cached shares and jobs.
+
+        Call this when switching to a new upstream server. The new pool will have
+        different job IDs, and old share data is no longer relevant. Keeping stale
+        data could cause false duplicate detection if the new pool happens to reuse
+        job IDs or if the miner resubmits previously rejected shares.
+        """
+        old_share_count = len(self._recent_shares)
+        old_job_count = len(self._jobs)
+
+        self._recent_shares.clear()
+        self._jobs.clear()
+        self._current_job_id = None
+
+        if old_share_count > 0 or old_job_count > 0:
+            logger.debug(
+                f"[{self.session_id}] Cleared share cache on upstream switch "
+                f"(shares={old_share_count}, jobs={old_job_count})"
+            )
+
+    # Maximum values for 32-bit hex fields
+    MAX_UINT32 = 0xFFFFFFFF
+
     def _validate_share_hash(
         self,
         job: JobInfo,
@@ -290,6 +378,17 @@ class ShareValidator:
             Tuple of (valid, error_reason).
         """
         try:
+            # Validate hex string lengths to prevent overflow
+            # These should all be 8-character hex strings (32-bit values)
+            for name, value in [
+                ("ntime", ntime),
+                ("nonce", nonce),
+                ("version", job.version),
+                ("nbits", job.nbits),
+            ]:
+                if len(value) > 8:
+                    return False, f"Invalid {name}: too long (max 8 hex chars)"
+
             # Calculate coinbase
             coinbase = bytes.fromhex(job.coinbase1 + extranonce1 + extranonce2 + job.coinbase2)
             coinbase_hash = sha256d(coinbase)
@@ -299,23 +398,42 @@ class ShareValidator:
             for branch in job.merkle_branches:
                 merkle_root = sha256d(merkle_root + bytes.fromhex(branch))
 
-            # Build block header
+            # Build block header - parse and validate 32-bit values
             version = int(job.version, 16)
+            if version > self.MAX_UINT32:
+                return False, f"Invalid version: {job.version} exceeds uint32"
+
             if version_bits:
-                # Apply version-rolling bits
+                # Apply version-rolling bits with bounds check
+                if len(version_bits) > 8:
+                    return False, f"Invalid version_bits: too long (max 8 hex chars)"
                 version_mask = int(version_bits, 16)
+                if version_mask > self.MAX_UINT32:
+                    return False, f"Invalid version_bits: exceeds uint32"
                 version = (version & 0xe0000000) | (version_mask & 0x1fffffff)
 
             # Stratum prevhash is 8x4-byte words, each word byte-swapped
             # Convert back to normal byte order for block header
             prevhash_bytes = swap_endian_words(bytes.fromhex(job.prevhash))
 
+            # Parse and validate ntime and nonce
+            ntime_int = int(ntime, 16)
+            nonce_int = int(nonce, 16)
+            nbits_int = int(job.nbits, 16)
+
+            if ntime_int > self.MAX_UINT32:
+                return False, f"Invalid ntime: {ntime} exceeds uint32"
+            if nonce_int > self.MAX_UINT32:
+                return False, f"Invalid nonce: {nonce} exceeds uint32"
+            if nbits_int > self.MAX_UINT32:
+                return False, f"Invalid nbits: {job.nbits} exceeds uint32"
+
             header = struct.pack("<I", version)  # Version (little-endian)
             header += prevhash_bytes  # Previous block hash (already in correct order)
             header += merkle_root  # Merkle root (already in correct order)
-            header += struct.pack("<I", int(ntime, 16))  # Timestamp
-            header += struct.pack("<I", int(job.nbits, 16))  # Bits (difficulty)
-            header += struct.pack("<I", int(nonce, 16))  # Nonce
+            header += struct.pack("<I", ntime_int)  # Timestamp
+            header += struct.pack("<I", nbits_int)  # Bits (difficulty)
+            header += struct.pack("<I", nonce_int)  # Nonce
 
             # Calculate block hash
             block_hash = sha256d(header)
@@ -334,9 +452,24 @@ class ShareValidator:
 
             return True, None
 
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] Hash validation error: {e}")
-            # Don't reject on validation errors - let the pool decide
+        except ValueError as e:
+            # Invalid hex/int conversion - data format issue
+            logger.warning(
+                f"[{self.session_id}] Hash validation format error (accepting share): {e}"
+            )
+            return True, None
+        except struct.error as e:
+            # Struct packing error - data size issue
+            logger.warning(
+                f"[{self.session_id}] Hash validation struct error (accepting share): {e}"
+            )
+            return True, None
+        except (TypeError, KeyError, IndexError) as e:
+            # Unexpected data type or missing data - let pool be arbiter
+            logger.warning(
+                f"[{self.session_id}] Hash validation data error (accepting share): "
+                f"{type(e).__name__}: {e}"
+            )
             return True, None
 
     def get_stats(self) -> dict:
@@ -346,6 +479,7 @@ class ShareValidator:
             "stale_rejected": self.stale_rejected,
             "low_diff_rejected": self.low_diff_rejected,
             "over_target_rejected": self.over_target_rejected,
+            "invalid_format_rejected": self.invalid_format_rejected,
             "cached_shares": len(self._recent_shares),
             "tracked_jobs": len(self._jobs),
             "current_difficulty": self._difficulty,
@@ -383,7 +517,18 @@ def difficulty_to_target(difficulty: float) -> int:
     Convert difficulty to target value.
 
     The target is the maximum hash value that a share must be below.
+
+    Args:
+        difficulty: Mining difficulty (must be positive).
+
+    Returns:
+        Target value as integer.
+
+    Raises:
+        ValueError: If difficulty is zero or negative.
     """
+    if difficulty <= 0:
+        raise ValueError(f"Difficulty must be positive, got {difficulty}")
     # Bitcoin difficulty 1 target
     MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     return int(MAX_TARGET / difficulty)

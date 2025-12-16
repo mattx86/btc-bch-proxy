@@ -49,6 +49,12 @@ def load_config(path: Union[str, Path]) -> Config:
     if raw_config is None:
         raise ConfigError("Configuration file is empty")
 
+    if not isinstance(raw_config, dict):
+        raise ConfigError(
+            f"Configuration file must contain a YAML mapping (dict), "
+            f"got {type(raw_config).__name__}"
+        )
+
     try:
         return Config.model_validate(raw_config)
     except ValidationError as e:

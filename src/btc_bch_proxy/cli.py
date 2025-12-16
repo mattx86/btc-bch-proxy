@@ -61,7 +61,7 @@ def main():
 )
 @click.option(
     "--log-level",
-    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
     default=None,
     help="Override log level from config",
 )
@@ -96,7 +96,7 @@ def start(config_path: Optional[Path], foreground: bool, log_level: Optional[str
     setup_logging(config.logging)
 
     # Create daemon manager
-    daemon = DaemonManager(config)
+    daemon = DaemonManager(config, config_path=str(config_path))
 
     # Check if already running
     if daemon.is_running():
@@ -293,7 +293,12 @@ def init(no_venv: bool, venv_path: Path):
                     )
                     click.echo("Installed dependencies")
             except subprocess.CalledProcessError as e:
-                click.echo(f"Warning: Failed to install dependencies: {e.stderr.decode() if e.stderr else e}", err=True)
+                error_detail = e.stderr.decode() if e.stderr else str(e)
+                click.echo(
+                    f"ERROR: Failed to install dependencies: {error_detail}\n"
+                    f"You may need to manually install: pip install pydantic pyyaml loguru click",
+                    err=True
+                )
 
         # Show activation instructions
         click.echo("")

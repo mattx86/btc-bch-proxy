@@ -23,13 +23,20 @@ class StratumRequest:
         }
 
 
+# Type alias for error formats:
+# - Stratum style: [code, message, traceback] (List)
+# - JSON-RPC 2.0 style: {"code": N, "message": "..."} (Dict)
+StratumError = Union[List[Any], dict]
+
+
 @dataclass
 class StratumResponse:
     """A stratum JSON-RPC response from server to client."""
 
     id: int
     result: Any
-    error: Optional[List[Any]] = None  # [code, message, traceback]
+    # Error can be Stratum style [code, msg, traceback] or JSON-RPC 2.0 style {code, message}
+    error: Optional[StratumError] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
