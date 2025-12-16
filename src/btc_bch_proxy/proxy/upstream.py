@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import ssl
 import time as time_module
 from typing import TYPE_CHECKING, Dict, Optional, Set
@@ -334,7 +335,6 @@ class UpstreamConnection:
             return False
         except OSError as e:
             # Provide more specific error messages for common connection failures
-            import errno
             error_msg = str(e)
             if hasattr(e, 'errno'):
                 if e.errno == errno.ECONNREFUSED:

@@ -290,8 +290,7 @@ class StratumProxyServer:
         # Phase 1: Clean expired timestamps and collect empty IPs
         empty_ips = []
         for ip, attempts in self._connection_attempts.items():
-            # Filter in-place to avoid creating new list
-            original_len = len(attempts)
+            # Filter in-place
             attempts[:] = [t for t in attempts if t > cutoff]
             if not attempts:
                 empty_ips.append(ip)

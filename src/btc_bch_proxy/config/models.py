@@ -137,19 +137,25 @@ class TimeFrame(BaseModel):
         return self.end == self.END_OF_DAY
 
     def contains(self, t: time) -> bool:
-        """Check if a given time falls within this timeframe."""
+        """
+        Check if a given time falls within this timeframe.
+
+        End time is exclusive: [start, end) - includes start, excludes end.
+        This allows adjacent timeframes like 00:00-12:00 and 12:00-24:00
+        where 12:00 belongs only to the second timeframe.
+        """
         # Handle end-of-day case (24:00 should include everything from start to midnight)
         if self.is_end_of_day:
             return self.start <= t
 
         # Note: start == end case is rejected by model_validator, so we don't handle it here
 
-        # Handle normal case (start < end)
+        # Handle normal case (start < end) - end is exclusive
         if self.start < self.end:
-            return self.start <= t <= self.end
+            return self.start <= t < self.end
 
-        # Handle midnight crossover (start > end, e.g., 22:00-02:00)
-        return t >= self.start or t <= self.end
+        # Handle midnight crossover (start > end, e.g., 22:00-02:00) - end is exclusive
+        return t >= self.start or t < self.end
 
     def duration_seconds(self) -> int:
         """Calculate duration of this timeframe in seconds."""

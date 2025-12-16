@@ -518,6 +518,10 @@ class ShareValidator:
         }
 
 
+# Bitcoin difficulty 1 target (used for difficulty <-> target conversion)
+MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+
+
 def sha256d(data: bytes) -> bytes:
     """Double SHA256 hash."""
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
@@ -561,12 +565,9 @@ def difficulty_to_target(difficulty: float) -> int:
     """
     if difficulty <= 0:
         raise ValueError(f"Difficulty must be positive, got {difficulty}")
-    # Bitcoin difficulty 1 target
-    MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     return int(MAX_TARGET / difficulty)
 
 
 def target_to_difficulty(target: int) -> float:
     """Convert target to difficulty."""
-    MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
     return MAX_TARGET / target if target > 0 else float("inf")

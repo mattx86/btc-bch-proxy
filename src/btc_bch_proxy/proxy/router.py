@@ -329,13 +329,14 @@ class TimeBasedRouter:
 
         while not stop_event.is_set():
             try:
-                # Get current and next server
+                # Get scheduled server and check failover state
                 scheduled_server = self.get_scheduled_server()
 
                 # Check if we need to deactivate failover (scheduled server changed)
                 if self.is_failover_active and self._current_server != scheduled_server:
                     await self.deactivate_failover()
 
+                # Get effective current server (may differ from scheduled if failover active)
                 current_server = self.get_current_server()
 
                 # Check if server changed
