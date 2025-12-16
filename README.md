@@ -25,12 +25,19 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 git clone https://github.com/mattx86/btc-bch-proxy.git
 cd btc-bch-proxy
 
-# Windows
+# Initialize proxy -- Windows
 init.bat
 
-# Linux
+# Initialize proxy -- Linux
 chmod +x *.sh
 ./init.sh
+
+# Edit config.yaml with pool and schedule configuration.
+
+# Start proxy -- Windows
+start.bat
+# Start proxy -- Linux
+./start.sh -f
 ```
 
 This creates a virtual environment, upgrades pip, installs dependencies, and generates `config.yaml`.
