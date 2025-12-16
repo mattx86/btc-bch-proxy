@@ -574,6 +574,9 @@ class MinerSession:
                     self._consecutive_protocol_errors = 0
 
                 for msg in messages:
+                    # Check closing flag between messages for faster shutdown
+                    if self._closing:
+                        break
                     await self._handle_miner_message(msg)
 
             except asyncio.TimeoutError:
@@ -860,6 +863,16 @@ class MinerSession:
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
+        # Reject shares if session is closing
+        if self._closing:
+            error = [25, "Session closing", None]
+            logger.debug(f"[{self.session_id}] Share rejected: session closing")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
         # Reject shares during brief server switchover (while draining old shares)
         if self._switching_servers:
             error = [25, "Server switch in progress", None]
@@ -1356,6 +1369,18 @@ class MinerSession:
 
         logger.info(f"[{self.session_id}] Closing session")
 
+        # Capture references to avoid TOCTOU issues
+        writer = self.writer
+        upstream = self._upstream
+
+        # Close the miner socket FIRST to break any blocking reads
+        # This causes read() to return empty bytes, exiting the read loop
+        if writer and not writer.is_closing():
+            try:
+                writer.close()
+            except Exception:
+                pass  # Socket may already be broken
+
         # Cancel relay tasks immediately to break out of any blocking operations
         relay_tasks = getattr(self, '_relay_tasks', [])
         for task in relay_tasks:
@@ -1371,20 +1396,6 @@ class MinerSession:
             except asyncio.TimeoutError:
                 logger.debug(f"[{self.session_id}] Timeout waiting for tasks to cancel")
 
-        # Capture references to avoid TOCTOU issues
-        writer = self.writer
-        upstream = self._upstream
-
-        # Drain any remaining queued messages before closing
-        # Give them a chance to be sent to the miner
-        # Always call drain - it handles its own locking and idempotency
-        # (avoids TOCTOU race with empty() check)
-        try:
-            if writer:
-                await self._drain_miner_queue()
-        except Exception as e:
-            logger.debug(f"[{self.session_id}] Error draining queue: {e}")
-
         # Close upstream connection
         if upstream:
             try:
@@ -1393,14 +1404,13 @@ class MinerSession:
                 logger.debug(f"[{self.session_id}] Error closing upstream: {e}")
             self._upstream = None
 
-        # Close miner connection
+        # Wait for miner connection to finish closing (we called close() earlier)
         if writer:
             try:
-                writer.close()
                 await writer.wait_closed()
             except Exception as e:
                 # Expected during unclean disconnects, log at debug level
-                logger.debug(f"[{self.session_id}] Error closing miner connection: {e}")
+                logger.debug(f"[{self.session_id}] Error waiting for miner connection close: {e}")
 
         self.reader = None
         self.writer = None

@@ -146,10 +146,25 @@ class StratumProxyServer:
         # Log final stats before shutdown
         await ProxyStats.get_instance().log_stats()
 
-        # Close all sessions (each session closes its own upstream connection)
+        # Close all sessions IN PARALLEL (each session closes its own upstream connection)
+        # Don't hold the lock while waiting - just grab the session list
         async with self._session_lock:
-            for session in list(self._sessions.values()):
-                await session.close()
+            sessions = list(self._sessions.values())
+
+        if sessions:
+            logger.info(f"Closing {len(sessions)} active sessions...")
+            # Close all sessions concurrently with a timeout
+            close_tasks = [session.close() for session in sessions]
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*close_tasks, return_exceptions=True),
+                    timeout=5.0  # 5 second overall timeout for all sessions
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for sessions to close, forcing shutdown")
+
+        # Clear the sessions dict
+        async with self._session_lock:
             self._sessions.clear()
 
         logger.info("Proxy server stopped")
