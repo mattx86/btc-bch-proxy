@@ -217,6 +217,10 @@ class MinerSession:
         self._upstream: Optional[UpstreamConnection] = None
         self._upstream_lock = asyncio.Lock()  # Protects _upstream during reconnection
 
+        # Server switching state - when True, new shares are rejected
+        self._switching_servers = False
+        self._switch_target_server: Optional[str] = None  # Server we're trying to switch to
+
         # Pending requests and shares
         self._pending_shares: dict[int, asyncio.Future] = {}
         self._miner_request_id = 0
@@ -357,75 +361,152 @@ class MinerSession:
         """
         Internal implementation of upstream connection (must hold _upstream_lock).
 
+        Server Switch Protocol:
+            1. Validate server config exists
+            2. Retry connecting to new server for up to 20 minutes
+               (old server stays connected and handles shares during this time)
+            3. Once new server is fully connected:
+               - Enter switching state (new shares rejected briefly)
+               - Drain pending shares on old upstream
+               - Disconnect old upstream
+               - Activate new upstream
+               - Exit switching state
+            4. If new server never connects after 20 min, keep old server
+
         Concurrency Note:
-            While this method holds _upstream_lock, share submissions via _handle_submit()
-            may still be in progress using the old upstream reference. This is safe because:
-            1. Share submits capture self._upstream at the start of each retry attempt
-            2. If the old upstream is disconnected, the submit fails with a retryable error
-            3. The retry logic reconnects and re-captures the new upstream
-            4. The share is then submitted to the new connection
-            So shares are not lost during server switch, though there may be brief retry delays.
+            While in switching state, _handle_submit() rejects new shares with
+            "server switch in progress" error. This is a brief window (few seconds)
+            while draining old shares.
         """
-        # Wait for pending shares on current upstream before switching
-        if self._upstream and self._upstream.has_pending_shares:
-            initial_pending = self._upstream.pending_share_count
-            logger.info(
-                f"[{self.session_id}] Waiting for {initial_pending} "
-                f"pending shares before switching"
-            )
-            start_time = time.time()
-            timeout = float(self.config.proxy.pending_shares_timeout)
-            while self._upstream.has_pending_shares:
-                if time.time() - start_time > timeout:
-                    remaining = self._upstream.pending_share_count
-                    logger.warning(
-                        f"[{self.session_id}] Timeout waiting for pending shares: "
-                        f"{remaining} shares abandoned (miner may lose these shares)"
-                    )
-                    break
-                await self._upstream.read_messages()
-                await asyncio.sleep(POLL_SLEEP_INTERVAL)
-
-        # Disconnect old upstream if switching
-        if self._upstream:
-            await self._upstream.disconnect()
-
-        # Clear share cache to prevent false duplicate detection with new upstream
-        # New pool may have different job IDs or the old shares are now stale
-        self._validator.clear_share_cache()
-
-        # Get server config
+        # Get server config first (fail fast if invalid)
         server_config = self.router.get_server_config(server_name)
         if not server_config:
             logger.error(f"[{self.session_id}] Unknown server: {server_name}")
             return False
 
-        # Create a NEW upstream connection for this session
-        self._upstream = UpstreamConnection(server_config, self.config.proxy)
+        # Keep reference to old upstream
+        old_upstream = self._upstream
+        is_server_switch = old_upstream is not None and self._current_server != server_name
 
-        # Connect
-        if not await self._upstream.connect():
-            logger.error(f"[{self.session_id}] Failed to connect to {server_name}")
+        if is_server_switch:
+            logger.info(
+                f"[{self.session_id}] Starting server switch: "
+                f"{self._current_server} -> {server_name} "
+                f"(old server stays active during connection attempts)"
+            )
+
+        # Retry connecting to new server for up to max_retries
+        # Old server stays connected and handles shares during this time
+        max_retries = server_config.max_retries
+        retry_interval = server_config.retry_interval
+        retry_timeout = max_retries * retry_interval  # ~20 minutes
+        start_time = time.time()
+        new_upstream = None
+
+        for attempt in range(1, max_retries + 1):
+            # Check if session is closing
+            if self._closing:
+                logger.info(f"[{self.session_id}] Switch cancelled - session closing")
+                return False
+
+            # Create a NEW upstream connection for this attempt
+            new_upstream = UpstreamConnection(server_config, self.config.proxy)
+
+            # Attempt full handshake: connect -> configure -> subscribe -> authorize
+            connected = await new_upstream.connect()
+            if connected:
+                await new_upstream.configure()
+                subscribed = await new_upstream.subscribe()
+                if subscribed:
+                    authorized = await new_upstream.authorize()
+                    if authorized:
+                        # SUCCESS - new server is fully ready!
+                        break
+                    else:
+                        await new_upstream.disconnect()
+                        new_upstream = None
+                else:
+                    await new_upstream.disconnect()
+                    new_upstream = None
+            else:
+                new_upstream = None
+
+            # Check if we've exceeded the retry timeout
+            elapsed = time.time() - start_time
+            if elapsed >= retry_timeout:
+                logger.error(
+                    f"[{self.session_id}] Failed to connect to {server_name} after "
+                    f"{int(elapsed)}s ({attempt} attempts) - keeping old server"
+                )
+                return False
+
+            # Log progress every ~1 minute (12 attempts at 5s interval)
+            if attempt % 12 == 0:
+                minutes_elapsed = int(elapsed / 60)
+                minutes_remaining = int((retry_timeout - elapsed) / 60)
+                logger.warning(
+                    f"[{self.session_id}] Still trying to connect to {server_name}... "
+                    f"({minutes_elapsed}m elapsed, {minutes_remaining}m remaining)"
+                )
+
+            # Wait before next retry
+            await asyncio.sleep(retry_interval)
+        else:
+            # Exhausted all retries without breaking (no successful connection)
+            logger.error(
+                f"[{self.session_id}] Failed to connect to {server_name} after "
+                f"{max_retries} attempts - keeping old server"
+            )
             return False
 
-        # Configure (negotiate version-rolling with pool)
-        await self._upstream.configure()
+        # NEW SERVER IS READY - now do the brief switchover
+        # Enter switching state - new shares will be rejected during drain
+        if is_server_switch:
+            self._switching_servers = True
+            self._switch_target_server = server_name
 
-        # Subscribe
-        if not await self._upstream.subscribe():
-            await self._upstream.disconnect()
-            logger.error(f"[{self.session_id}] Failed to subscribe to {server_name}")
-            return False
+        try:
+            # Wait for pending shares on old upstream before switching
+            if old_upstream and old_upstream.has_pending_shares:
+                initial_pending = old_upstream.pending_share_count
+                logger.info(
+                    f"[{self.session_id}] Draining {initial_pending} pending shares..."
+                )
+                drain_start = time.time()
+                timeout = float(self.config.proxy.pending_shares_timeout)
+                while old_upstream.has_pending_shares:
+                    if time.time() - drain_start > timeout:
+                        remaining = old_upstream.pending_share_count
+                        logger.warning(
+                            f"[{self.session_id}] Timeout draining pending shares: "
+                            f"{remaining} shares abandoned"
+                        )
+                        break
+                    await old_upstream.read_messages()
+                    await asyncio.sleep(POLL_SLEEP_INTERVAL)
 
-        # Authorize
-        if not await self._upstream.authorize():
-            await self._upstream.disconnect()
-            logger.error(f"[{self.session_id}] Failed to authorize with {server_name}")
-            return False
+            # Disconnect old upstream
+            if old_upstream:
+                await old_upstream.disconnect()
 
-        self._current_server = server_name
-        logger.info(f"[{self.session_id}] Connected to upstream {server_name}")
-        return True
+            # Clear share cache - old jobs are no longer valid
+            self._validator.clear_share_cache()
+
+            # Activate new upstream
+            self._upstream = new_upstream
+            self._current_server = server_name
+
+            elapsed = time.time() - start_time
+            logger.info(
+                f"[{self.session_id}] Connected to upstream {server_name} "
+                f"(after {int(elapsed)}s)"
+            )
+            return True
+
+        finally:
+            # Always clear switching state when done
+            self._switching_servers = False
+            self._switch_target_server = None
 
     async def _reconnect_upstream(self) -> None:
         """
@@ -777,8 +858,32 @@ class MinerSession:
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
+        # Reject shares during brief server switchover (while draining old shares)
+        if self._switching_servers:
+            error = [25, "Server switch in progress", None]
+            logger.info(
+                f"[{self.session_id}] Share rejected: server switch in progress "
+                f"(switching to {self._switch_target_server})"
+            )
+            stats = ProxyStats.get_instance()
+            fire_and_forget(stats.record_share_rejected(
+                self._switch_target_server or self._current_server, "server switch"
+            ))
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
         if not self._upstream or not self._upstream.authorized:
             error = [24, "Not authorized", None]
+            logger.warning(
+                f"[{self.session_id}] Share rejected: upstream not connected/authorized "
+                f"(current_server={self._current_server})"
+            )
+            # Record the rejection in stats
+            stats = ProxyStats.get_instance()
+            fire_and_forget(stats.record_share_rejected(self._current_server, "not connected"))
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
