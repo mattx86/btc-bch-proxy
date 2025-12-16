@@ -536,6 +536,10 @@ class MinerSession:
 
                 # Send set_extranonce to miner with new values
                 if self._upstream and self._upstream.subscribed:
+                    # Update validator with extranonce2 size (may have changed on reconnect)
+                    if self._upstream.extranonce2_size is not None:
+                        self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
+
                     notification = StratumNotification(
                         method=StratumMethods.MINING_SET_EXTRANONCE,
                         params=[self._upstream.extranonce1, self._upstream.extranonce2_size],
@@ -1347,6 +1351,10 @@ class MinerSession:
 
         # Re-subscribe with new upstream's extranonce
         if self._upstream and self._upstream.subscribed:
+            # Update validator with new pool's extranonce2 size (may differ between pools)
+            if self._upstream.extranonce2_size is not None:
+                self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
+
             # Send set_extranonce notification to miner if supported
             notification = StratumNotification(
                 method=StratumMethods.MINING_SET_EXTRANONCE,
@@ -1356,7 +1364,8 @@ class MinerSession:
 
             logger.info(
                 f"[{self.session_id}] Server switch complete, "
-                f"new extranonce1={self._upstream.extranonce1}"
+                f"new extranonce1={self._upstream.extranonce1}, "
+                f"extranonce2_size={self._upstream.extranonce2_size}"
             )
 
     async def close(self) -> None:
