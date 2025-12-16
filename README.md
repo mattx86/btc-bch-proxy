@@ -33,7 +33,7 @@ chmod +x *.sh
 ./init.sh
 ```
 
-This creates a virtual environment, installs dependencies, and generates `config.yaml`.
+This creates a virtual environment, upgrades pip, installs dependencies, and generates `config.yaml`.
 
 ### Manual Installation
 
@@ -46,6 +46,7 @@ python -m venv venv
 venv\Scripts\activate     # Windows
 source venv/bin/activate  # Linux
 
+pip install --upgrade pip
 pip install -e .
 btc-bch-proxy init --no-venv
 ```
@@ -70,7 +71,7 @@ btc-bch-proxy init --no-venv
    ./init.sh
    ```
 
-   This creates a virtual environment, installs dependencies, and generates `config.yaml`.
+   This creates a virtual environment, upgrades pip, installs dependencies, and generates `config.yaml`.
 
 2. **Edit the configuration** with your pool details:
 
@@ -136,7 +137,7 @@ btc-bch-proxy init --no-venv
 
 | Script | Description |
 |--------|-------------|
-| `init.bat` / `init.sh` | Initialize: create venv, install deps, create config |
+| `init.bat` / `init.sh` | Initialize: create venv, upgrade pip, install deps, create config |
 | `start.bat` / `start.sh` | Start the proxy (pass `-f` for foreground) |
 | `stop.bat` / `stop.sh` | Stop the running proxy |
 
@@ -281,7 +282,13 @@ The proxy logs detailed statistics every 15 minutes (at :00, :15, :30, :45). Exa
 ============================================================
 PROXY STATISTICS (uptime: 2h 30m)
 ============================================================
-Miners: 3 active | 5 total connections | 2 disconnections | Active server: pool1
+Servers:
+  - pool1 (stratum.pool1.com:3333) Schedule: 00:00-12:00 Username: wallet.worker1
+  - pool2 (stratum.pool2.com:3333) Schedule: 12:00-24:00 Username: wallet.worker2
+Miners: 3 active | 5 total connections | 2 disconnections
+Active server: pool1 (stratum.pool1.com:3333)
+Previous server: pool2 (stratum.pool2.com:3333)
+Last switch: 2025-12-16 12:00:00-0600
 ----------------------------------------
 Server: pool1 (active)
   Connections: 1 | Reconnections: 0
@@ -296,8 +303,10 @@ Server: pool2
 ```
 
 **Tracked metrics:**
+- Server configuration (address, schedule, username)
 - Active miners and connection history
-- Currently active server (marked with `(active)`)
+- Currently active server with address (marked with `(active)` in per-server stats)
+- Previous server and last switch time with timezone
 - Per-server share acceptance/rejection rates
 - Rejection reasons (normalized into categories):
   - `duplicate share` - Share already submitted
