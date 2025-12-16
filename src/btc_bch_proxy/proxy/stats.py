@@ -172,8 +172,8 @@ class ProxyStats:
         # when singleton is instantiated outside async context
         self._lock: Optional[asyncio.Lock] = None
 
-        # Start time for uptime tracking
-        self.start_time = datetime.now()
+        # Start time for uptime tracking (timezone-aware for consistency)
+        self.start_time = datetime.now(timezone.utc).astimezone()
 
     def _get_lock(self) -> asyncio.Lock:
         """
@@ -307,7 +307,7 @@ class ProxyStats:
 
     def get_uptime(self) -> str:
         """Get formatted uptime string."""
-        delta = datetime.now() - self.start_time
+        delta = datetime.now(timezone.utc).astimezone() - self.start_time
         days = delta.days
         hours, remainder = divmod(delta.seconds, 3600)
         minutes, seconds = divmod(remainder, 60)

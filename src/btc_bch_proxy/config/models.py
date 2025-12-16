@@ -297,9 +297,18 @@ class Config(BaseModel):
                     f"Available servers: {server_names}"
                 )
 
-    def _validate_no_overlap(self) -> None:
-        """Ensure no timeframes overlap."""
-        # Convert timeframes to minute ranges for easier comparison
+    def _get_minute_ranges(self, include_server: bool = False) -> List[tuple]:
+        """
+        Convert schedule timeframes to minute-based ranges.
+
+        Handles midnight crossover by splitting into two ranges.
+
+        Args:
+            include_server: If True, include server name in tuples.
+
+        Returns:
+            Sorted list of (start_mins, end_mins) or (start_mins, end_mins, server) tuples.
+        """
         ranges = []
         for tf in self.schedule:
             start_mins = tf.start.hour * 60 + tf.start.minute
@@ -307,15 +316,28 @@ class Config(BaseModel):
             if tf.end == time(23, 59, 59):
                 end_mins = 24 * 60  # End of day
 
-            if end_mins > start_mins:
-                ranges.append((start_mins, end_mins, tf.server))
+            if include_server:
+                if end_mins > start_mins:
+                    ranges.append((start_mins, end_mins, tf.server))
+                else:
+                    # Midnight crossover - split into two ranges
+                    ranges.append((start_mins, 24 * 60, tf.server))
+                    ranges.append((0, end_mins, tf.server))
             else:
-                # Midnight crossover - split into two ranges
-                ranges.append((start_mins, 24 * 60, tf.server))
-                ranges.append((0, end_mins, tf.server))
+                if end_mins > start_mins:
+                    ranges.append((start_mins, end_mins))
+                else:
+                    # Midnight crossover - split into two ranges
+                    ranges.append((start_mins, 24 * 60))
+                    ranges.append((0, end_mins))
 
         # Sort by start time
         ranges.sort(key=lambda x: x[0])
+        return ranges
+
+    def _validate_no_overlap(self) -> None:
+        """Ensure no timeframes overlap."""
+        ranges = self._get_minute_ranges(include_server=True)
 
         # Check for overlaps
         for i in range(len(ranges) - 1):
@@ -330,23 +352,7 @@ class Config(BaseModel):
 
     def _validate_complete_coverage(self) -> None:
         """Ensure schedule covers all 24 hours without gaps."""
-        # Convert timeframes to minute ranges
-        ranges = []
-        for tf in self.schedule:
-            start_mins = tf.start.hour * 60 + tf.start.minute
-            end_mins = tf.end.hour * 60 + tf.end.minute
-            if tf.end == time(23, 59, 59):
-                end_mins = 24 * 60  # End of day
-
-            if end_mins > start_mins:
-                ranges.append((start_mins, end_mins))
-            else:
-                # Midnight crossover - split into two ranges
-                ranges.append((start_mins, 24 * 60))
-                ranges.append((0, end_mins))
-
-        # Sort by start time
-        ranges.sort(key=lambda x: x[0])
+        ranges = self._get_minute_ranges(include_server=False)
 
         # Check for gaps (schedule must start at 0 and end at 24*60)
         if not ranges:

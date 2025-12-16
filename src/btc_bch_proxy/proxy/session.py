@@ -275,6 +275,9 @@ class MinerSession:
         # Protocol error tracking (for DoS protection)
         self._consecutive_protocol_errors = 0
 
+        # Relay tasks (initialized here, populated in run())
+        self._relay_tasks: list[asyncio.Task] = []
+
         logger.info(f"[{self.session_id}] New miner session from {self.client_addr}")
 
     @property
@@ -310,7 +313,6 @@ class MinerSession:
     async def run(self) -> None:
         """Main session loop - handle the miner connection lifecycle."""
         self._running = True
-        self._relay_tasks: list[asyncio.Task] = []
 
         try:
             # Connect to initial upstream server
@@ -975,7 +977,7 @@ class MinerSession:
             extranonce2 = msg.params[2]
             ntime = msg.params[3]
             nonce = msg.params[4]
-        except (TypeError, ValueError, KeyError, IndexError) as e:
+        except (TypeError, ValueError, IndexError) as e:
             error = [20, f"Failed to parse params: {type(e).__name__}: {e}", None]
             logger.error(f"[{self.session_id}] {error[1]}")
             await self._send_to_miner(
@@ -1481,7 +1483,7 @@ class MinerSession:
                 pass  # Socket may already be broken
 
         # Cancel relay tasks immediately to break out of any blocking operations
-        relay_tasks = getattr(self, '_relay_tasks', [])
+        relay_tasks = self._relay_tasks
         for task in relay_tasks:
             if not task.done():
                 task.cancel()

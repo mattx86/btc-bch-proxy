@@ -231,7 +231,7 @@ class ShareValidator:
             version=str(params[5]),
             nbits=str(params[6]),
             ntime=str(params[7]),
-            clean_jobs=bool(params[8]) if len(params) > 8 else False,
+            clean_jobs=bool(params[8]),  # len(params) >= 9 guaranteed by check above
         )
         self.add_job(job_info, source_server)
 

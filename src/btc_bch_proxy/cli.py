@@ -265,15 +265,26 @@ def init(no_venv: bool, venv_path: Path):
                 click.echo(f"Failed to create virtual environment: {e}", err=True)
                 sys.exit(1)
 
-        # Step 2: Install dependencies
+        # Step 2: Upgrade pip and install dependencies
         if sys.platform == "win32":
             pip_path = venv_path / "Scripts" / "pip.exe"
-            python_path = venv_path / "Scripts" / "python.exe"
         else:
             pip_path = venv_path / "bin" / "pip"
-            python_path = venv_path / "bin" / "python"
 
         if pip_path.exists():
+            # Upgrade pip first
+            click.echo("Upgrading pip...")
+            try:
+                subprocess.run(
+                    [str(pip_path), "install", "--upgrade", "pip"],
+                    check=True,
+                    capture_output=True,
+                )
+                click.echo("Pip upgraded successfully")
+            except subprocess.CalledProcessError as e:
+                # Non-fatal - continue with existing pip version
+                click.echo(f"Warning: Failed to upgrade pip: {e}", err=True)
+
             click.echo("Installing dependencies...")
             try:
                 # Check if we're in the package directory (has pyproject.toml)
