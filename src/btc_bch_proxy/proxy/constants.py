@@ -57,6 +57,10 @@ MAX_ERROR_MESSAGE_LENGTH = 200
 MAX_BACKGROUND_ERROR_LENGTH = 500
 
 # Grace period after server switch for stale shares (seconds)
-# Shares with wrong extranonce2 length during this period are treated as stale work
-# from the previous pool, not validation errors (miner may have in-flight work)
+# Shares from the previous pool during this period are routed to the old pool
 SERVER_SWITCH_GRACE_PERIOD = 30.0
+
+# Grace period extension when a share is routed to old pool (seconds)
+# Each time a share is successfully routed to the old pool, the grace period
+# is extended by this amount, allowing in-flight work to complete
+GRACE_PERIOD_EXTENSION = 15.0

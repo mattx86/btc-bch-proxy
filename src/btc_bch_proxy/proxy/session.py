@@ -25,6 +25,7 @@ from btc_bch_proxy.proxy.validation import ShareValidator
 from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
 from btc_bch_proxy.proxy.utils import fire_and_forget
 from btc_bch_proxy.proxy.constants import (
+    GRACE_PERIOD_EXTENSION,
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_MINER_STRING_LENGTH,
     MINER_SEND_QUEUE_MAX_SIZE,
@@ -226,6 +227,7 @@ class MinerSession:
         # Old upstream kept alive during grace period for stale share submission
         self._old_upstream: Optional[UpstreamConnection] = None
         self._old_upstream_server_name: Optional[str] = None
+        self._grace_period_end_time: float = 0.0  # When grace period expires (extended on each old share)
 
         # Pending requests and shares
         self._pending_shares: dict[int, asyncio.Future] = {}
@@ -502,6 +504,7 @@ class MinerSession:
 
                 self._old_upstream = old_upstream
                 self._old_upstream_server_name = self._current_server
+                self._grace_period_end_time = time.time() + SERVER_SWITCH_GRACE_PERIOD
                 logger.info(
                     f"[{self.session_id}] Keeping old upstream {self._current_server} alive "
                     f"for {SERVER_SWITCH_GRACE_PERIOD}s grace period"
@@ -917,8 +920,8 @@ class MinerSession:
         # Clean up old upstream if grace period has expired
         if (
             self._old_upstream is not None
-            and self._last_switch_time > 0
-            and (time.time() - self._last_switch_time) >= SERVER_SWITCH_GRACE_PERIOD
+            and self._grace_period_end_time > 0
+            and time.time() >= self._grace_period_end_time
         ):
             logger.info(
                 f"[{self.session_id}] Grace period expired, disconnecting old upstream "
@@ -930,6 +933,7 @@ class MinerSession:
                 logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
             self._old_upstream = None
             self._old_upstream_server_name = None
+            self._grace_period_end_time = 0.0
 
         if not self._upstream or not self._upstream.authorized:
             error = [24, "Not authorized", None]
@@ -1036,8 +1040,8 @@ class MinerSession:
         in_grace_period = (
             self._old_upstream is not None
             and self._old_upstream.connected
-            and self._last_switch_time > 0
-            and (time.time() - self._last_switch_time) < SERVER_SWITCH_GRACE_PERIOD
+            and self._grace_period_end_time > 0
+            and time.time() < self._grace_period_end_time
         )
 
         # Route to old pool if job was issued by old pool and we're in grace period
@@ -1063,6 +1067,13 @@ class MinerSession:
                     f"({self._old_upstream_server_name}): {reason}"
                 )
                 fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
+
+            # Extend grace period after routing share to old pool
+            # This allows more time for any remaining in-flight work to complete
+            self._grace_period_end_time = time.time() + GRACE_PERIOD_EXTENSION
+            logger.debug(
+                f"[{self.session_id}] Extended grace period by {GRACE_PERIOD_EXTENSION}s"
+            )
 
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, accepted, error),
