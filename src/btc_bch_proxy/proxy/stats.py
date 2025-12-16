@@ -7,10 +7,27 @@ import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 from loguru import logger
+
+
+@dataclass
+class ServerConfigInfo:
+    """Server configuration info for stats display."""
+
+    name: str
+    host: str
+    port: int
+    username: str
+    schedule_start: str  # HH:MM format
+    schedule_end: str  # HH:MM format
+
+    @property
+    def address(self) -> str:
+        """Get host:port string."""
+        return f"{self.host}:{self.port}"
 
 
 def normalize_rejection_reason(reason: str) -> str:
@@ -141,6 +158,15 @@ class ProxyStats:
 
         # Currently active server (for display in stats)
         self._active_server: Optional[str] = None
+        self._active_server_addr: Optional[str] = None  # host:port
+
+        # Previous server and last switch time (for display in stats)
+        self._previous_server: Optional[str] = None
+        self._previous_server_addr: Optional[str] = None  # host:port
+        self._last_switch_time: Optional[datetime] = None
+
+        # Server configuration info (for display in stats)
+        self._server_configs: List[ServerConfigInfo] = []
 
         # Lock for thread safety - created lazily to avoid event loop issues
         # when singleton is instantiated outside async context
@@ -186,6 +212,15 @@ class ProxyStats:
         with cls._instance_lock:
             cls._instance = None
 
+    def set_server_configs(self, configs: List[ServerConfigInfo]) -> None:
+        """
+        Set server configuration info for stats display.
+
+        Args:
+            configs: List of server configuration info.
+        """
+        self._server_configs = configs
+
     def _get_server_stats(self, server_name: str) -> ServerStats:
         """Get or create stats for a server."""
         # Validate server_name to prevent KeyError or stats pollution
@@ -215,10 +250,23 @@ class ProxyStats:
                 self.current_miners -= 1
             self.total_miner_disconnections += 1
 
-    async def set_active_server(self, server_name: str) -> None:
-        """Set the currently active server for routing."""
+    async def set_active_server(self, server_name: str, server_addr: Optional[str] = None) -> None:
+        """
+        Set the currently active server for routing.
+
+        Args:
+            server_name: Name of the server.
+            server_addr: Server address as "host:port" (optional).
+        """
         async with self._get_lock():
+            # Track previous server and switch time when server changes
+            if self._active_server is not None and self._active_server != server_name:
+                self._previous_server = self._active_server
+                self._previous_server_addr = self._active_server_addr
+                # Store local time with timezone info for proper offset display
+                self._last_switch_time = datetime.now(timezone.utc).astimezone()
             self._active_server = server_name
+            self._active_server_addr = server_addr
 
     async def record_upstream_connect(self, server_name: str) -> None:
         """Record an upstream server connection."""
@@ -283,6 +331,11 @@ class ProxyStats:
             total_connections = self.total_miner_connections
             total_disconnections = self.total_miner_disconnections
             active_server = self._active_server
+            active_server_addr = self._active_server_addr
+            previous_server = self._previous_server
+            previous_server_addr = self._previous_server_addr
+            last_switch_time = self._last_switch_time
+            server_configs = list(self._server_configs)
             server_stats_copy = {
                 name: ServerStats(
                     name=stats.name,
@@ -299,13 +352,35 @@ class ProxyStats:
         logger.info(f"PROXY STATISTICS (uptime: {uptime})")
         logger.info("=" * 60)
 
+        # Server configuration
+        if server_configs:
+            logger.info("Servers:")
+            for cfg in server_configs:
+                logger.info(
+                    f"  - {cfg.name} ({cfg.address}) "
+                    f"Schedule: {cfg.schedule_start}-{cfg.schedule_end} "
+                    f"Username: {cfg.username}"
+                )
+
         # Miner stats
-        active_str = f" | Active server: {active_server}" if active_server else ""
         logger.info(
             f"Miners: {current_miners} active | "
             f"{total_connections} total connections | "
-            f"{total_disconnections} disconnections{active_str}"
+            f"{total_disconnections} disconnections"
         )
+
+        # Server routing info
+        if active_server:
+            # Format server name with address if available
+            active_str = f"{active_server} ({active_server_addr})" if active_server_addr else active_server
+            if previous_server and last_switch_time:
+                prev_str = f"{previous_server} ({previous_server_addr})" if previous_server_addr else previous_server
+                switch_time_str = last_switch_time.strftime("%Y-%m-%d %H:%M:%S%z")
+                logger.info(f"Active server: {active_str}")
+                logger.info(f"Previous server: {prev_str}")
+                logger.info(f"Last switch: {switch_time_str}")
+            else:
+                logger.info(f"Active server: {active_str} (no switches yet)")
 
         # Per-server stats
         if not server_stats_copy:

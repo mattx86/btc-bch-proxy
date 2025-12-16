@@ -111,7 +111,7 @@ class ShareValidator:
         # Job source tracking for grace period routing
         # Maps job_id -> source_server (persists across cache clears for grace period)
         self._job_sources: OrderedDict[str, str] = OrderedDict()
-        self._max_job_sources = 100  # Limit to prevent unbounded growth
+        self._max_job_sources = 4096  # Limit to prevent unbounded growth
 
         # Current difficulty
         self._difficulty: float = 1.0
@@ -122,7 +122,6 @@ class ShareValidator:
         # Statistics
         self.duplicates_rejected: int = 0
         self.stale_rejected: int = 0
-        self.low_diff_rejected: int = 0
         self.over_target_rejected: int = 0
         self.invalid_format_rejected: int = 0
 
@@ -511,7 +510,6 @@ class ShareValidator:
         return {
             "duplicates_rejected": self.duplicates_rejected,
             "stale_rejected": self.stale_rejected,
-            "low_diff_rejected": self.low_diff_rejected,
             "over_target_rejected": self.over_target_rejected,
             "invalid_format_rejected": self.invalid_format_rejected,
             "cached_shares": len(self._recent_shares),

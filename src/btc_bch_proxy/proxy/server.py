@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -17,7 +18,7 @@ RATE_LIMIT_MAX_IPS = 10000  # Maximum unique IPs to track (prevents memory exhau
 
 from btc_bch_proxy.proxy.router import TimeBasedRouter
 from btc_bch_proxy.proxy.session import MinerSession
-from btc_bch_proxy.proxy.stats import ProxyStats, run_stats_logger
+from btc_bch_proxy.proxy.stats import ProxyStats, ServerConfigInfo, run_stats_logger
 
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import Config
@@ -81,6 +82,9 @@ class StratumProxyServer:
     async def start(self) -> None:
         """Start the proxy server."""
         logger.info("Starting stratum proxy server...")
+
+        # Initialize stats with server configuration
+        self._init_stats_server_configs()
 
         # Log initial server
         initial_server = self.router.get_current_server()
@@ -306,7 +310,6 @@ class StratumProxyServer:
 
             # Use heapq.nsmallest for O(n log k) instead of O(n log n) full sort
             # where k = evict_count (typically small compared to n)
-            import heapq
             oldest_entries = heapq.nsmallest(
                 evict_count,
                 self._connection_attempts.items(),
@@ -360,6 +363,36 @@ class StratumProxyServer:
                 )
             else:
                 logger.info(f"Switched {len(switch_tasks)} sessions to {new_server}")
+
+    def _init_stats_server_configs(self) -> None:
+        """Initialize ProxyStats with server configuration info."""
+        # Build a map of server name -> schedule entry
+        schedule_map: Dict[str, tuple] = {}
+        for entry in self.config.schedule:
+            # Format times as HH:MM strings
+            start_str = entry.start.strftime("%H:%M")
+            # Handle end-of-day sentinel (23:59:59 -> "24:00")
+            if entry.end.hour == 23 and entry.end.minute == 59:
+                end_str = "24:00"
+            else:
+                end_str = entry.end.strftime("%H:%M")
+            schedule_map[entry.server] = (start_str, end_str)
+
+        # Build ServerConfigInfo for each server
+        configs = []
+        for server in self.config.servers:
+            schedule_start, schedule_end = schedule_map.get(server.name, ("--:--", "--:--"))
+            configs.append(ServerConfigInfo(
+                name=server.name,
+                host=server.host,
+                port=server.port,
+                username=server.username,
+                schedule_start=schedule_start,
+                schedule_end=schedule_end,
+            ))
+
+        stats = ProxyStats.get_instance()
+        stats.set_server_configs(configs)
 
     @property
     def active_sessions(self) -> int:

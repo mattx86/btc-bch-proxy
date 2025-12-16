@@ -310,12 +310,19 @@ class TimeBasedRouter:
         """
         logger.info("Starting time-based scheduler")
 
+        def get_server_addr(server_name: str) -> Optional[str]:
+            """Get server address as host:port."""
+            config = self.get_server_config(server_name)
+            if config:
+                return f"{config.host}:{config.port}"
+            return None
+
         # Set initial active server in stats
         try:
             initial_server = self.get_current_server()
             self._current_server = initial_server
             stats = ProxyStats.get_instance()
-            await stats.set_active_server(initial_server)
+            await stats.set_active_server(initial_server, get_server_addr(initial_server))
             logger.info(f"Initial active server: {initial_server}")
         except RuntimeError as e:
             logger.error(f"Failed to determine initial server: {e}")
@@ -337,7 +344,7 @@ class TimeBasedRouter:
                     self._current_server = current_server
                     # Update stats with active server
                     stats = ProxyStats.get_instance()
-                    await stats.set_active_server(current_server)
+                    await stats.set_active_server(current_server, get_server_addr(current_server))
                     await self.notify_switch(current_server)
 
                 # Calculate sleep time until next switch

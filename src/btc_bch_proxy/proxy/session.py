@@ -222,7 +222,6 @@ class MinerSession:
         # Server switching state - when True, new shares are rejected
         self._switching_servers = False
         self._switch_target_server: Optional[str] = None  # Server we're trying to switch to
-        self._last_switch_time: float = 0.0  # Timestamp of last server switch (for grace period)
 
         # Old upstream kept alive during grace period for stale share submission
         self._old_upstream: Optional[UpstreamConnection] = None
@@ -1444,9 +1443,6 @@ class MinerSession:
             # Update validator with new pool's extranonce2 size (may differ between pools)
             if self._upstream.extranonce2_size is not None:
                 self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
-
-            # Record switch time for grace period (miner may have in-flight old work)
-            self._last_switch_time = time.time()
 
             # Send set_extranonce notification to miner if supported
             notification = StratumNotification(
