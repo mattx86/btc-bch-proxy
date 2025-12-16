@@ -448,8 +448,13 @@ class DaemonManager:
             # The handler must be synchronous, so we set the event via call_soon_threadsafe
             loop = asyncio.get_running_loop()
 
+            # Track if signal was received (for the watcher task)
+            self._signal_received = False
+
             def sync_signal_handler(signum: int, frame: Any) -> None:
-                # Set the event in a thread-safe way using the event loop
+                # Mark signal as received for the watcher task
+                self._signal_received = True
+                # Also try to set the event via call_soon_threadsafe
                 try:
                     loop.call_soon_threadsafe(self._stop_event.set)
                 except RuntimeError:
@@ -458,6 +463,27 @@ class DaemonManager:
 
             signal.signal(signal.SIGINT, sync_signal_handler)
             signal.signal(signal.SIGTERM, sync_signal_handler)
+
+            # Start a watcher task that periodically checks for signals
+            # This ensures the event loop yields frequently enough for signal handling
+            asyncio.create_task(self._windows_signal_watcher())
+
+    async def _windows_signal_watcher(self) -> None:
+        """
+        Periodically check for signals on Windows.
+
+        On Windows, signal handlers only run when Python executes bytecode.
+        During I/O waits (like serve_forever()), signals may not be processed.
+        This task yields periodically to ensure signal handlers can run.
+        """
+        while not self._stop_event.is_set():
+            # Check if signal was received by the sync handler
+            if getattr(self, '_signal_received', False):
+                logger.info("Received shutdown signal (Ctrl+C)")
+                self._stop_event.set()
+                break
+            # Yield briefly to allow signal processing
+            await asyncio.sleep(0.1)
 
     async def _handle_signal(self) -> None:
         """Handle shutdown signal."""

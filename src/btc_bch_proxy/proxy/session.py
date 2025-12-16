@@ -303,6 +303,7 @@ class MinerSession:
     async def run(self) -> None:
         """Main session loop - handle the miner connection lifecycle."""
         self._running = True
+        self._relay_tasks: list[asyncio.Task] = []
 
         try:
             # Connect to initial upstream server
@@ -319,11 +320,11 @@ class MinerSession:
             miner_write_task = asyncio.create_task(self._miner_write_loop())
             upstream_read_task = asyncio.create_task(self._upstream_read_loop())
 
-            tasks = [miner_read_task, miner_write_task, upstream_read_task]
+            self._relay_tasks = [miner_read_task, miner_write_task, upstream_read_task]
 
             # Wait for any task to complete (connection closed or error)
             done, pending = await asyncio.wait(
-                tasks,
+                self._relay_tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -338,6 +339,7 @@ class MinerSession:
         except Exception as e:
             logger.error(f"[{self.session_id}] Session error: {e}")
         finally:
+            self._relay_tasks = []
             await self.close()
 
     async def _connect_upstream(self, server_name: str) -> bool:
@@ -1353,6 +1355,21 @@ class MinerSession:
             self._running = False  # Must be inside lock to prevent race condition
 
         logger.info(f"[{self.session_id}] Closing session")
+
+        # Cancel relay tasks immediately to break out of any blocking operations
+        relay_tasks = getattr(self, '_relay_tasks', [])
+        for task in relay_tasks:
+            if not task.done():
+                task.cancel()
+        # Wait briefly for tasks to cancel (don't block forever)
+        if relay_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*relay_tasks, return_exceptions=True),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logger.debug(f"[{self.session_id}] Timeout waiting for tasks to cancel")
 
         # Capture references to avoid TOCTOU issues
         writer = self.writer
