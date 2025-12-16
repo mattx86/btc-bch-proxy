@@ -55,3 +55,8 @@ MAX_ERROR_MESSAGE_LENGTH = 200
 
 # Maximum length for background task exception messages (more verbose for debugging)
 MAX_BACKGROUND_ERROR_LENGTH = 500
+
+# Grace period after server switch for stale shares (seconds)
+# Shares with wrong extranonce2 length during this period are treated as stale work
+# from the previous pool, not validation errors (miner may have in-flight work)
+SERVER_SWITCH_GRACE_PERIOD = 30.0

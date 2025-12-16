@@ -32,6 +32,7 @@ from btc_bch_proxy.proxy.constants import (
     POLL_SLEEP_INTERVAL,
     QUEUE_DRAIN_TIMEOUT,
     QUEUE_DRAIN_WRITE_TIMEOUT,
+    SERVER_SWITCH_GRACE_PERIOD,
     SHARE_SUBMIT_INITIAL_RETRY_DELAY,
     SHARE_SUBMIT_MAX_RETRY_DELAY,
     SHARE_SUBMIT_MAX_TOTAL_TIME,
@@ -220,6 +221,12 @@ class MinerSession:
         # Server switching state - when True, new shares are rejected
         self._switching_servers = False
         self._switch_target_server: Optional[str] = None  # Server we're trying to switch to
+        self._last_switch_time: float = 0.0  # Timestamp of last server switch (for grace period)
+
+        # Old upstream kept alive during grace period for stale share submission
+        self._old_upstream: Optional[UpstreamConnection] = None
+        self._old_upstream_extranonce2_size: Optional[int] = None
+        self._old_upstream_server_name: Optional[str] = None
 
         # Pending requests and shares
         self._pending_shares: dict[int, asyncio.Future] = {}
@@ -487,11 +494,26 @@ class MinerSession:
                     await old_upstream.read_messages()
                     await asyncio.sleep(POLL_SLEEP_INTERVAL)
 
-            # Disconnect old upstream
-            if old_upstream:
+            # Keep old upstream alive for grace period to accept stale shares
+            # (miner may have in-flight work with old extranonce2 format)
+            if old_upstream and is_server_switch:
+                # Clean up any previous old upstream first
+                if self._old_upstream:
+                    await self._old_upstream.disconnect()
+
+                self._old_upstream = old_upstream
+                self._old_upstream_extranonce2_size = old_upstream.extranonce2_size
+                self._old_upstream_server_name = self._current_server
+                logger.info(
+                    f"[{self.session_id}] Keeping old upstream {self._current_server} alive "
+                    f"for {SERVER_SWITCH_GRACE_PERIOD}s grace period"
+                )
+            elif old_upstream:
+                # Not a server switch (reconnect), just disconnect old
                 await old_upstream.disconnect()
 
-            # Clear share cache - old jobs are no longer valid
+            # Clear share cache - old jobs are no longer valid for NEW upstream
+            # (but we can still submit old jobs to old upstream during grace period)
             self._validator.clear_share_cache()
 
             # Activate new upstream
@@ -894,6 +916,24 @@ class MinerSession:
             )
             return
 
+        # Clean up old upstream if grace period has expired
+        if (
+            self._old_upstream is not None
+            and self._last_switch_time > 0
+            and (time.time() - self._last_switch_time) >= SERVER_SWITCH_GRACE_PERIOD
+        ):
+            logger.info(
+                f"[{self.session_id}] Grace period expired, disconnecting old upstream "
+                f"({self._old_upstream_server_name})"
+            )
+            try:
+                await self._old_upstream.disconnect()
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
+            self._old_upstream = None
+            self._old_upstream_extranonce2_size = None
+            self._old_upstream_server_name = None
+
         if not self._upstream or not self._upstream.authorized:
             error = [24, "Not authorized", None]
             logger.warning(
@@ -1014,11 +1054,54 @@ class MinerSession:
         )
 
         if not valid:
-            # Reject locally - don't forward to pool
-            error = [20, reject_reason, None]
+            # Check if this is a stale share from previous pool during grace period
+            # (miner may have in-flight work with old extranonce2 size after switch)
+            can_submit_to_old_pool = (
+                "extranonce2 length" in reject_reason
+                and self._old_upstream is not None
+                and self._old_upstream.connected
+                and self._last_switch_time > 0
+                and (time.time() - self._last_switch_time) < SERVER_SWITCH_GRACE_PERIOD
+                and self._old_upstream_extranonce2_size is not None
+                and len(extranonce2) == self._old_upstream_extranonce2_size * 2
+            )
+
+            if can_submit_to_old_pool:
+                # Submit to old upstream instead of rejecting
+                logger.info(
+                    f"[{self.session_id}] Routing stale share to old pool "
+                    f"({self._old_upstream_server_name}): job={job_id}"
+                )
+                accepted, error = await self._old_upstream.submit_share(
+                    worker_name, job_id, extranonce2, ntime, nonce, version_bits
+                )
+                stats = ProxyStats.get_instance()
+                if accepted:
+                    logger.info(
+                        f"[{self.session_id}] Stale share accepted by old pool "
+                        f"({self._old_upstream_server_name}): job={job_id}"
+                    )
+                    fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
+                else:
+                    reason = _get_error_message(error)
+                    logger.info(
+                        f"[{self.session_id}] Stale share rejected by old pool "
+                        f"({self._old_upstream_server_name}): {reason}"
+                    )
+                    fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
+
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, accepted, error),
+                    priority=MessagePriority.HIGH,
+                )
+                return
+
+            # Regular rejection - can't forward to any pool
             logger.warning(f"[{self.session_id}] Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason))
+
+            error = [20, reject_reason, None]
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -1355,6 +1438,9 @@ class MinerSession:
             if self._upstream.extranonce2_size is not None:
                 self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
 
+            # Record switch time for grace period (miner may have in-flight old work)
+            self._last_switch_time = time.time()
+
             # Send set_extranonce notification to miner if supported
             notification = StratumNotification(
                 method=StratumMethods.MINING_SET_EXTRANONCE,
@@ -1381,6 +1467,7 @@ class MinerSession:
         # Capture references to avoid TOCTOU issues
         writer = self.writer
         upstream = self._upstream
+        old_upstream = self._old_upstream
 
         # Close the miner socket FIRST to break any blocking reads
         # This causes read() to return empty bytes, exiting the read loop
@@ -1405,13 +1492,20 @@ class MinerSession:
             except asyncio.TimeoutError:
                 logger.debug(f"[{self.session_id}] Timeout waiting for tasks to cancel")
 
-        # Close upstream connection
+        # Close upstream connections (both current and old if still active)
         if upstream:
             try:
                 await upstream.disconnect()
             except Exception as e:
                 logger.debug(f"[{self.session_id}] Error closing upstream: {e}")
             self._upstream = None
+
+        if old_upstream:
+            try:
+                await old_upstream.disconnect()
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Error closing old upstream: {e}")
+            self._old_upstream = None
 
         # Wait for miner connection to finish closing (we called close() earlier)
         if writer:
