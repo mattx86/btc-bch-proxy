@@ -17,6 +17,7 @@ A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routi
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
 - **Connection health**: TCP keepalives and automatic reconnection on connection failures
+- **Worker difficulty override**: Per-worker minimum difficulty settings to combat vardiff-induced duplicate shares
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
