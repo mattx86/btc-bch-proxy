@@ -514,6 +514,11 @@ class MinerSession:
             # (but we can still submit old jobs to old upstream during grace period)
             self._validator.clear_share_cache()
 
+            # Reset difficulty tracking for new server
+            # (new pool will send mining.set_difficulty which will be logged as initial)
+            self._pool_difficulty = None
+            self._miner_difficulty = None
+
             # Activate new upstream
             self._upstream = new_upstream
             self._current_server = server_name
@@ -1305,25 +1310,28 @@ class MinerSession:
                             # Track miner's effective difficulty for validation
                             self._validator.set_difficulty(miner_difficulty)
 
-                            # Log difficulty changes
+                            # Log difficulty changes (include server name for clarity)
+                            server_name = self._current_server or "unknown"
                             if self._miner_difficulty is None:
                                 if miner_difficulty != pool_difficulty:
                                     logger.info(
-                                        f"[{self.session_id}] Initial difficulty: {miner_difficulty} "
+                                        f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
                                         f"(pool: {pool_difficulty}, worker override applied)"
                                     )
                                 else:
-                                    logger.info(f"[{self.session_id}] Initial difficulty: {miner_difficulty}")
+                                    logger.info(
+                                        f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty}"
+                                    )
                             elif miner_difficulty != self._miner_difficulty:
                                 if miner_difficulty != pool_difficulty:
                                     logger.info(
-                                        f"[{self.session_id}] Difficulty changed: "
+                                        f"[{self.session_id}] Difficulty from {server_name}: "
                                         f"{self._miner_difficulty} -> {miner_difficulty} "
                                         f"(pool: {pool_difficulty}, worker override applied)"
                                     )
                                 else:
                                     logger.info(
-                                        f"[{self.session_id}] Difficulty changed: "
+                                        f"[{self.session_id}] Difficulty from {server_name}: "
                                         f"{self._miner_difficulty} -> {miner_difficulty}"
                                     )
                             self._miner_difficulty = miner_difficulty
