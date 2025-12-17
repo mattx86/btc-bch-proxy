@@ -1059,8 +1059,9 @@ class MinerSession:
 
         When a pool rejects a share as "low difficulty" but hasn't sent us a
         mining.set_difficulty update, we can infer the pool's actual requirement
-        from the rejection. For "highest-seen" mode, we update our tracked max
-        to the rejected share's difficulty + 1000 to prevent future rejections.
+        from the rejection. For "highest-seen" mode, we double the rejected
+        share's difficulty to give headroom for pools with variable per-job
+        difficulty targets (common in solo pools).
 
         Args:
             reason: The rejection reason string, e.g. "low difficulty share (19188.02)"
@@ -1086,8 +1087,10 @@ class MinerSession:
         except ValueError:
             return
 
-        # Calculate new target: rejected difficulty + 1000
-        new_target = rejected_diff + 1000
+        # Calculate new target: double the rejected difficulty
+        # This gives more headroom for pools with variable per-job difficulty targets
+        # (e.g., solo pools that don't send mining.set_difficulty updates)
+        new_target = rejected_diff * 2
 
         # Only update if this is higher than our current max
         if self._max_pool_difficulty is not None and new_target <= self._max_pool_difficulty:
@@ -1098,7 +1101,7 @@ class MinerSession:
 
         logger.info(
             f"[{self.session_id}] Auto-adjusting difficulty for highest-seen mode: "
-            f"{old_max} -> {new_target} (rejected share was {rejected_diff})"
+            f"{old_max} -> {new_target} (2x rejected share difficulty {rejected_diff})"
         )
 
         # Send new difficulty to miner
