@@ -1595,6 +1595,19 @@ class MinerSession:
             )
             await self._send_to_miner(StratumProtocol.encode_message(notification))
 
+            # Forward any notifications received during upstream handshake
+            # This includes difficulty and job notifications that were queued
+            # These will be processed through _handle_upstream_message which:
+            # 1. Sends difficulty (with override) when received
+            # 2. Sends queued jobs after difficulty is received
+            pending = await self._upstream.get_pending_notifications()
+            if pending:
+                logger.info(
+                    f"[{self.session_id}] Processing {len(pending)} notifications from new pool"
+                )
+                for pending_notification in pending:
+                    await self._handle_upstream_message(pending_notification)
+
             logger.info(
                 f"[{self.session_id}] Server switch complete, "
                 f"new extranonce1={self._upstream.extranonce1}, "
