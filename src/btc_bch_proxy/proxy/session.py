@@ -966,12 +966,12 @@ class MinerSession:
         override_note = ", worker override applied" if miner_difficulty != pool_difficulty else ""
         if self._miner_difficulty is None:
             logger.info(
-                f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
+                f"[{self.session_id}] Difficulty for {server_name}: {miner_difficulty} "
                 f"(pool: {pool_difficulty}{override_note})"
             )
         else:
             logger.info(
-                f"[{self.session_id}] Difficulty from {server_name}: "
+                f"[{self.session_id}] Difficulty for {server_name}: "
                 f"{self._miner_difficulty} -> {miner_difficulty} "
                 f"(pool: {pool_difficulty}{override_note})"
             )
