@@ -895,6 +895,77 @@ class MinerSession:
         )
         self._authorized = True
 
+        # Send buffered difficulty (initial difficulty is buffered until we know worker_name)
+        await self._apply_worker_difficulty_override()
+
+    async def _apply_worker_difficulty_override(self) -> None:
+        """
+        Send buffered difficulty to miner after authorization.
+
+        The initial mining.set_difficulty from the pool arrives before the miner
+        authorizes, so it's buffered. After authorization, we send the difficulty
+        (with worker override if applicable).
+        """
+        if self._pool_difficulty is None:
+            return
+
+        await self._send_difficulty_to_miner(self._pool_difficulty)
+
+    async def _send_difficulty_to_miner(self, pool_difficulty: float) -> None:
+        """
+        Send difficulty to miner, applying worker override if configured.
+
+        Args:
+            pool_difficulty: The difficulty set by the pool.
+        """
+        # Check for worker difficulty override
+        miner_difficulty = pool_difficulty
+        if self.worker_name:
+            worker_diff = self.config.get_worker_difficulty(self.worker_name)
+            if worker_diff is not None and worker_diff > pool_difficulty:
+                miner_difficulty = float(worker_diff)
+
+        # Don't send if difficulty hasn't changed
+        if self._miner_difficulty is not None and miner_difficulty == self._miner_difficulty:
+            return
+
+        # Send difficulty to miner
+        diff_msg = StratumNotification(
+            method=StratumMethods.MINING_SET_DIFFICULTY,
+            params=[miner_difficulty]
+        )
+        data = StratumProtocol.encode_message(diff_msg)
+        await self._send_to_miner(data)
+
+        # Track miner's effective difficulty for validation
+        self._validator.set_difficulty(miner_difficulty)
+
+        # Log difficulty (include server name for clarity)
+        server_name = self._current_server or "unknown"
+        if self._miner_difficulty is None:
+            if miner_difficulty != pool_difficulty:
+                logger.info(
+                    f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
+                    f"(pool: {pool_difficulty}, worker override applied)"
+                )
+            else:
+                logger.info(
+                    f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty}"
+                )
+        else:
+            if miner_difficulty != pool_difficulty:
+                logger.info(
+                    f"[{self.session_id}] Difficulty from {server_name}: "
+                    f"{self._miner_difficulty} -> {miner_difficulty} "
+                    f"(pool: {pool_difficulty}, worker override applied)"
+                )
+            else:
+                logger.info(
+                    f"[{self.session_id}] Difficulty from {server_name}: "
+                    f"{self._miner_difficulty} -> {miner_difficulty}"
+                )
+        self._miner_difficulty = miner_difficulty
+
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
         # Reject shares if session is closing
@@ -1288,53 +1359,17 @@ class MinerSession:
                             pool_difficulty = float(msg.params[0])
                             self._pool_difficulty = pool_difficulty
 
-                            # Check for worker difficulty override
-                            miner_difficulty = pool_difficulty
-                            if self.worker_name:
-                                worker_diff = self.config.get_worker_difficulty(self.worker_name)
-                                if worker_diff is not None and worker_diff > pool_difficulty:
-                                    miner_difficulty = float(worker_diff)
-
-                            # Send difficulty to miner (possibly overridden)
-                            if miner_difficulty != pool_difficulty:
-                                # Create modified message with override difficulty
-                                modified_msg = StratumNotification(
-                                    method=msg.method,
-                                    params=[miner_difficulty]
+                            # If miner hasn't authorized yet, just buffer the pool difficulty
+                            # It will be sent (with override if applicable) after authorization
+                            if not self.worker_name:
+                                logger.debug(
+                                    f"[{self.session_id}] Buffering pool difficulty {pool_difficulty} "
+                                    f"until miner authorizes"
                                 )
-                                data = StratumProtocol.encode_message(modified_msg)
-                            else:
-                                data = StratumProtocol.encode_message(msg)
-                            await self._send_to_miner(data)
+                                continue
 
-                            # Track miner's effective difficulty for validation
-                            self._validator.set_difficulty(miner_difficulty)
-
-                            # Log difficulty changes (include server name for clarity)
-                            server_name = self._current_server or "unknown"
-                            if self._miner_difficulty is None:
-                                if miner_difficulty != pool_difficulty:
-                                    logger.info(
-                                        f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
-                                        f"(pool: {pool_difficulty}, worker override applied)"
-                                    )
-                                else:
-                                    logger.info(
-                                        f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty}"
-                                    )
-                            elif miner_difficulty != self._miner_difficulty:
-                                if miner_difficulty != pool_difficulty:
-                                    logger.info(
-                                        f"[{self.session_id}] Difficulty from {server_name}: "
-                                        f"{self._miner_difficulty} -> {miner_difficulty} "
-                                        f"(pool: {pool_difficulty}, worker override applied)"
-                                    )
-                                else:
-                                    logger.info(
-                                        f"[{self.session_id}] Difficulty from {server_name}: "
-                                        f"{self._miner_difficulty} -> {miner_difficulty}"
-                                    )
-                            self._miner_difficulty = miner_difficulty
+                            # Miner is authorized - apply override and send
+                            await self._send_difficulty_to_miner(pool_difficulty)
                         except (ValueError, TypeError):
                             logger.warning(f"[{self.session_id}] Invalid difficulty value: {msg.params}")
                 else:
