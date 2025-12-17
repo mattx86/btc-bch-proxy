@@ -256,11 +256,11 @@ validation:
 
 ### Worker Settings (Optional)
 
-Configure per-worker difficulty overrides. Workers are identified by their authorization username.
+Configure per-worker difficulty overrides. Workers are identified by the username the miner uses when connecting to the proxy (via `mining.authorize`).
 
 ```yaml
 workers:
-  - username: "wallet.worker1"
+  - username: "miner1"           # Username the miner uses to connect to the proxy
     difficulty: 50000000         # Preferred difficulty for this worker
 ```
 

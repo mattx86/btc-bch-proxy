@@ -66,8 +66,8 @@ validation:
   job_cache_size: 10              # Max jobs to track per session
 
 # Per-worker settings (optional)
-# Workers are identified by the username they use to authorize with the proxy.
+# Workers are identified by the username the miner uses to connect to the proxy.
 # Difficulty override is only applied if it is > the pool's difficulty.
 # workers:
-#   - username: "wallet.worker1"
+#   - username: "miner1"          # Username the miner uses to connect
 #     difficulty: 50000000         # Preferred difficulty for this worker
