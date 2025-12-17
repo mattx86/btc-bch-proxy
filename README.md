@@ -260,6 +260,8 @@ validation:
 
 Configure per-worker difficulty overrides. Workers are identified by the username the miner uses when connecting to the proxy (via `mining.authorize`).
 
+This feature was implemented to combat pools' variable difficulty (vardiff) causing duplicate share rejections. When vardiff sets difficulty too low for fast miners, the miner may exhaust nonce space or submit shares faster than new jobs arrive, resulting in duplicates. By forcing a higher minimum difficulty, share submission rate is reduced and duplicates are minimized.
+
 ```yaml
 workers:
   - username: "miner1"           # Username the miner uses to connect to the proxy
@@ -271,7 +273,9 @@ workers:
 - If the configured difficulty is lower than or equal to the pool's, the pool's difficulty is used
 - This prevents rejected shares due to low difficulty
 
-**Use case:** Force higher difficulty for powerful miners to reduce share submission frequency without changing pool settings.
+**Note:** Forcing a higher difficulty will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.
+
+**Use case:** Force higher difficulty for powerful miners to reduce share submission frequency and duplicate share rejections without changing pool settings.
 
 ## Statistics
 

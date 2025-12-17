@@ -325,6 +325,8 @@ validation:
 # Per-worker settings (optional)
 # Workers are identified by the username the miner uses to connect to the proxy.
 # Difficulty override is only applied if it is > the pool's difficulty.
+# NOTE: Forcing higher difficulty will cause the pool to report lower worker hashrate
+#       (pool calculates hashrate using its difficulty, not the override).
 # workers:
 #   - username: "miner1"          # Username the miner uses to connect
 #     difficulty: 50000000         # Preferred difficulty for this worker
