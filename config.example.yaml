@@ -67,9 +67,16 @@ validation:
 
 # Per-worker settings (optional)
 # Workers are identified by the username the miner uses to connect to the proxy.
-# Difficulty override is only applied if it is > the pool's difficulty.
+# Difficulty modes:
+#   - number: Fixed minimum difficulty (only applied if > pool difficulty)
+#   - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
+#   - "off": No override, use pool difficulty as-is
 # NOTE: Forcing higher difficulty will cause the pool to report lower worker hashrate
 #       (pool calculates hashrate using its difficulty, not the override).
 # workers:
 #   - username: "miner1"          # Username the miner uses to connect
-#     difficulty: 50000000         # Preferred difficulty for this worker
+#     difficulty: 50000000         # Fixed minimum difficulty
+#   - username: "miner2"
+#     difficulty: "highest-seen"  # Lock to highest pool difficulty seen
+#   - username: "miner3"
+#     difficulty: "off"           # No override

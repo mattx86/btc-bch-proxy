@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import time
-from typing import ClassVar, List, Optional
+from typing import ClassVar, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -263,8 +263,12 @@ class WorkerConfig(BaseModel):
     """Configuration for per-worker settings."""
 
     username: str = Field(..., description="Worker username to match")
-    difficulty: int = Field(
-        ..., ge=1, description="Preferred difficulty (only applied if > pool difficulty)"
+    # Difficulty can be:
+    # - int: Fixed minimum difficulty (only applied if > pool difficulty)
+    # - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
+    # - "off": No override, use pool difficulty as-is
+    difficulty: Union[int, Literal["highest-seen", "off"]] = Field(
+        ..., description="Difficulty override mode: number, 'highest-seen', or 'off'"
     )
 
     @field_validator("username")
@@ -274,6 +278,25 @@ class WorkerConfig(BaseModel):
         if not v or not v.strip():
             raise ValueError("Worker username cannot be empty")
         return v.strip()
+
+    @field_validator("difficulty")
+    @classmethod
+    def validate_difficulty(cls, v: Union[int, str]) -> Union[int, str]:
+        """Validate difficulty value."""
+        if isinstance(v, int):
+            if v < 1:
+                raise ValueError("Difficulty must be >= 1")
+            return v
+        if isinstance(v, str):
+            v_lower = v.lower().strip()
+            if v_lower not in ("highest-seen", "off"):
+                raise ValueError(
+                    f"Invalid difficulty mode '{v}'. Must be a number, 'highest-seen', or 'off'"
+                )
+            return v_lower
+        raise ValueError(
+            f"Invalid difficulty type: {type(v).__name__}. Must be int or string"
+        )
 
 
 class Config(BaseModel):
@@ -409,8 +432,16 @@ class Config(BaseModel):
         """Get list of all server names."""
         return [s.name for s in self.servers]
 
-    def get_worker_difficulty(self, username: str) -> Optional[int]:
-        """Get configured difficulty for a worker, if defined."""
+    def get_worker_difficulty(self, username: str) -> Optional[Union[int, str]]:
+        """
+        Get configured difficulty for a worker, if defined.
+
+        Returns:
+            - int: Fixed minimum difficulty
+            - "highest-seen": Use highest pool difficulty seen
+            - "off": No override
+            - None: No config for this worker
+        """
         for worker in self.workers:
             if worker.username == username:
                 return worker.difficulty

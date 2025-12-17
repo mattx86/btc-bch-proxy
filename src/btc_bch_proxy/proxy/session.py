@@ -242,6 +242,7 @@ class MinerSession:
         # Difficulty tracking
         self._pool_difficulty: Optional[float] = None  # Difficulty set by the pool
         self._miner_difficulty: Optional[float] = None  # Difficulty sent to miner (may be overridden)
+        self._max_pool_difficulty: Optional[float] = None  # Highest pool difficulty seen (for top-dynamic mode)
 
         # Queued notifications before authorization OR after pool switch (jobs and difficulty)
         # We buffer these until we know the worker's username so we can apply difficulty override,
@@ -527,6 +528,7 @@ class MinerSession:
             # (new pool will send mining.set_difficulty which will be logged as initial)
             self._pool_difficulty = None
             self._miner_difficulty = None
+            self._max_pool_difficulty = None  # Reset highest-seen tracking for new pool
 
             # Set flag to queue jobs until we receive first difficulty from new pool
             # This ensures difficulty override is applied before any jobs are sent
@@ -974,13 +976,34 @@ class MinerSession:
 
         Args:
             pool_difficulty: The difficulty set by the pool.
+
+        Override modes:
+            - int: Fixed minimum difficulty (only applied if > pool difficulty)
+            - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
+            - "off": No override, use pool difficulty as-is
+            - None: No config for this worker, use pool difficulty as-is
         """
+        # Update max pool difficulty seen (for highest-seen mode)
+        if self._max_pool_difficulty is None or pool_difficulty > self._max_pool_difficulty:
+            self._max_pool_difficulty = pool_difficulty
+
         # Check for worker difficulty override
         miner_difficulty = pool_difficulty
+        override_mode = ""
         if self.worker_name:
             worker_diff = self.config.get_worker_difficulty(self.worker_name)
-            if worker_diff is not None and worker_diff > pool_difficulty:
+            if worker_diff == "off":
+                # No override - use pool difficulty as-is
+                override_mode = ""
+            elif worker_diff == "highest-seen":
+                # Use highest pool difficulty seen (prevents vardiff from lowering)
+                miner_difficulty = self._max_pool_difficulty
+                if miner_difficulty > pool_difficulty:
+                    override_mode = "highest-seen"
+            elif isinstance(worker_diff, int) and worker_diff > pool_difficulty:
+                # Fixed minimum difficulty
                 miner_difficulty = float(worker_diff)
+                override_mode = "fixed"
 
         # Don't send if difficulty hasn't changed
         if self._miner_difficulty is not None and miner_difficulty == self._miner_difficulty:
@@ -999,7 +1022,7 @@ class MinerSession:
 
         # Log difficulty (always show pool difficulty for clarity)
         server_name = self._current_server or "unknown"
-        override_note = ", worker override applied" if miner_difficulty != pool_difficulty else ""
+        override_note = f", override: {override_mode}" if override_mode else ""
         if self._miner_difficulty is None:
             logger.info(
                 f"[{self.session_id}] Difficulty for {server_name}: {miner_difficulty} "

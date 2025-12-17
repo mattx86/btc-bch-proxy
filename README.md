@@ -267,20 +267,32 @@ This feature was implemented to combat pools' variable difficulty (vardiff) caus
 
 ```yaml
 workers:
-  - username: "miner1"           # Username the miner uses to connect to the proxy
-    difficulty: 50000000         # Preferred difficulty for this worker
+  - username: "miner1"
+    difficulty: 50000000         # Fixed minimum difficulty
+  - username: "miner2"
+    difficulty: "highest-seen"   # Lock to highest pool difficulty seen
+  - username: "miner3"
+    difficulty: "off"            # No override, use pool difficulty as-is
 ```
 
-**Behavior:**
-- The configured difficulty is only applied if it is **> the pool's difficulty**
-- If the configured difficulty is lower than or equal to the pool's, the pool's difficulty is used
-- This prevents rejected shares due to low difficulty
+**Difficulty Modes:**
 
-**Note:** Forcing a higher difficulty will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.
+| Mode | Description |
+|------|-------------|
+| Number (e.g., `50000000`) | Fixed minimum difficulty. Only applied if greater than pool's difficulty. |
+| `"highest-seen"` | Tracks the highest difficulty the pool has set and uses that. Prevents vardiff from lowering difficulty. |
+| `"off"` | No override. Uses pool's difficulty as-is. |
+
+**Behavior:**
+- **Fixed number**: Only applied if the configured value is **> the pool's difficulty**. If lower, the pool's difficulty is used.
+- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch.
+- **off**: Passes through pool difficulty unchanged.
+
+**Note:** Forcing a higher difficulty (via fixed number or highest-seen) will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.
 
 **Use case:** Force higher difficulty for powerful miners to reduce share submission frequency and duplicate share rejections without changing pool settings.
 
-**Suggestion:** Set the difficulty override to at least the pool's initial/minimum difficulty + 1000. For example, if the pool starts workers at difficulty 10000, set the override to 11000 or higher. Adjust based on observed duplicate rejection rates.
+**Suggestion:** For fixed difficulty, set the override to at least the pool's initial/minimum difficulty + 1000. For example, if the pool starts workers at difficulty 10000, set the override to 11000 or higher. Adjust based on observed duplicate rejection rates.
 
 ## Statistics
 
