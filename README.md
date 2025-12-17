@@ -277,6 +277,8 @@ workers:
 
 **Use case:** Force higher difficulty for powerful miners to reduce share submission frequency and duplicate share rejections without changing pool settings.
 
+**Suggestion:** Set the difficulty override to at least the pool's initial/minimum difficulty + 1000. For example, if the pool starts workers at difficulty 10000, set the override to 11000 or higher. Adjust based on observed duplicate rejection rates.
+
 ## Statistics
 
 The proxy logs detailed statistics every 15 minutes (at :00, :15, :30, :45). Example output:
