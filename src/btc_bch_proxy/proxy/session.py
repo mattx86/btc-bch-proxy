@@ -940,30 +940,20 @@ class MinerSession:
         # Track miner's effective difficulty for validation
         self._validator.set_difficulty(miner_difficulty)
 
-        # Log difficulty (include server name for clarity)
+        # Log difficulty (always show pool difficulty for clarity)
         server_name = self._current_server or "unknown"
+        override_note = ", worker override applied" if miner_difficulty != pool_difficulty else ""
         if self._miner_difficulty is None:
-            if miner_difficulty != pool_difficulty:
-                logger.info(
-                    f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
-                    f"(pool: {pool_difficulty}, worker override applied)"
-                )
-            else:
-                logger.info(
-                    f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty}"
-                )
+            logger.info(
+                f"[{self.session_id}] Difficulty from {server_name}: {miner_difficulty} "
+                f"(pool: {pool_difficulty}{override_note})"
+            )
         else:
-            if miner_difficulty != pool_difficulty:
-                logger.info(
-                    f"[{self.session_id}] Difficulty from {server_name}: "
-                    f"{self._miner_difficulty} -> {miner_difficulty} "
-                    f"(pool: {pool_difficulty}, worker override applied)"
-                )
-            else:
-                logger.info(
-                    f"[{self.session_id}] Difficulty from {server_name}: "
-                    f"{self._miner_difficulty} -> {miner_difficulty}"
-                )
+            logger.info(
+                f"[{self.session_id}] Difficulty from {server_name}: "
+                f"{self._miner_difficulty} -> {miner_difficulty} "
+                f"(pool: {pool_difficulty}{override_note})"
+            )
         self._miner_difficulty = miner_difficulty
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
