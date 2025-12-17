@@ -24,7 +24,6 @@ servers:
     ssl: false
     timeout: 30
     retry_interval: 5
-    max_retries: 240              # 20 minutes at 5 second intervals
 
   - name: "stratum2"
     host: "pool2.example.com"
@@ -34,7 +33,6 @@ servers:
     ssl: false
     timeout: 30
     retry_interval: 5
-    max_retries: 240
 
 schedule:
   # stratum1 for morning/night hours (00:00 to 11:59)

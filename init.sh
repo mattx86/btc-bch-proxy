@@ -34,6 +34,15 @@ fi
 echo "Activating virtual environment..."
 source venv/bin/activate
 
+# Upgrade pip
+echo "Upgrading pip..."
+pip install --upgrade pip > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "WARNING: Failed to upgrade pip, continuing with existing version..."
+else
+    echo "Pip upgraded successfully."
+fi
+
 # Install dependencies
 echo "Installing dependencies..."
 pip install -e . > /dev/null 2>&1
@@ -48,7 +57,7 @@ if [ -f "config.yaml" ]; then
     echo "config.yaml already exists, skipping..."
 else
     echo "Creating config.yaml..."
-    btc-bch-proxy init --no-venv
+    btc-bch-proxy init
 fi
 
 # Deactivate virtual environment

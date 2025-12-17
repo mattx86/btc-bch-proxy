@@ -406,15 +406,17 @@ class MinerSession:
                 f"(old server stays active during connection attempts)"
             )
 
-        # Retry connecting to new server for up to max_retries
+        # Retry connecting to new server for up to retry_timeout_minutes
         # Old server stays connected and handles shares during this time
-        max_retries = server_config.max_retries
         retry_interval = server_config.retry_interval
-        retry_timeout = max_retries * retry_interval  # ~20 minutes
+        retry_timeout = self.config.failover.retry_timeout_minutes * 60
         start_time = time.time()
         new_upstream = None
+        attempt = 0
 
-        for attempt in range(1, max_retries + 1):
+        while True:
+            attempt += 1
+
             # Check if session is closing
             if self._closing:
                 logger.info(f"[{self.session_id}] Switch cancelled - session closing")
@@ -462,13 +464,6 @@ class MinerSession:
 
             # Wait before next retry
             await asyncio.sleep(retry_interval)
-        else:
-            # Exhausted all retries without breaking (no successful connection)
-            logger.error(
-                f"[{self.session_id}] Failed to connect to {server_name} after "
-                f"{max_retries} attempts - keeping old server"
-            )
-            return False
 
         # NEW SERVER IS READY - now do the brief switchover
         # Enter switching state - new shares will be rejected during drain

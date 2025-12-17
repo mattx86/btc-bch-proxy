@@ -19,8 +19,6 @@ class StratumServerConfig(BaseModel):
     ssl: bool = Field(default=False, description="Use SSL/TLS connection")
     timeout: int = Field(default=30, ge=1, description="Connection timeout in seconds")
     retry_interval: int = Field(default=5, ge=1, description="Seconds between reconnection attempts")
-    # 240 retries * 5 second interval = 20 minute retry window before failover
-    max_retries: int = Field(default=240, ge=1, description="Maximum reconnection attempts")
 
     @field_validator("name")
     @classmethod

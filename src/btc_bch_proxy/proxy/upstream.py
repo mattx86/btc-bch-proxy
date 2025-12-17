@@ -877,11 +877,6 @@ class UpstreamConnection:
                 await self.disconnect()
                 return []
 
-    def can_retry(self) -> bool:
-        """Check if we can retry connecting."""
-        return self._retry_count < self.config.max_retries
-
-
 class UpstreamManager:
     """
     Manages connections to multiple upstream stratum servers.

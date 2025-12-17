@@ -231,95 +231,10 @@ def validate(config_path: Path):
 
 
 @main.command()
-@click.option(
-    "--no-venv",
-    is_flag=True,
-    help="Skip virtual environment creation",
-)
-@click.option(
-    "--venv-path",
-    type=click.Path(path_type=Path),
-    default="venv",
-    help="Path for virtual environment (default: ./venv)",
-)
-def init(no_venv: bool, venv_path: Path):
-    """Initialize project: create config and virtual environment."""
+def init():
+    """Create a sample configuration file."""
     import shutil
-    import subprocess
 
-    # Step 1: Create virtual environment
-    if not no_venv:
-        venv_path = Path(venv_path)
-        if venv_path.exists():
-            click.echo(f"Virtual environment already exists at {venv_path}")
-        else:
-            click.echo(f"Creating virtual environment at {venv_path}...")
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "venv", str(venv_path)],
-                    check=True,
-                    capture_output=True,
-                )
-                click.echo(f"Created virtual environment: {venv_path}")
-            except subprocess.CalledProcessError as e:
-                click.echo(f"Failed to create virtual environment: {e}", err=True)
-                sys.exit(1)
-
-        # Step 2: Upgrade pip and install dependencies
-        if sys.platform == "win32":
-            pip_path = venv_path / "Scripts" / "pip.exe"
-        else:
-            pip_path = venv_path / "bin" / "pip"
-
-        if pip_path.exists():
-            # Upgrade pip first
-            click.echo("Upgrading pip...")
-            try:
-                subprocess.run(
-                    [str(pip_path), "install", "--upgrade", "pip"],
-                    check=True,
-                    capture_output=True,
-                )
-                click.echo("Pip upgraded successfully")
-            except subprocess.CalledProcessError as e:
-                # Non-fatal - continue with existing pip version
-                click.echo(f"Warning: Failed to upgrade pip: {e}", err=True)
-
-            click.echo("Installing dependencies...")
-            try:
-                # Check if we're in the package directory (has pyproject.toml)
-                if Path("pyproject.toml").exists():
-                    subprocess.run(
-                        [str(pip_path), "install", "-e", "."],
-                        check=True,
-                        capture_output=True,
-                    )
-                    click.echo("Installed package in development mode")
-                else:
-                    # Install just the dependencies
-                    subprocess.run(
-                        [str(pip_path), "install", "pydantic", "pyyaml", "loguru", "click"],
-                        check=True,
-                        capture_output=True,
-                    )
-                    click.echo("Installed dependencies")
-            except subprocess.CalledProcessError as e:
-                error_detail = e.stderr.decode() if e.stderr else str(e)
-                click.echo(
-                    f"ERROR: Failed to install dependencies: {error_detail}\n"
-                    f"You may need to manually install: pip install pydantic pyyaml loguru click",
-                    err=True
-                )
-
-        # Show activation instructions
-        click.echo("")
-        if sys.platform == "win32":
-            click.echo(f"To activate: {venv_path}\\Scripts\\activate")
-        else:
-            click.echo(f"To activate: source {venv_path}/bin/activate")
-        click.echo("")
-
-    # Step 3: Create config file
     try:
         package_dir = Path(__file__).parent.parent.parent
         example_config = package_dir / "config.example.yaml"
@@ -343,67 +258,69 @@ def create_sample_config():
     config_content = """# Bitcoin/Bitcoin Cash Stratum Proxy Configuration
 
 proxy:
-  bind_host: "0.0.0.0"
-  bind_port: 3333
-  max_connections: 100
-  connection_timeout: 60
-  miner_read_timeout: 600
-  send_timeout: 30
-  pending_shares_timeout: 10
-  tcp_keepalive: true
-  keepalive_idle: 60
-  keepalive_interval: 10
-  keepalive_count: 3
-  share_submit_retries: 3
-  upstream_health_timeout: 300
+  bind_host: "0.0.0.0"           # Listen on all interfaces
+  bind_port: 3333                 # Port for miners to connect
+  max_connections: 100            # Maximum concurrent miner connections
+  connection_timeout: 60          # Miner connection timeout (seconds)
+  miner_read_timeout: 600         # Miner read timeout in seconds (10 minutes)
+  send_timeout: 30                # Send to miner timeout (seconds)
+  pending_shares_timeout: 10      # Timeout waiting for pending shares (seconds)
+  tcp_keepalive: true             # Enable TCP keepalive on connections
+  keepalive_idle: 60              # Seconds before sending keepalive probes
+  keepalive_interval: 10          # Seconds between keepalive probes
+  keepalive_count: 3              # Failed probes before connection is dead
+  share_submit_retries: 3         # Retries for failed share submissions
+  upstream_health_timeout: 300    # Seconds without upstream messages before reconnecting
 
 servers:
   - name: "stratum1"
     host: "pool1.example.com"
     port: 3333
-    username: "your_wallet.worker1"
+    username: "wallet_address.worker1"
     password: "x"
     ssl: false
     timeout: 30
     retry_interval: 5
-    max_retries: 240
 
   - name: "stratum2"
     host: "pool2.example.com"
     port: 3333
-    username: "your_wallet.worker2"
+    username: "wallet_address.worker2"
     password: "x"
     ssl: false
     timeout: 30
     retry_interval: 5
-    max_retries: 240
 
 schedule:
+  # stratum1 for morning/night hours (00:00 to 11:59)
   - start: "00:00"
     end: "12:00"
     server: "stratum1"
 
+  # stratum2 for afternoon/evening hours (12:00 to 23:59)
   - start: "12:00"
     end: "24:00"
     server: "stratum2"
 
 logging:
-  level: "INFO"
-  file: null
-  rotation: "50 MB"
-  retention: 10
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  file: null                      # Log file path (null for console only)
+  rotation: "50 MB"               # Log rotation size
+  retention: 10                   # Keep N rotated files
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
 
+# Failover settings
 failover:
-  retry_timeout_minutes: 20
+  retry_timeout_minutes: 20       # Retry primary server for this long before failover
 
+# Share validation settings
 validation:
-  reject_duplicates: true
-  reject_stale: true
-  validate_difficulty: false
-  share_cache_size: 1000
-  share_cache_ttl: 300
-  job_cache_size: 10
+  reject_duplicates: true         # Reject duplicate share submissions
+  reject_stale: true              # Reject shares for stale/unknown jobs
+  validate_difficulty: false      # Validate share hash meets difficulty (CPU intensive)
+  share_cache_size: 1000          # Max recent shares to track per session
+  share_cache_ttl: 300            # Share cache TTL in seconds
+  job_cache_size: 10              # Max jobs to track per session
 """
 
     dest_path = Path("config.yaml")

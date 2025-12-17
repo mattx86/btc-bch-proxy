@@ -30,6 +30,15 @@ REM Activate virtual environment
 echo Activating virtual environment...
 call venv\Scripts\activate.bat
 
+REM Upgrade pip
+echo Upgrading pip...
+pip install --upgrade pip >nul 2>&1
+if errorlevel 1 (
+    echo WARNING: Failed to upgrade pip, continuing with existing version...
+) else (
+    echo Pip upgraded successfully.
+)
+
 REM Install dependencies
 echo Installing dependencies...
 pip install -e . >nul 2>&1
@@ -44,7 +53,7 @@ if exist config.yaml (
     echo config.yaml already exists, skipping...
 ) else (
     echo Creating config.yaml...
-    btc-bch-proxy init --no-venv
+    btc-bch-proxy init
 )
 
 REM Deactivate virtual environment

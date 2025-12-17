@@ -42,22 +42,6 @@ start.bat
 
 This creates a virtual environment, upgrades pip, installs dependencies, and generates `config.yaml`.
 
-### Manual Installation
-
-```bash
-git clone https://github.com/mattx86/btc-bch-proxy.git
-cd btc-bch-proxy
-
-# Create venv and install
-python -m venv venv
-venv\Scripts\activate     # Windows
-source venv/bin/activate  # Linux
-
-pip install --upgrade pip
-pip install -e .
-btc-bch-proxy init --no-venv
-```
-
 ### Dependencies
 
 - Python 3.10+
@@ -152,21 +136,11 @@ btc-bch-proxy init --no-venv
 
 | Command | Description |
 |---------|-------------|
-| `btc-bch-proxy init` | Initialize project (venv + config) |
+| `btc-bch-proxy init` | Create sample configuration file |
 | `btc-bch-proxy start` | Start the proxy |
 | `btc-bch-proxy stop` | Stop the running proxy |
 | `btc-bch-proxy status` | Check if proxy is running |
 | `btc-bch-proxy validate <config>` | Validate a configuration file |
-
-### Init Options
-
-```bash
-btc-bch-proxy init [OPTIONS]
-
-Options:
-  --no-venv              Skip virtual environment creation
-  --venv-path PATH       Path for virtual environment (default: ./venv)
-```
 
 ### Start Options
 
@@ -226,7 +200,6 @@ servers:
     ssl: false              # Use SSL/TLS connection
     timeout: 30             # Connection timeout (seconds)
     retry_interval: 5       # Seconds between reconnection attempts
-    max_retries: 240        # Max reconnection attempts (240 * 5s = 20 min)
 ```
 
 ### Schedule Settings
