@@ -285,7 +285,7 @@ workers:
 
 **Behavior:**
 - **Fixed number**: Only applied if the configured value is **> the pool's difficulty**. If lower, the pool's difficulty is used.
-- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch.
+- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch. **Auto-adjusts:** If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically increases difficulty to `rejected_share_difficulty + 1000`.
 - **off**: Passes through pool difficulty unchanged.
 
 **Note:** Forcing a higher difficulty (via fixed number or highest-seen) will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.

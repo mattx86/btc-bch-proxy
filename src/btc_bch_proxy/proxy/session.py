@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -1052,6 +1053,66 @@ class MinerSession:
             )
         self._miner_difficulty = miner_difficulty
 
+    async def _handle_low_difficulty_rejection(self, reason: str) -> None:
+        """
+        Handle a "low difficulty share" rejection by auto-adjusting difficulty.
+
+        When a pool rejects a share as "low difficulty" but hasn't sent us a
+        mining.set_difficulty update, we can infer the pool's actual requirement
+        from the rejection. For "highest-seen" mode, we update our tracked max
+        to the rejected share's difficulty + 1000 to prevent future rejections.
+
+        Args:
+            reason: The rejection reason string, e.g. "low difficulty share (19188.02)"
+        """
+        # Only process "low difficulty" rejections
+        if "low difficulty" not in reason.lower():
+            return
+
+        # Only applies to "highest-seen" mode
+        if not self.worker_name:
+            return
+        worker_diff = self.config.get_worker_difficulty(self.worker_name)
+        if worker_diff != "highest-seen":
+            return
+
+        # Extract difficulty from rejection message: "low difficulty share (19188.02)"
+        match = re.search(r"\((\d+(?:\.\d+)?)\)", reason)
+        if not match:
+            return
+
+        try:
+            rejected_diff = float(match.group(1))
+        except ValueError:
+            return
+
+        # Calculate new target: rejected difficulty + 1000
+        new_target = rejected_diff + 1000
+
+        # Only update if this is higher than our current max
+        if self._max_pool_difficulty is not None and new_target <= self._max_pool_difficulty:
+            return
+
+        old_max = self._max_pool_difficulty
+        self._max_pool_difficulty = new_target
+
+        logger.info(
+            f"[{self.session_id}] Auto-adjusting difficulty for highest-seen mode: "
+            f"{old_max} -> {new_target} (rejected share was {rejected_diff})"
+        )
+
+        # Send new difficulty to miner
+        diff_msg = StratumNotification(
+            method=StratumMethods.MINING_SET_DIFFICULTY,
+            params=[new_target]
+        )
+        data = StratumProtocol.encode_message(diff_msg)
+        await self._send_to_miner(data)
+
+        # Update tracking
+        self._validator.set_difficulty(new_target)
+        self._miner_difficulty = new_target
+
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
         # Reject shares if session is closing
@@ -1383,6 +1444,10 @@ class MinerSession:
             reason = _get_error_message(error)
             logger.warning(f"[{self.session_id}] Share rejected: {reason}")
             fire_and_forget(stats.record_share_rejected(self._current_server, reason))
+
+            # Auto-adjust difficulty for "highest-seen" mode when pool rejects as low difficulty
+            # This handles pools that silently increase difficulty without sending mining.set_difficulty
+            await self._handle_low_difficulty_rejection(reason)
 
             # If pool says "duplicate", cache it locally to prevent re-submission.
             # This is CORRECT behavior because:
