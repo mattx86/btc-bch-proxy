@@ -243,9 +243,14 @@ class MinerSession:
         self._pool_difficulty: Optional[float] = None  # Difficulty set by the pool
         self._miner_difficulty: Optional[float] = None  # Difficulty sent to miner (may be overridden)
 
-        # Queued notifications before authorization (jobs and difficulty)
-        # We buffer these until we know the worker's username so we can apply difficulty override
+        # Queued notifications before authorization OR after pool switch (jobs and difficulty)
+        # We buffer these until we know the worker's username so we can apply difficulty override,
+        # OR until we receive the first difficulty from a new pool after switching
         self._pending_notifications: list[StratumNotification] = []
+
+        # Flag set after pool switch to queue jobs until first difficulty is received
+        # This ensures difficulty override is applied before miner receives any new jobs
+        self._awaiting_switch_difficulty: bool = False
 
         # Client address (defensive check for malformed peername tuple)
         peername = writer.get_extra_info("peername")
@@ -522,6 +527,14 @@ class MinerSession:
             # (new pool will send mining.set_difficulty which will be logged as initial)
             self._pool_difficulty = None
             self._miner_difficulty = None
+
+            # Set flag to queue jobs until we receive first difficulty from new pool
+            # This ensures difficulty override is applied before any jobs are sent
+            if is_server_switch and self.worker_name:
+                self._awaiting_switch_difficulty = True
+                logger.debug(
+                    f"[{self.session_id}] Waiting for difficulty from new pool before sending jobs"
+                )
 
             # Activate new upstream
             self._upstream = new_upstream
@@ -931,6 +944,29 @@ class MinerSession:
 
         # Clear the queue
         self._pending_notifications.clear()
+
+    async def _send_queued_jobs_after_switch(self) -> None:
+        """
+        Send queued jobs after receiving first difficulty from new pool.
+
+        Called after a pool switch when the first difficulty is received.
+        Sends all queued job notifications and clears the switch flag.
+        """
+        jobs_sent = 0
+        for notification in self._pending_notifications:
+            if notification.method == StratumMethods.MINING_NOTIFY:
+                data = StratumProtocol.encode_message(notification)
+                await self._send_to_miner(data)
+                jobs_sent += 1
+
+        if jobs_sent > 0:
+            logger.info(
+                f"[{self.session_id}] Sent {jobs_sent} queued job(s) after pool switch"
+            )
+
+        # Clear the queue and flag
+        self._pending_notifications.clear()
+        self._awaiting_switch_difficulty = False
 
     async def _send_difficulty_to_miner(self, pool_difficulty: float) -> None:
         """
@@ -1358,12 +1394,15 @@ class MinerSession:
                 StratumMethods.MINING_SET_EXTRANONCE,
             ):
                 if msg.method == StratumMethods.MINING_NOTIFY:
-                    if not self.worker_name:
-                        # Queue job until after authorization (so we can send correct difficulty first)
+                    # Queue job if:
+                    # 1. Not yet authorized (waiting for worker_name)
+                    # 2. After pool switch, waiting for first difficulty
+                    if not self.worker_name or self._awaiting_switch_difficulty:
                         self._pending_notifications.append(msg)
                         # Still track job for validation
                         self._validator.add_job_from_notify(msg.params, self._current_server)
-                        logger.debug(f"[{self.session_id}] Job queued until authorization")
+                        reason = "authorization" if not self.worker_name else "switch difficulty"
+                        logger.debug(f"[{self.session_id}] Job queued until {reason}")
                     else:
                         data = StratumProtocol.encode_message(msg)
                         await self._send_to_miner(data)
@@ -1383,6 +1422,10 @@ class MinerSession:
                                     f"[{self.session_id}] Difficulty {pool_difficulty} queued "
                                     f"until authorization"
                                 )
+                            elif self._awaiting_switch_difficulty:
+                                # First difficulty after pool switch - send it, then queued jobs
+                                await self._send_difficulty_to_miner(pool_difficulty)
+                                await self._send_queued_jobs_after_switch()
                             else:
                                 # Miner is authorized - apply override if configured
                                 await self._send_difficulty_to_miner(pool_difficulty)
