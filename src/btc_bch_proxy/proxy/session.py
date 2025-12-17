@@ -1356,10 +1356,9 @@ class MinerSession:
                                     f"[{self.session_id}] Buffering pool difficulty {pool_difficulty} "
                                     f"until miner authorizes"
                                 )
-                                continue
-
-                            # Miner is authorized - apply override and send
-                            await self._send_difficulty_to_miner(pool_difficulty)
+                            else:
+                                # Miner is authorized - apply override and send
+                                await self._send_difficulty_to_miner(pool_difficulty)
                         except (ValueError, TypeError):
                             logger.warning(f"[{self.session_id}] Invalid difficulty value: {msg.params}")
                 else:
