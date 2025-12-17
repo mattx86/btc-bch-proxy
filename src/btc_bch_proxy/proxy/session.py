@@ -983,6 +983,17 @@ class MinerSession:
             - "off": No override, use pool difficulty as-is
             - None: No config for this worker, use pool difficulty as-is
         """
+        server_name = self._current_server or "unknown"
+
+        # Always log pool difficulty changes (even if we don't change miner difficulty)
+        pool_diff_changed = self._pool_difficulty != pool_difficulty
+        if pool_diff_changed and self._pool_difficulty is not None:
+            logger.info(
+                f"[{self.session_id}] Pool {server_name} difficulty changed: "
+                f"{self._pool_difficulty} -> {pool_difficulty}"
+            )
+        self._pool_difficulty = pool_difficulty
+
         # Update max pool difficulty seen (for highest-seen mode)
         if self._max_pool_difficulty is None or pool_difficulty > self._max_pool_difficulty:
             self._max_pool_difficulty = pool_difficulty
@@ -1005,8 +1016,14 @@ class MinerSession:
                 miner_difficulty = float(worker_diff)
                 override_mode = "fixed"
 
-        # Don't send if difficulty hasn't changed
+        # Don't send if miner difficulty hasn't changed
         if self._miner_difficulty is not None and miner_difficulty == self._miner_difficulty:
+            # Log if pool changed but we're keeping miner at override
+            if pool_diff_changed and override_mode:
+                logger.info(
+                    f"[{self.session_id}] Miner difficulty unchanged at {miner_difficulty} "
+                    f"(override: {override_mode})"
+                )
             return
 
         # Send difficulty to miner
@@ -1021,7 +1038,6 @@ class MinerSession:
         self._validator.set_difficulty(miner_difficulty)
 
         # Log difficulty (always show pool difficulty for clarity)
-        server_name = self._current_server or "unknown"
         override_note = f", override: {override_mode}" if override_mode else ""
         if self._miner_difficulty is None:
             logger.info(
