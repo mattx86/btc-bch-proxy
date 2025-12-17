@@ -240,7 +240,8 @@ class MinerSession:
         self._max_send_failures = 3  # Close session after this many consecutive failures
 
         # Difficulty tracking
-        self._current_difficulty: Optional[float] = None
+        self._pool_difficulty: Optional[float] = None  # Difficulty set by the pool
+        self._miner_difficulty: Optional[float] = None  # Difficulty sent to miner (may be overridden)
 
         # Client address (defensive check for malformed peername tuple)
         peername = writer.get_extra_info("peername")
@@ -1269,30 +1270,69 @@ class MinerSession:
                 StratumMethods.MINING_SET_DIFFICULTY,
                 StratumMethods.MINING_SET_EXTRANONCE,
             ):
-                data = StratumProtocol.encode_message(msg)
-                await self._send_to_miner(data)
-
                 if msg.method == StratumMethods.MINING_NOTIFY:
+                    data = StratumProtocol.encode_message(msg)
+                    await self._send_to_miner(data)
                     # Track job for validation (include source server for grace period routing)
                     self._validator.add_job_from_notify(msg.params, self._current_server)
                     logger.debug(f"[{self.session_id}] Job notification forwarded")
                 elif msg.method == StratumMethods.MINING_SET_DIFFICULTY:
-                    # Track difficulty for validation
+                    # Handle difficulty with potential worker override
                     if msg.params and len(msg.params) > 0:
                         try:
-                            difficulty = float(msg.params[0])
-                            self._validator.set_difficulty(difficulty)
-                            # Log initial difficulty or changes
-                            if self._current_difficulty is None:
-                                logger.info(f"[{self.session_id}] Initial difficulty: {difficulty}")
-                            elif difficulty != self._current_difficulty:
-                                logger.info(
-                                    f"[{self.session_id}] Difficulty changed: "
-                                    f"{self._current_difficulty} -> {difficulty}"
+                            pool_difficulty = float(msg.params[0])
+                            self._pool_difficulty = pool_difficulty
+
+                            # Check for worker difficulty override
+                            miner_difficulty = pool_difficulty
+                            if self.worker_name:
+                                worker_diff = self.config.get_worker_difficulty(self.worker_name)
+                                if worker_diff is not None and worker_diff > pool_difficulty:
+                                    miner_difficulty = float(worker_diff)
+
+                            # Send difficulty to miner (possibly overridden)
+                            if miner_difficulty != pool_difficulty:
+                                # Create modified message with override difficulty
+                                modified_msg = StratumNotification(
+                                    method=msg.method,
+                                    params=[miner_difficulty]
                                 )
-                            self._current_difficulty = difficulty
+                                data = StratumProtocol.encode_message(modified_msg)
+                            else:
+                                data = StratumProtocol.encode_message(msg)
+                            await self._send_to_miner(data)
+
+                            # Track miner's effective difficulty for validation
+                            self._validator.set_difficulty(miner_difficulty)
+
+                            # Log difficulty changes
+                            if self._miner_difficulty is None:
+                                if miner_difficulty != pool_difficulty:
+                                    logger.info(
+                                        f"[{self.session_id}] Initial difficulty: {miner_difficulty} "
+                                        f"(pool: {pool_difficulty}, worker override applied)"
+                                    )
+                                else:
+                                    logger.info(f"[{self.session_id}] Initial difficulty: {miner_difficulty}")
+                            elif miner_difficulty != self._miner_difficulty:
+                                if miner_difficulty != pool_difficulty:
+                                    logger.info(
+                                        f"[{self.session_id}] Difficulty changed: "
+                                        f"{self._miner_difficulty} -> {miner_difficulty} "
+                                        f"(pool: {pool_difficulty}, worker override applied)"
+                                    )
+                                else:
+                                    logger.info(
+                                        f"[{self.session_id}] Difficulty changed: "
+                                        f"{self._miner_difficulty} -> {miner_difficulty}"
+                                    )
+                            self._miner_difficulty = miner_difficulty
                         except (ValueError, TypeError):
                             logger.warning(f"[{self.session_id}] Invalid difficulty value: {msg.params}")
+                else:
+                    # MINING_SET_EXTRANONCE - forward as-is
+                    data = StratumProtocol.encode_message(msg)
+                    await self._send_to_miner(data)
 
         elif isinstance(msg, StratumResponse):
             # Responses are handled by the upstream connection's pending request system

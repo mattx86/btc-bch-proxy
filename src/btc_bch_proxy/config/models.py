@@ -259,6 +259,23 @@ class ValidationConfig(BaseModel):
     )
 
 
+class WorkerConfig(BaseModel):
+    """Configuration for per-worker settings."""
+
+    username: str = Field(..., description="Worker username to match")
+    difficulty: int = Field(
+        ..., ge=1, description="Preferred difficulty (only applied if > pool difficulty)"
+    )
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        """Validate username is not empty."""
+        if not v or not v.strip():
+            raise ValueError("Worker username cannot be empty")
+        return v.strip()
+
+
 class Config(BaseModel):
     """Main configuration model."""
 
@@ -268,6 +285,7 @@ class Config(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    workers: List[WorkerConfig] = Field(default_factory=list, description="Per-worker settings")
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
@@ -390,3 +408,10 @@ class Config(BaseModel):
     def get_server_names(self) -> List[str]:
         """Get list of all server names."""
         return [s.name for s in self.servers]
+
+    def get_worker_difficulty(self, username: str) -> Optional[int]:
+        """Get configured difficulty for a worker, if defined."""
+        for worker in self.workers:
+            if worker.username == username:
+                return worker.difficulty
+        return None

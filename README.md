@@ -254,6 +254,23 @@ validation:
 - `reject_stale`: Prevents submitting shares for jobs that are no longer valid (reduces "stale job" rejections)
 - `validate_difficulty`: Validates that the share hash actually meets the difficulty target before submitting (CPU intensive, disabled by default)
 
+### Worker Settings (Optional)
+
+Configure per-worker difficulty overrides. Workers are identified by their authorization username.
+
+```yaml
+workers:
+  - username: "wallet.worker1"
+    difficulty: 50000000         # Preferred difficulty for this worker
+```
+
+**Behavior:**
+- The configured difficulty is only applied if it is **> the pool's difficulty**
+- If the configured difficulty is lower than or equal to the pool's, the pool's difficulty is used
+- This prevents rejected shares due to low difficulty
+
+**Use case:** Force higher difficulty for powerful miners to reduce share submission frequency without changing pool settings.
+
 ## Statistics
 
 The proxy logs detailed statistics every 15 minutes (at :00, :15, :30, :45). Example output:
