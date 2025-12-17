@@ -134,6 +134,7 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
 | `init.bat` / `init.sh` | Initialize: create venv, upgrade pip, install deps, create config |
 | `start.bat` / `start.sh` | Start the proxy (pass `-f` for foreground) |
 | `stop.bat` / `stop.sh` | Stop the running proxy |
+| `status.bat` / `status.sh` | Check if proxy is running |
 
 ## CLI Commands
 
