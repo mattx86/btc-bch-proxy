@@ -37,6 +37,8 @@ class StratumResponse:
     result: Any
     # Error can be Stratum style [code, msg, traceback] or JSON-RPC 2.0 style {code, message}
     error: Optional[StratumError] = None
+    # Non-standard reject-reason field used by some pools (e.g., "Above target")
+    reject_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -50,6 +52,11 @@ class StratumResponse:
     def is_error(self) -> bool:
         """Check if this is an error response."""
         return self.error is not None
+
+    @property
+    def is_rejected(self) -> bool:
+        """Check if this is a rejected share (result=False with optional reject_reason)."""
+        return self.result is False
 
 
 @dataclass

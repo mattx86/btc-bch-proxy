@@ -118,6 +118,8 @@ class StratumProtocol:
         params = obj.get("params", [])
         result = obj.get("result")
         error = obj.get("error")
+        # Non-standard field used by some pools for share rejection reasons
+        reject_reason = obj.get("reject-reason")
 
         # DoS protection: limit result field size
         result = self._limit_result_size(result)
@@ -154,7 +156,7 @@ class StratumProtocol:
 
         # Response (has id, has result or error, no method)
         if msg_id is not None and (result is not None or error is not None) and method is None:
-            return StratumResponse(id=msg_id, result=result, error=error)
+            return StratumResponse(id=msg_id, result=result, error=error, reject_reason=reject_reason)
 
         # Request (has id and method)
         if msg_id is not None and method is not None:

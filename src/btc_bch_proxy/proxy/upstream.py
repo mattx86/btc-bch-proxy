@@ -677,6 +677,11 @@ class UpstreamConnection:
 
             if response.is_error:
                 return False, response.error
+            if response.is_rejected:
+                # Pool returned result=false, possibly with a reject-reason
+                if response.reject_reason:
+                    return False, [20, response.reject_reason, None]
+                return False, [20, "Rejected by pool", None]
             return response.result is True, None
 
         except asyncio.TimeoutError:
