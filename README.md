@@ -135,6 +135,7 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
 | `start.bat` / `start.sh` | Start the proxy (pass `-f` for foreground) |
 | `stop.bat` / `stop.sh` | Stop the running proxy |
 | `status.bat` / `status.sh` | Check if proxy is running |
+| `validate_config.bat` / `validate_config.sh` | Validate configuration file |
 
 ## CLI Commands
 
