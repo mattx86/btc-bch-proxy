@@ -1013,9 +1013,10 @@ class MinerSession:
         This prevents vardiff from lowering the miner's difficulty.
 
         Floor-reset: If the pool difficulty drops to less than 50% of our current
-        miner difficulty, we reset to 50% of miner difficulty (as long as that's
-        still > pool_difficulty + 1000). This prevents our difficulty from drifting
-        too far above what the pool expects.
+        miner difficulty, we reset to 75% of miner difficulty (25% reduction) as
+        long as that's still > pool_difficulty + 1000. This prevents our difficulty
+        from drifting too far above what the pool expects while using a gentler
+        adjustment than a full 50% reset.
 
         Args:
             pool_difficulty: The difficulty set by the pool.
@@ -1032,10 +1033,11 @@ class MinerSession:
         self._pool_difficulty = pool_difficulty
 
         # Floor-reset: If pool difficulty has dropped significantly (< 50% of miner diff),
-        # reset our tracking to prevent excessive divergence from pool expectations
+        # reset our tracking to prevent excessive divergence from pool expectations.
+        # We reduce by 25% (to 75% of current) rather than 50% for a gentler adjustment.
         if self._miner_difficulty is not None and self._max_pool_difficulty is not None:
             if pool_difficulty < (self._miner_difficulty * 0.5):
-                floor_reset = self._miner_difficulty * 0.5
+                floor_reset = self._miner_difficulty * 0.75
                 # Only apply floor-reset if it still maintains the +1000 buffer
                 if floor_reset > pool_difficulty + 1000:
                     logger.info(

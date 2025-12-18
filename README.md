@@ -274,7 +274,7 @@ The proxy automatically manages difficulty to combat vardiff-induced duplicate s
 **Auto-adjustment:**
 - **Low difficulty rejection**: If pool rejects share as "low difficulty" (or similar), proxy raises difficulty to `(rejected_difficulty + 1000)` if that's higher than current
 - **Stale share rejection**: If pool rejects share as "stale" or "job not found", proxy lowers difficulty by 1000 (if still above pool difficulty)
-- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 50% of miner difficulty (if still > pool difficulty + 1000). This prevents excessive divergence from pool expectations.
+- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 75% of miner difficulty (25% reduction) if still > pool difficulty + 1000. This prevents excessive divergence from pool expectations.
 
 **Note:** This automatic +1000 buffer prevents most vardiff-induced duplicate rejections while keeping the miner working at a difficulty close to what the pool expects.
 
