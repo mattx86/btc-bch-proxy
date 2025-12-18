@@ -972,6 +972,10 @@ class MinerSession:
                     else:
                         override_difficulty = float(min_diff)
                     override_mode = "highest-seen-with-minimum"
+                elif self._max_pool_difficulty is not None:
+                    # No minimum_difficulty - fall back to highest-seen behavior
+                    override_difficulty = self._max_pool_difficulty
+                    override_mode = "highest-seen"
             elif isinstance(worker_diff, int):
                 # Fixed difficulty override
                 override_difficulty = float(worker_diff)
@@ -1103,6 +1107,18 @@ class MinerSession:
                     miner_difficulty = max(float(min_diff), self._max_pool_difficulty)
                     if miner_difficulty > pool_difficulty:
                         override_mode = "highest-seen-with-minimum"
+                else:
+                    # No minimum_difficulty set - fall back to highest-seen behavior
+                    if not getattr(self, "_warned_no_minimum_difficulty", False):
+                        logger.warning(
+                            f"[{self.session_id}] Worker '{self.worker_name}' uses "
+                            f"'highest-seen-with-minimum' without minimum_difficulty set. "
+                            f"Behaving as 'highest-seen'."
+                        )
+                        self._warned_no_minimum_difficulty = True
+                    miner_difficulty = self._max_pool_difficulty
+                    if miner_difficulty > pool_difficulty:
+                        override_mode = "highest-seen"
             elif isinstance(worker_diff, int) and worker_diff > pool_difficulty:
                 # Fixed minimum difficulty
                 miner_difficulty = float(worker_diff)
@@ -1223,6 +1239,81 @@ class MinerSession:
         # Send suggest_difficulty to pool (helps restore hashrate reporting)
         if self._upstream and self._upstream.connected:
             fire_and_forget(self._upstream.suggest_difficulty(effective_difficulty))
+
+    async def _handle_stale_share_rejection(self, reason: str) -> None:
+        """
+        Handle a "stale" or "job not found" rejection by lowering difficulty.
+
+        When a pool rejects a share as stale, it suggests the miner is taking too
+        long to find shares at the current difficulty. For "highest-seen" and
+        "highest-seen-with-minimum" modes, we lower the difficulty by 1000 to help
+        the miner find shares faster, as long as the new difficulty is still above
+        the pool's difficulty and any configured minimum.
+
+        Args:
+            reason: The rejection reason string, e.g. "stale", "job not found"
+        """
+        # Only process stale/job-not-found rejections
+        reason_lower = reason.lower()
+        if "stale" not in reason_lower and "job not found" not in reason_lower:
+            return
+
+        # Only applies to "highest-seen" and "highest-seen-with-minimum" modes
+        if not self.worker_name:
+            return
+        worker_diff = self.config.get_worker_difficulty(self.worker_name)
+        if worker_diff not in ("highest-seen", "highest-seen-with-minimum"):
+            return
+
+        # Can't lower if we don't have a current difficulty set
+        if self._miner_difficulty is None or self._max_pool_difficulty is None:
+            return
+
+        # Calculate new target: current difficulty minus 1000
+        new_target = self._miner_difficulty - 1000
+
+        # Determine the floor (pool difficulty or minimum_difficulty, whichever is higher)
+        floor_difficulty = self._pool_difficulty or 1.0
+        if worker_diff == "highest-seen-with-minimum":
+            min_diff = self.config.get_worker_minimum_difficulty(self.worker_name)
+            if min_diff is not None:
+                floor_difficulty = max(floor_difficulty, float(min_diff))
+
+        # Only lower if new target is still above the floor
+        if new_target <= floor_difficulty:
+            logger.debug(
+                f"[{self.session_id}] Stale share but can't lower difficulty: "
+                f"new_target={new_target} <= floor={floor_difficulty}"
+            )
+            return
+
+        # Don't lower below pool difficulty
+        if new_target <= (self._pool_difficulty or 0):
+            return
+
+        old_difficulty = self._miner_difficulty
+        self._max_pool_difficulty = new_target
+
+        logger.info(
+            f"[{self.session_id}] Lowering difficulty due to stale share ({worker_diff} mode): "
+            f"{old_difficulty} -> {new_target} (stale reason: {reason})"
+        )
+
+        # Send new difficulty to miner
+        diff_msg = StratumNotification(
+            method=StratumMethods.MINING_SET_DIFFICULTY,
+            params=[new_target]
+        )
+        data = StratumProtocol.encode_message(diff_msg)
+        await self._send_to_miner(data)
+
+        # Update tracking
+        self._validator.set_difficulty(new_target)
+        self._miner_difficulty = new_target
+
+        # Send suggest_difficulty to pool
+        if self._upstream and self._upstream.connected:
+            fire_and_forget(self._upstream.suggest_difficulty(new_target))
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
@@ -1559,6 +1650,9 @@ class MinerSession:
             # Auto-adjust difficulty for "highest-seen" mode when pool rejects as low difficulty
             # This handles pools that silently increase difficulty without sending mining.set_difficulty
             await self._handle_low_difficulty_rejection(reason)
+
+            # Lower difficulty on stale shares to help miner find shares faster
+            await self._handle_stale_share_rejection(reason)
 
             # If pool says "duplicate", cache it locally to prevent re-submission.
             # This is CORRECT behavior because:

@@ -313,14 +313,6 @@ class WorkerConfig(BaseModel):
             raise ValueError("minimum_difficulty must be >= 1")
         return v
 
-    @model_validator(mode="after")
-    def validate_minimum_difficulty_required(self) -> "WorkerConfig":
-        """Validate that minimum_difficulty is set when using highest-seen-with-minimum."""
-        if self.difficulty == "highest-seen-with-minimum" and self.minimum_difficulty is None:
-            raise ValueError(
-                "minimum_difficulty is required when difficulty is 'highest-seen-with-minimum'"
-            )
-        return self
 
 
 class Config(BaseModel):

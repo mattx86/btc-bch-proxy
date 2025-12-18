@@ -286,14 +286,18 @@ workers:
 |------|-------------|
 | Number (e.g., `50000000`) | Fixed minimum difficulty. Only applied if greater than pool's difficulty. |
 | `"highest-seen"` | Tracks the highest difficulty the pool has set and uses that. Prevents vardiff from lowering difficulty. |
-| `"highest-seen-with-minimum"` | Combines highest-seen ceiling with a minimum floor. Requires `minimum_difficulty` option. |
+| `"highest-seen-with-minimum"` | Combines highest-seen ceiling with a minimum floor. Use with `minimum_difficulty` option (optional - falls back to highest-seen if not set). |
 | `"off"` | No override. Uses pool's difficulty as-is. |
 
 **Behavior:**
 - **Fixed number**: Only applied if the configured value is **> the pool's difficulty**. If lower, the pool's difficulty is used.
-- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch. **Auto-adjusts:** If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically doubles the difficulty (`rejected_share_difficulty * 2`). This aggressive adjustment handles solo pools with per-job difficulty targets.
-- **highest-seen-with-minimum**: Uses the greater of `minimum_difficulty` or the highest pool difficulty seen. This provides a guaranteed floor (the minimum) while still allowing the pool to raise difficulty above it. Includes the same auto-adjust behavior as "highest-seen".
+- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch.
+- **highest-seen-with-minimum**: Uses the greater of `minimum_difficulty` or the highest pool difficulty seen. This provides a guaranteed floor (the minimum) while still allowing the pool to raise difficulty above it. If `minimum_difficulty` is not specified, behaves like "highest-seen" (with a warning logged).
 - **off**: Passes through pool difficulty unchanged.
+
+**Auto-adjustment (highest-seen and highest-seen-with-minimum only):**
+- **Low difficulty rejection**: If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically doubles the difficulty (`rejected_share_difficulty * 2`). This handles solo pools with per-job difficulty targets.
+- **Stale share rejection**: If the pool rejects a share as "stale" or "job not found", the proxy lowers difficulty by 1000 (as long as it stays above pool difficulty and `minimum_difficulty` if set). This helps the miner find shares faster to avoid stales.
 
 **Difficulty Suggestion to Pool:**
 When the proxy overrides difficulty (fixed or highest-seen), it sends `mining.suggest_difficulty` to the pool with the override value. This attempts to restore accurate hashrate reporting on the pool side. Pools may honor or ignore this suggestion.
