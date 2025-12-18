@@ -288,6 +288,13 @@ workers:
 - **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch. **Auto-adjusts:** If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically doubles the difficulty (`rejected_share_difficulty * 2`). This aggressive adjustment handles solo pools with per-job difficulty targets.
 - **off**: Passes through pool difficulty unchanged.
 
+**Difficulty Suggestion to Pool:**
+When the proxy overrides difficulty (fixed or highest-seen), it sends `mining.suggest_difficulty` to the pool with the override value. This attempts to restore accurate hashrate reporting on the pool side. Pools may honor or ignore this suggestion.
+
+Additionally, when miners send their own `mining.suggest_difficulty` requests:
+- **With override active**: The proxy intercepts the miner's request and sends its own override value instead
+- **With "off" or no config**: The miner's request is forwarded to the pool unchanged
+
 **Note:** Forcing a higher difficulty (via fixed number or highest-seen) will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.
 
 **Use case:** Force higher difficulty for powerful miners to reduce share submission frequency and duplicate share rejections without changing pool settings.

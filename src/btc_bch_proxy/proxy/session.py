@@ -823,6 +823,8 @@ class MinerSession:
                 await self._handle_authorize(msg)
             elif msg.method == StratumMethods.MINING_SUBMIT:
                 await self._handle_submit(msg)
+            elif msg.method == StratumMethods.MINING_SUGGEST_DIFFICULTY:
+                await self._handle_suggest_difficulty(msg)
             else:
                 # Forward other requests to upstream
                 await self._forward_to_upstream(msg)
@@ -917,6 +919,70 @@ class MinerSession:
 
         # Send queued notifications (difficulty with override, then jobs)
         await self._send_queued_notifications()
+
+    async def _handle_suggest_difficulty(self, msg: StratumRequest) -> None:
+        """
+        Handle mining.suggest_difficulty from miner.
+
+        When the proxy is overriding difficulty (fixed or highest-seen mode), we:
+        1. Intercept and block the miner's suggest_difficulty
+        2. Send our own suggest_difficulty with the override value to the pool
+
+        This allows the proxy to control the difficulty while attempting to
+        restore accurate hashrate reporting on the pool side.
+
+        Args:
+            msg: The suggest_difficulty request from the miner.
+        """
+        # Extract miner's suggested difficulty
+        miner_suggestion = None
+        if msg.params and len(msg.params) > 0:
+            try:
+                miner_suggestion = float(msg.params[0])
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"[{self.session_id}] Invalid suggest_difficulty value: {msg.params[0]}"
+                )
+
+        # Check if we're overriding difficulty
+        override_difficulty = None
+        override_mode = None
+        if self.worker_name:
+            worker_diff = self.config.get_worker_difficulty(self.worker_name)
+            if worker_diff == "off":
+                # No override - forward miner's request as-is
+                pass
+            elif worker_diff == "highest-seen":
+                # Use our tracked maximum difficulty
+                if self._max_pool_difficulty is not None:
+                    override_difficulty = self._max_pool_difficulty
+                    override_mode = "highest-seen"
+            elif isinstance(worker_diff, int):
+                # Fixed difficulty override
+                override_difficulty = float(worker_diff)
+                override_mode = "fixed"
+
+        if override_difficulty is not None:
+            # Block miner's request and send our own
+            logger.info(
+                f"[{self.session_id}] Intercepted miner suggest_difficulty({miner_suggestion}), "
+                f"sending override ({override_mode}): {override_difficulty}"
+            )
+
+            # Send success response to miner (we "handled" their request)
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, True)
+            )
+
+            # Send our override suggestion to the pool
+            if self._upstream and self._upstream.connected:
+                await self._upstream.suggest_difficulty(override_difficulty)
+        else:
+            # No override - forward miner's request to pool
+            logger.debug(
+                f"[{self.session_id}] Forwarding miner suggest_difficulty({miner_suggestion})"
+            )
+            await self._forward_to_upstream(msg)
 
     async def _send_queued_notifications(self) -> None:
         """
@@ -1053,6 +1119,12 @@ class MinerSession:
             )
         self._miner_difficulty = miner_difficulty
 
+        # Send suggest_difficulty to pool when overriding (helps restore hashrate reporting)
+        # Only send when difficulty is being overridden (miner_difficulty > pool_difficulty)
+        if override_mode and self._upstream and self._upstream.connected:
+            # Fire and forget - don't block on pool's response
+            fire_and_forget(self._upstream.suggest_difficulty(miner_difficulty))
+
     async def _handle_low_difficulty_rejection(self, reason: str) -> None:
         """
         Handle a "low difficulty share" rejection by auto-adjusting difficulty.
@@ -1115,6 +1187,10 @@ class MinerSession:
         # Update tracking
         self._validator.set_difficulty(new_target)
         self._miner_difficulty = new_target
+
+        # Send suggest_difficulty to pool (helps restore hashrate reporting)
+        if self._upstream and self._upstream.connected:
+            fire_and_forget(self._upstream.suggest_difficulty(new_target))
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""

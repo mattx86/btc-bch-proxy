@@ -90,6 +90,7 @@ class StratumMethods:
     MINING_CONFIGURE = "mining.configure"
     MINING_EXTRANONCE_SUBSCRIBE = "mining.extranonce.subscribe"
     MINING_GET_TRANSACTIONS = "mining.get_transactions"
+    MINING_SUGGEST_DIFFICULTY = "mining.suggest_difficulty"
 
     # Server -> Client notifications
     MINING_NOTIFY = "mining.notify"

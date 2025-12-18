@@ -634,6 +634,57 @@ class UpstreamConnection:
             logger.error(f"Authorize error for {self.name}: {e}")
             return False
 
+    async def suggest_difficulty(self, difficulty: float) -> bool:
+        """
+        Send mining.suggest_difficulty to suggest a preferred difficulty to the pool.
+
+        This is used to request the pool set a specific difficulty, which can help
+        restore accurate hashrate reporting when the proxy is overriding difficulty.
+        Pools may honor or ignore this suggestion.
+
+        Args:
+            difficulty: The suggested difficulty value.
+
+        Returns:
+            True if suggestion was sent (not necessarily honored by pool).
+        """
+        if not self._connected:
+            return False
+
+        req_id = await self._next_id()
+        params = [difficulty]
+
+        try:
+            # Send the suggestion - pools may or may not respond
+            # Some pools respond with true/false, others just acknowledge with set_difficulty
+            response = await self._send_request(
+                req_id, StratumMethods.MINING_SUGGEST_DIFFICULTY, params
+            )
+
+            if response.is_error:
+                # Pool doesn't support suggest_difficulty - that's OK
+                logger.debug(
+                    f"Pool {self.name} rejected suggest_difficulty: {response.error}"
+                )
+                return False
+
+            logger.info(
+                f"Sent suggest_difficulty({difficulty}) to {self.name}, "
+                f"result={response.result}"
+            )
+            return True
+
+        except asyncio.TimeoutError:
+            # Timeout is common - some pools don't respond to suggest_difficulty
+            logger.debug(
+                f"suggest_difficulty({difficulty}) timeout for {self.name} "
+                f"(pool may not support it)"
+            )
+            return False
+        except Exception as e:
+            logger.debug(f"suggest_difficulty error for {self.name}: {e}")
+            return False
+
     async def submit_share(
         self,
         worker_name: str,
