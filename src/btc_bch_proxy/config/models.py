@@ -266,9 +266,15 @@ class WorkerConfig(BaseModel):
     # Difficulty can be:
     # - int: Fixed minimum difficulty (only applied if > pool difficulty)
     # - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
+    # - "highest-seen-with-minimum": Combines highest-seen ceiling with a minimum floor
     # - "off": No override, use pool difficulty as-is
-    difficulty: Union[int, Literal["highest-seen", "off"]] = Field(
-        ..., description="Difficulty override mode: number, 'highest-seen', or 'off'"
+    difficulty: Union[int, Literal["highest-seen", "highest-seen-with-minimum", "off"]] = Field(
+        ..., description="Difficulty override mode: number, 'highest-seen', 'highest-seen-with-minimum', or 'off'"
+    )
+    # Minimum difficulty floor (required when difficulty is "highest-seen-with-minimum")
+    # The effective difficulty is max(minimum_difficulty, highest_seen_pool_difficulty)
+    minimum_difficulty: Optional[int] = Field(
+        default=None, description="Minimum difficulty floor for 'highest-seen-with-minimum' mode"
     )
 
     @field_validator("username")
@@ -289,14 +295,32 @@ class WorkerConfig(BaseModel):
             return v
         if isinstance(v, str):
             v_lower = v.lower().strip()
-            if v_lower not in ("highest-seen", "off"):
+            if v_lower not in ("highest-seen", "highest-seen-with-minimum", "off"):
                 raise ValueError(
-                    f"Invalid difficulty mode '{v}'. Must be a number, 'highest-seen', or 'off'"
+                    f"Invalid difficulty mode '{v}'. "
+                    f"Must be a number, 'highest-seen', 'highest-seen-with-minimum', or 'off'"
                 )
             return v_lower
         raise ValueError(
             f"Invalid difficulty type: {type(v).__name__}. Must be int or string"
         )
+
+    @field_validator("minimum_difficulty")
+    @classmethod
+    def validate_minimum_difficulty(cls, v: Optional[int]) -> Optional[int]:
+        """Validate minimum_difficulty value."""
+        if v is not None and v < 1:
+            raise ValueError("minimum_difficulty must be >= 1")
+        return v
+
+    @model_validator(mode="after")
+    def validate_minimum_difficulty_required(self) -> "WorkerConfig":
+        """Validate that minimum_difficulty is set when using highest-seen-with-minimum."""
+        if self.difficulty == "highest-seen-with-minimum" and self.minimum_difficulty is None:
+            raise ValueError(
+                "minimum_difficulty is required when difficulty is 'highest-seen-with-minimum'"
+            )
+        return self
 
 
 class Config(BaseModel):
@@ -439,10 +463,26 @@ class Config(BaseModel):
         Returns:
             - int: Fixed minimum difficulty
             - "highest-seen": Use highest pool difficulty seen
+            - "highest-seen-with-minimum": Combines highest-seen with a minimum floor
             - "off": No override
             - None: No config for this worker
         """
         for worker in self.workers:
             if worker.username == username:
                 return worker.difficulty
+        return None
+
+    def get_worker_minimum_difficulty(self, username: str) -> Optional[int]:
+        """
+        Get configured minimum_difficulty for a worker, if defined.
+
+        Used with "highest-seen-with-minimum" mode to provide a floor.
+
+        Returns:
+            - int: Minimum difficulty floor
+            - None: No minimum configured
+        """
+        for worker in self.workers:
+            if worker.username == username:
+                return worker.minimum_difficulty
         return None

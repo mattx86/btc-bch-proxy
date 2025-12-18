@@ -274,6 +274,9 @@ workers:
   - username: "miner2"
     difficulty: "highest-seen"   # Lock to highest pool difficulty seen
   - username: "miner3"
+    difficulty: "highest-seen-with-minimum"  # Combines highest-seen with a floor
+    minimum_difficulty: 10000000             # Required for highest-seen-with-minimum
+  - username: "miner4"
     difficulty: "off"            # No override, use pool difficulty as-is
 ```
 
@@ -283,11 +286,13 @@ workers:
 |------|-------------|
 | Number (e.g., `50000000`) | Fixed minimum difficulty. Only applied if greater than pool's difficulty. |
 | `"highest-seen"` | Tracks the highest difficulty the pool has set and uses that. Prevents vardiff from lowering difficulty. |
+| `"highest-seen-with-minimum"` | Combines highest-seen ceiling with a minimum floor. Requires `minimum_difficulty` option. |
 | `"off"` | No override. Uses pool's difficulty as-is. |
 
 **Behavior:**
 - **Fixed number**: Only applied if the configured value is **> the pool's difficulty**. If lower, the pool's difficulty is used.
 - **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch. **Auto-adjusts:** If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically doubles the difficulty (`rejected_share_difficulty * 2`). This aggressive adjustment handles solo pools with per-job difficulty targets.
+- **highest-seen-with-minimum**: Uses the greater of `minimum_difficulty` or the highest pool difficulty seen. This provides a guaranteed floor (the minimum) while still allowing the pool to raise difficulty above it. Includes the same auto-adjust behavior as "highest-seen".
 - **off**: Passes through pool difficulty unchanged.
 
 **Difficulty Suggestion to Pool:**
