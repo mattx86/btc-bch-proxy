@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -69,7 +68,7 @@ def normalize_rejection_reason(reason: str) -> str:
     if "invalid" in reason_lower:
         return "invalid share"
 
-    # For unknown patterns, truncate input to prevent regex DoS on very long strings
+    # For unknown patterns, truncate input to prevent DoS on very long strings
     # Only do this AFTER pattern matching to preserve full context for known patterns
     MAX_REASON_INPUT = 200
     if len(reason) > MAX_REASON_INPUT:
@@ -77,12 +76,38 @@ def normalize_rejection_reason(reason: str) -> str:
 
     # Remove any parenthetical details for unknown patterns
     # e.g., "some error (details=xyz)" → "some error"
-    cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', reason).strip()
+    # Use string operations instead of regex to avoid potential DoS
+    cleaned = reason
+    if "(" in cleaned:
+        # Find the last '(' and remove from there if followed by ')' at end
+        paren_idx = cleaned.rfind("(")
+        if paren_idx > 0 and cleaned.rstrip().endswith(")"):
+            cleaned = cleaned[:paren_idx].rstrip()
+
     if cleaned:
         # Truncate to prevent very long category names from unique error messages
-        # Also remove any numbers/hex which could create many variations
-        cleaned = re.sub(r'[0-9a-fA-F]{4,}', 'X', cleaned.lower())
-        cleaned = cleaned[:50]  # Max 50 chars for category name
+        # Replace sequences of hex/numbers with 'X' using simple character filtering
+        cleaned_lower = cleaned.lower()
+        result = []
+        hex_run = []
+        for char in cleaned_lower:
+            if char in "0123456789abcdef":
+                hex_run.append(char)
+            else:
+                # Flush hex run if 4+ chars
+                if len(hex_run) >= 4:
+                    result.append("X")
+                else:
+                    result.extend(hex_run)
+                hex_run = []
+                result.append(char)
+        # Handle trailing hex run
+        if len(hex_run) >= 4:
+            result.append("X")
+        else:
+            result.extend(hex_run)
+
+        cleaned = "".join(result)[:50]  # Max 50 chars for category name
         # Ensure ASCII-safe for JSON/logging (replace non-ASCII with ?)
         cleaned = cleaned.encode('ascii', errors='replace').decode('ascii')
         return cleaned
@@ -152,6 +177,10 @@ class ProxyStats:
         self.current_miners: int = 0
         self.total_miner_connections: int = 0
         self.total_miner_disconnections: int = 0
+
+        # Track connected session IDs to prevent double-counting
+        # This detects bugs where disconnect is called more than once for a session
+        self._connected_sessions: Set[str] = set()
 
         # Per-server stats
         self._server_stats: Dict[str, ServerStats] = {}
@@ -230,24 +259,51 @@ class ProxyStats:
             self._server_stats[server_name] = ServerStats(name=server_name)
         return self._server_stats[server_name]
 
-    async def record_miner_connect(self) -> None:
-        """Record a new miner connection."""
+    async def record_miner_connect(self, session_id: str) -> None:
+        """
+        Record a new miner connection.
+
+        Args:
+            session_id: Unique session identifier for tracking.
+        """
         async with self._get_lock():
+            if session_id in self._connected_sessions:
+                # Double-connect is a bug - log but still increment
+                logger.warning(
+                    f"Session {session_id} already recorded as connected. "
+                    f"Possible double-connect bug."
+                )
+            else:
+                self._connected_sessions.add(session_id)
             self.current_miners += 1
             self.total_miner_connections += 1
 
-    async def record_miner_disconnect(self) -> None:
-        """Record a miner disconnection."""
+    async def record_miner_disconnect(self, session_id: str) -> None:
+        """
+        Record a miner disconnection.
+
+        Args:
+            session_id: Unique session identifier for tracking.
+        """
         async with self._get_lock():
-            if self.current_miners <= 0:
-                # This indicates a bug: disconnect called more times than connect
+            if session_id not in self._connected_sessions:
+                # Double-disconnect detected - don't decrement counter
                 logger.warning(
-                    f"Miner disconnect recorded but current_miners already {self.current_miners}. "
-                    f"Possible double-disconnect bug."
+                    f"Session {session_id} not in connected set. "
+                    f"Possible double-disconnect bug - ignoring."
                 )
-                self.current_miners = 0
-            else:
+                return
+            self._connected_sessions.discard(session_id)
+            # Defensive check: prevent counter from going negative
+            # This should never happen if session tracking is correct, but guards
+            # against edge cases where the counter gets out of sync
+            if self.current_miners > 0:
                 self.current_miners -= 1
+            else:
+                logger.error(
+                    f"current_miners would go negative (currently {self.current_miners}), "
+                    f"not decrementing. Session ID: {session_id}"
+                )
             self.total_miner_disconnections += 1
 
     async def set_active_server(self, server_name: str, server_addr: Optional[str] = None) -> None:

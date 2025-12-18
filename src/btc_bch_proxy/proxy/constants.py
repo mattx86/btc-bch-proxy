@@ -9,8 +9,24 @@ POLL_SLEEP_INTERVAL = 0.1
 # Short timeout for non-blocking reads (seconds)
 NON_BLOCKING_READ_TIMEOUT = 0.1
 
-# Maximum length for miner-provided strings (usernames, user agents)
+# Maximum length for miner-provided strings (user agents, etc.)
 MAX_MINER_STRING_LENGTH = 256
+
+# Maximum length for worker usernames
+MAX_WORKER_USERNAME_LENGTH = 256
+
+# Session ID length in hex characters (12 chars = 48 bits, collision-safe)
+SESSION_ID_LENGTH = 12
+
+# Maximum extranonce1 length in hex characters (8 bytes = 16 hex chars)
+MAX_EXTRANONCE1_HEX_LENGTH = 16
+
+# Maximum extranonce2 size in bytes (typically 4-8)
+MAX_EXTRANONCE2_SIZE = 8
+
+# Job source TTL for grace period routing (seconds)
+# Should be >= SERVER_SWITCH_GRACE_PERIOD + GRACE_PERIOD_EXTENSION
+JOB_SOURCE_TTL = 60.0
 
 # Initial delay for share submit retry (seconds)
 SHARE_SUBMIT_INITIAL_RETRY_DELAY = 0.5
@@ -64,3 +80,16 @@ SERVER_SWITCH_GRACE_PERIOD = 30.0
 # Each time a share is successfully routed to the old pool, the grace period
 # is extended by this amount, allowing in-flight work to complete
 GRACE_PERIOD_EXTENSION = 15.0
+
+# Maximum number of merkle branches in mining.notify (DoS protection)
+# SHA-256 coin blocks typically have at most ~4000 transactions, requiring at most
+# 12 branches (log2(4096) = 12). Allow up to 32 for future-proofing and larger blocks.
+MAX_MERKLE_BRANCHES = 32
+
+# Maximum pending notifications to queue (prevents unbounded memory growth)
+# During handshake or pool switch, notifications are queued temporarily
+MAX_PENDING_NOTIFICATIONS = 100
+
+# Timeout for upstream socket close operation (seconds)
+# Prevents indefinite hang if remote end doesn't close gracefully
+UPSTREAM_DISCONNECT_TIMEOUT = 5.0

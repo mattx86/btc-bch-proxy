@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
+from btc_bch_proxy.proxy.constants import JOB_SOURCE_TTL, MAX_MERKLE_BRANCHES
+
 if TYPE_CHECKING:
     from btc_bch_proxy.config.models import ValidationConfig
 
@@ -109,9 +111,10 @@ class ShareValidator:
         self._current_job_id: Optional[str] = None
 
         # Job source tracking for grace period routing
-        # Maps job_id -> source_server (persists across cache clears for grace period)
-        self._job_sources: OrderedDict[str, str] = OrderedDict()
+        # Maps job_id -> (source_server, timestamp) - persists across cache clears
+        self._job_sources: OrderedDict[str, tuple[str, float]] = OrderedDict()
         self._max_job_sources = 4096  # Limit to prevent unbounded growth
+        self._last_job_source_cleanup: float = 0.0
 
         # Current difficulty
         self._difficulty: float = 1.0
@@ -175,11 +178,18 @@ class ShareValidator:
             job_info: Job information.
             source_server: Optional server name that issued this job (for grace period routing).
         """
+        now = time.time()
+
+        # Periodic cleanup of expired job sources (throttled)
+        if now - self._last_job_source_cleanup > 30.0:  # Check every 30 seconds
+            self._clean_job_sources()
+            self._last_job_source_cleanup = now
+
         # Store source server in job info if provided
         if source_server:
             job_info.source_server = source_server
-            # Track in job_sources dict (persists across cache clears for grace period)
-            self._job_sources[job_info.job_id] = source_server
+            # Track in job_sources dict with timestamp (persists for grace period)
+            self._job_sources[job_info.job_id] = (source_server, now)
             # Limit job source tracking to prevent unbounded growth
             while len(self._job_sources) > self._max_job_sources:
                 self._job_sources.popitem(last=False)
@@ -222,18 +232,50 @@ class ShareValidator:
             logger.warning(f"[{self.session_id}] Invalid mining.notify params: {params}")
             return
 
+        # Parse merkle branches with DoS protection
+        merkle_branches = []
+        if isinstance(params[4], list):
+            if len(params[4]) > MAX_MERKLE_BRANCHES:
+                logger.warning(
+                    f"[{self.session_id}] Excessive merkle branches ({len(params[4])}), "
+                    f"truncating to {MAX_MERKLE_BRANCHES}"
+                )
+                merkle_branches = [str(b) for b in params[4][:MAX_MERKLE_BRANCHES]]
+            else:
+                merkle_branches = [str(b) for b in params[4]]
+
         job_info = JobInfo(
             job_id=str(params[0]),
             prevhash=str(params[1]),
             coinbase1=str(params[2]),
             coinbase2=str(params[3]),
-            merkle_branches=[str(b) for b in params[4]] if isinstance(params[4], list) else [],
+            merkle_branches=merkle_branches,
             version=str(params[5]),
             nbits=str(params[6]),
             ntime=str(params[7]),
             clean_jobs=bool(params[8]),  # len(params) >= 9 guaranteed by check above
         )
         self.add_job(job_info, source_server)
+
+    def _clean_job_sources(self) -> None:
+        """Remove expired job sources based on TTL."""
+        now = time.time()
+        expired = []
+        for job_id, (_, timestamp) in self._job_sources.items():
+            if now - timestamp > JOB_SOURCE_TTL:
+                expired.append(job_id)
+            else:
+                # OrderedDict is ordered by insertion, so we can stop early
+                break
+
+        for job_id in expired:
+            del self._job_sources[job_id]
+
+        if expired:
+            logger.debug(
+                f"[{self.session_id}] Cleaned {len(expired)} expired job sources "
+                f"(remaining: {len(self._job_sources)})"
+            )
 
     def get_job_source(self, job_id: str) -> Optional[str]:
         """
@@ -247,9 +289,16 @@ class ShareValidator:
             job_id: The job ID to look up.
 
         Returns:
-            Server name that issued the job, or None if unknown.
+            Server name that issued the job, or None if unknown/expired.
         """
-        return self._job_sources.get(job_id)
+        entry = self._job_sources.get(job_id)
+        if entry is None:
+            return None
+        server, timestamp = entry
+        # Check TTL
+        if time.time() - timestamp > JOB_SOURCE_TTL:
+            return None
+        return server
 
     def validate_share(
         self,
@@ -487,23 +536,27 @@ class ShareValidator:
 
         except ValueError as e:
             # Invalid hex/int conversion - data format issue
+            # Fail-closed: reject malformed shares to prevent DoS/invalid submissions
+            self.invalid_format_rejected += 1
             logger.warning(
-                f"[{self.session_id}] Hash validation format error (accepting share): {e}"
+                f"[{self.session_id}] Hash validation format error (rejecting share): {e}"
             )
-            return True, None
+            return False, f"Invalid share format: {e}"
         except struct.error as e:
             # Struct packing error - data size issue
+            self.invalid_format_rejected += 1
             logger.warning(
-                f"[{self.session_id}] Hash validation struct error (accepting share): {e}"
+                f"[{self.session_id}] Hash validation struct error (rejecting share): {e}"
             )
-            return True, None
+            return False, f"Invalid share data size: {e}"
         except (TypeError, KeyError, IndexError) as e:
-            # Unexpected data type or missing data - let pool be arbiter
+            # Unexpected data type or missing data
+            self.invalid_format_rejected += 1
             logger.warning(
-                f"[{self.session_id}] Hash validation data error (accepting share): "
+                f"[{self.session_id}] Hash validation data error (rejecting share): "
                 f"{type(e).__name__}: {e}"
             )
-            return True, None
+            return False, f"Invalid share data: {type(e).__name__}"
 
     def get_stats(self) -> dict:
         """Get validation statistics."""
@@ -518,7 +571,9 @@ class ShareValidator:
         }
 
 
-# Bitcoin difficulty 1 target (used for difficulty <-> target conversion)
+# SHA-256 difficulty 1 target (used for difficulty <-> target conversion)
+# This is the standard target used by Bitcoin, Bitcoin Cash, DigiByte, and
+# other SHA-256 based cryptocurrencies for stratum mining difficulty calculation.
 MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 
 

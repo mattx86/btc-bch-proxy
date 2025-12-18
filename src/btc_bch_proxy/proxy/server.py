@@ -227,7 +227,7 @@ class StratumProxyServer:
 
         # Record miner connection
         stats = ProxyStats.get_instance()
-        await stats.record_miner_connect()
+        await stats.record_miner_connect(session.session_id)
 
         # Register session
         async with self._session_lock:
@@ -238,7 +238,7 @@ class StratumProxyServer:
             await session.run()
         finally:
             # Record miner disconnection
-            await stats.record_miner_disconnect()
+            await stats.record_miner_disconnect(session.session_id)
 
             # Unregister session
             async with self._session_lock:

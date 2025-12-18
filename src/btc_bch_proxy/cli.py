@@ -41,7 +41,10 @@ def find_config_file() -> Optional[Path]:
 @click.group()
 @click.version_option(version=__version__, prog_name="btc-bch-proxy")
 def main():
-    """Bitcoin/Bitcoin Cash Stratum Proxy with time-based server routing."""
+    """SHA-256 Stratum Proxy with time-based server routing.
+
+    Supports Bitcoin, Bitcoin Cash, DigiByte, and other SHA-256 based cryptocurrencies.
+    """
     pass
 
 
@@ -255,7 +258,8 @@ def init():
 
 def create_sample_config():
     """Create a sample configuration file from scratch."""
-    config_content = """# Bitcoin/Bitcoin Cash Stratum Proxy Configuration
+    config_content = """# SHA-256 Stratum Proxy Configuration
+# Supports Bitcoin, Bitcoin Cash, DigiByte, and other SHA-256 coins
 
 proxy:
   bind_host: "0.0.0.0"           # Listen on all interfaces

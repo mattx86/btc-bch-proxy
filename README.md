@@ -2,7 +2,9 @@
 
 > **Beta Software**: This project is currently in beta and under active development. Use with caution in production environments. Please report any issues on GitHub.
 
-A cross-platform Bitcoin/Bitcoin Cash stratum proxy with time-based server routing. Automatically switches between mining pools based on a configurable daily schedule.
+A cross-platform SHA-256 stratum proxy with time-based server routing. Automatically switches between mining pools based on a configurable daily schedule.
+
+**Supported Coins:** Bitcoin (BTC), Bitcoin Cash (BCH), DigiByte (DGB), and other SHA-256 based cryptocurrencies.
 
 ## Features
 

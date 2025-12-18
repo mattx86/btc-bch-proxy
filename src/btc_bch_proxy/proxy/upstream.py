@@ -22,9 +22,13 @@ from btc_bch_proxy.proxy.stats import ProxyStats
 from btc_bch_proxy.proxy.constants import (
     DEFAULT_PENDING_SHARES_WAIT_TIMEOUT,
     DEFAULT_UPSTREAM_HEALTH_TIMEOUT,
+    MAX_EXTRANONCE1_HEX_LENGTH,
+    MAX_EXTRANONCE2_SIZE,
+    MAX_PENDING_NOTIFICATIONS,
     NON_BLOCKING_READ_TIMEOUT,
     POLL_SLEEP_INTERVAL,
     SOCKET_READ_BUFFER_SIZE,
+    UPSTREAM_DISCONNECT_TIMEOUT,
 )
 from btc_bch_proxy.proxy.utils import fire_and_forget
 
@@ -364,7 +368,13 @@ class UpstreamConnection:
         if self._writer:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                # Use timeout to prevent indefinite hang if remote doesn't close gracefully
+                await asyncio.wait_for(
+                    self._writer.wait_closed(),
+                    timeout=UPSTREAM_DISCONNECT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.debug(f"Timeout waiting for {self.name} socket to close")
             except Exception as e:
                 logger.warning(f"Error closing connection to {self.name}: {e}")
 
@@ -562,12 +572,21 @@ class UpstreamConnection:
                     )
                     return False
 
+                # Validate extranonce1 length (typically 4-8 bytes = 8-16 hex chars)
+                # Very long values could indicate malicious/misconfigured pool
+                if len(self.extranonce1) > MAX_EXTRANONCE1_HEX_LENGTH:
+                    logger.error(
+                        f"Invalid extranonce1 from {self.name}: length {len(self.extranonce1)} "
+                        f"exceeds maximum {MAX_EXTRANONCE1_HEX_LENGTH} hex chars"
+                    )
+                    return False
+
                 # Validate extranonce2_size is reasonable (typically 2-8 bytes)
-                # Upper bound of 8 prevents memory issues with very large extranonce2 values
-                if not (1 <= self.extranonce2_size <= 8):
+                # Upper bound prevents memory issues with very large extranonce2 values
+                if not (1 <= self.extranonce2_size <= MAX_EXTRANONCE2_SIZE):
                     logger.error(
                         f"Invalid extranonce2_size from {self.name}: {self.extranonce2_size} "
-                        f"(expected 1-8)"
+                        f"(expected 1-{MAX_EXTRANONCE2_SIZE})"
                     )
                     return False
 
@@ -831,6 +850,13 @@ class UpstreamConnection:
                         if notifications:
                             async with self._pending_notifications_lock:
                                 for notif in notifications:
+                                    # Limit queue size to prevent unbounded growth
+                                    if len(self._pending_notifications) >= MAX_PENDING_NOTIFICATIONS:
+                                        logger.warning(
+                                            f"Pending notifications queue full ({MAX_PENDING_NOTIFICATIONS}), "
+                                            f"dropping oldest notification"
+                                        )
+                                        self._pending_notifications.pop(0)
                                     self._pending_notifications.append(notif)
                                     logger.debug(f"Queued notification: {notif.method}")
 

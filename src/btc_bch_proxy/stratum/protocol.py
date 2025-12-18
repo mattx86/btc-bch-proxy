@@ -130,11 +130,19 @@ class StratumProtocol:
                 # Convert dict with numeric keys to list: {"0": a, "1": b} -> [a, b]
                 try:
                     max_key = max(int(k) for k in params.keys()) + 1
-                    # DoS protection: limit max key to prevent huge sparse list allocation
-                    # Also check for sparse arrays: if we'd create many None entries, use values instead
                     num_entries = len(params)
-                    is_sparse = num_entries < max_key // 2  # More than half would be None
-                    if max_key > self.MAX_PARAMS_LIST_SIZE or is_sparse:
+                    # DoS protection: limit max key and prevent sparse arrays
+                    # Consider it sparse if:
+                    # - max_key exceeds limit, OR
+                    # - less than 75% of entries would be filled, OR
+                    # - more than 10 None entries would be created
+                    none_entries = max_key - num_entries
+                    is_sparse = (
+                        max_key > self.MAX_PARAMS_LIST_SIZE or
+                        num_entries < max_key * 0.75 or
+                        none_entries > 10
+                    )
+                    if is_sparse:
                         if max_key > self.MAX_PARAMS_LIST_SIZE:
                             logger.warning(
                                 f"Params dict max key {max_key} exceeds limit "
@@ -142,8 +150,8 @@ class StratumProtocol:
                             )
                         else:
                             logger.debug(
-                                f"Sparse params dict detected ({num_entries}/{max_key}), "
-                                f"using values only"
+                                f"Sparse params dict detected ({num_entries}/{max_key}, "
+                                f"{none_entries} null entries), using values only"
                             )
                         params = list(params.values())[:self.MAX_PARAMS_LIST_SIZE]
                     else:

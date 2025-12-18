@@ -29,12 +29,15 @@ from btc_bch_proxy.proxy.constants import (
     GRACE_PERIOD_EXTENSION,
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_MINER_STRING_LENGTH,
+    MAX_PENDING_NOTIFICATIONS,
+    MAX_WORKER_USERNAME_LENGTH,
     MINER_SEND_QUEUE_MAX_SIZE,
     MINER_WRITE_LOOP_TIMEOUT,
     POLL_SLEEP_INTERVAL,
     QUEUE_DRAIN_TIMEOUT,
     QUEUE_DRAIN_WRITE_TIMEOUT,
     SERVER_SWITCH_GRACE_PERIOD,
+    SESSION_ID_LENGTH,
     SHARE_SUBMIT_INITIAL_RETRY_DELAY,
     SHARE_SUBMIT_MAX_RETRY_DELAY,
     SHARE_SUBMIT_MAX_TOTAL_TIME,
@@ -199,9 +202,9 @@ class MinerSession:
         self.router = router
         self.config = config
 
-        # Use 12 hex chars (48 bits) for session ID to reduce collision probability
-        # With 48 bits, collision probability is ~1 in 1000 at 17 million sessions
-        self.session_id = uuid.uuid4().hex[:12]
+        # Use SESSION_ID_LENGTH hex chars for session ID to reduce collision probability
+        # With 48 bits (12 chars), collision probability is ~1 in 1000 at 17 million sessions
+        self.session_id = uuid.uuid4().hex[:SESSION_ID_LENGTH]
         self._protocol = StratumProtocol()
 
         # Session state
@@ -906,8 +909,11 @@ class MinerSession:
     async def _handle_authorize(self, msg: StratumRequest) -> None:
         """Handle mining.authorize from miner."""
         # Accept any credentials from miner (sanitize to prevent log injection)
+        # Use shorter limit for worker names than general miner strings
         if len(msg.params) >= 1:
-            self.worker_name = _sanitize_miner_string(str(msg.params[0]))
+            self.worker_name = _sanitize_miner_string(
+                str(msg.params[0]), max_length=MAX_WORKER_USERNAME_LENGTH
+            )
 
         logger.info(f"[{self.session_id}] Miner authorized as {self.worker_name}")
 
@@ -1581,6 +1587,13 @@ class MinerSession:
                     # 1. Not yet authorized (waiting for worker_name)
                     # 2. After pool switch, waiting for first difficulty
                     if not self.worker_name or self._awaiting_switch_difficulty:
+                        # Limit queue size to prevent unbounded growth
+                        if len(self._pending_notifications) >= MAX_PENDING_NOTIFICATIONS:
+                            logger.warning(
+                                f"[{self.session_id}] Pending notifications queue full "
+                                f"({MAX_PENDING_NOTIFICATIONS}), dropping oldest"
+                            )
+                            self._pending_notifications.pop(0)
                         self._pending_notifications.append(msg)
                         # Still track job for validation
                         self._validator.add_job_from_notify(msg.params, self._current_server)
@@ -1600,6 +1613,13 @@ class MinerSession:
 
                             if not self.worker_name:
                                 # Queue difficulty until after authorization
+                                # Limit queue size to prevent unbounded growth
+                                if len(self._pending_notifications) >= MAX_PENDING_NOTIFICATIONS:
+                                    logger.warning(
+                                        f"[{self.session_id}] Pending notifications queue full "
+                                        f"({MAX_PENDING_NOTIFICATIONS}), dropping oldest"
+                                    )
+                                    self._pending_notifications.pop(0)
                                 self._pending_notifications.append(msg)
                                 logger.debug(
                                     f"[{self.session_id}] Difficulty {pool_difficulty} queued "
