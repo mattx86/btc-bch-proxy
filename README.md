@@ -19,7 +19,7 @@ A cross-platform SHA-256 stratum proxy with time-based server routing. Automatic
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
 - **Connection health**: TCP keepalives and automatic reconnection on connection failures
-- **Worker difficulty override**: Per-worker minimum difficulty settings to combat vardiff-induced duplicate shares
+- **Automatic difficulty management**: Prevents vardiff-induced duplicate shares with +1000 buffer and highest-seen tracking
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
@@ -261,56 +261,22 @@ validation:
 - `reject_stale`: Prevents submitting shares for jobs that are no longer valid (reduces "stale job" rejections)
 - `validate_difficulty`: Validates that the share hash actually meets the difficulty target before submitting (CPU intensive, disabled by default)
 
-### Worker Settings (Optional)
+### Automatic Difficulty Management
 
-Configure per-worker difficulty overrides. Workers are identified by the username the miner uses when connecting to the proxy (via `mining.authorize`).
-
-This feature was implemented to combat pools' variable difficulty (vardiff) causing duplicate share rejections. When vardiff sets difficulty too low for fast miners, the miner may exhaust nonce space or submit shares faster than new jobs arrive, resulting in duplicates. By forcing a higher minimum difficulty, share submission rate is reduced and duplicates are minimized.
-
-```yaml
-workers:
-  - username: "miner1"
-    difficulty: 50000000         # Fixed minimum difficulty
-  - username: "miner2"
-    difficulty: "highest-seen"   # Lock to highest pool difficulty seen
-  - username: "miner3"
-    difficulty: "highest-seen-with-minimum"  # Combines highest-seen with a floor
-    minimum_difficulty: 10000000             # Required for highest-seen-with-minimum
-  - username: "miner4"
-    difficulty: "off"            # No override, use pool difficulty as-is
-```
-
-**Difficulty Modes:**
-
-| Mode | Description |
-|------|-------------|
-| Number (e.g., `50000000`) | Fixed minimum difficulty. Only applied if greater than pool's difficulty. |
-| `"highest-seen"` | Tracks the highest difficulty the pool has set and uses that. Prevents vardiff from lowering difficulty. |
-| `"highest-seen-with-minimum"` | Combines highest-seen ceiling with a minimum floor. Use with `minimum_difficulty` option (optional - falls back to highest-seen if not set). |
-| `"off"` | No override. Uses pool's difficulty as-is. |
+The proxy automatically manages difficulty to combat vardiff-induced duplicate share rejections. No configuration is required.
 
 **Behavior:**
-- **Fixed number**: Only applied if the configured value is **> the pool's difficulty**. If lower, the pool's difficulty is used.
-- **highest-seen**: Remembers the maximum pool difficulty seen during the session. Vardiff can increase difficulty but not decrease it. Resets on pool switch.
-- **highest-seen-with-minimum**: Uses the greater of `minimum_difficulty` or the highest pool difficulty seen. This provides a guaranteed floor (the minimum) while still allowing the pool to raise difficulty above it. If `minimum_difficulty` is not specified, behaves like "highest-seen" (with a warning logged).
-- **off**: Passes through pool difficulty unchanged.
+- When pool sets difficulty, proxy sends `(pool_difficulty + 1000)` to miner
+- Difficulty only increases, never decreases (highest-seen tracking)
+- Miner `mining.suggest_difficulty` requests are forwarded to pool unchanged
+- Difficulty resets on pool switch (new session with new pool)
 
-**Auto-adjustment (highest-seen and highest-seen-with-minimum only):**
-- **Low difficulty rejection**: If the pool rejects a share as "low difficulty" without having sent a difficulty update, the proxy automatically doubles the difficulty (`rejected_share_difficulty * 2`). This handles solo pools with per-job difficulty targets.
-- **Stale share rejection**: If the pool rejects a share as "stale" or "job not found", the proxy lowers difficulty by 1000 (as long as it stays above pool difficulty and `minimum_difficulty` if set). This helps the miner find shares faster to avoid stales.
+**Auto-adjustment:**
+- **Low difficulty rejection**: If pool rejects share as "low difficulty" (or similar), proxy raises difficulty to `(rejected_difficulty + 1000)` if that's higher than current
+- **Stale share rejection**: If pool rejects share as "stale" or "job not found", proxy lowers difficulty by 1000 (if still above pool difficulty)
+- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 50% of miner difficulty (if still > pool difficulty + 1000). This prevents excessive divergence from pool expectations.
 
-**Difficulty Suggestion to Pool:**
-When the proxy overrides difficulty (fixed or highest-seen), it sends `mining.suggest_difficulty` to the pool with the override value. This attempts to restore accurate hashrate reporting on the pool side. Pools may honor or ignore this suggestion.
-
-Additionally, when miners send their own `mining.suggest_difficulty` requests:
-- **With override active**: The proxy intercepts the miner's request and sends its own override value instead
-- **With "off" or no config**: The miner's request is forwarded to the pool unchanged
-
-**Note:** Forcing a higher difficulty (via fixed number or highest-seen) will cause the pool to report a lower hashrate for the worker. This is because the pool calculates hashrate based on its own difficulty setting, not the override. Your actual hashrate and earnings are unaffected.
-
-**Use case:** Force higher difficulty for powerful miners to reduce share submission frequency and duplicate share rejections without changing pool settings.
-
-**Suggestion:** For fixed difficulty, set the override to at least the pool's initial/minimum difficulty + 1000. For example, if the pool starts workers at difficulty 10000, set the override to 11000 or higher. Adjust based on observed duplicate rejection rates.
+**Note:** This automatic +1000 buffer prevents most vardiff-induced duplicate rejections while keeping the miner working at a difficulty close to what the pool expects.
 
 ## Statistics
 

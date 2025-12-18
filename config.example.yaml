@@ -65,18 +65,9 @@ validation:
   share_cache_ttl: 300            # Share cache TTL in seconds
   job_cache_size: 10              # Max jobs to track per session
 
-# Per-worker settings (optional)
-# Workers are identified by the username the miner uses to connect to the proxy.
-# Difficulty modes:
-#   - number: Fixed minimum difficulty (only applied if > pool difficulty)
-#   - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
-#   - "off": No override, use pool difficulty as-is
-# NOTE: Forcing higher difficulty will cause the pool to report lower worker hashrate
-#       (pool calculates hashrate using its difficulty, not the override).
-# workers:
-#   - username: "miner1"          # Username the miner uses to connect
-#     difficulty: 50000000         # Fixed minimum difficulty
-#   - username: "miner2"
-#     difficulty: "highest-seen"  # Lock to highest pool difficulty seen
-#   - username: "miner3"
-#     difficulty: "off"           # No override
+# Automatic difficulty management (no configuration required):
+# - Proxy sends (pool_difficulty + 1000) to miner to prevent vardiff duplicates
+# - Difficulty only increases, never decreases (highest-seen tracking)
+# - Miner mining.suggest_difficulty requests are forwarded to pool unchanged
+# - On low-difficulty rejection: raises to (rejected_diff + 1000) if higher
+# - On stale share rejection: lowers by 1000 (if still above pool difficulty)

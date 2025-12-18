@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import time
-from typing import ClassVar, List, Literal, Optional, Union
+from typing import ClassVar, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -259,62 +259,6 @@ class ValidationConfig(BaseModel):
     )
 
 
-class WorkerConfig(BaseModel):
-    """Configuration for per-worker settings."""
-
-    username: str = Field(..., description="Worker username to match")
-    # Difficulty can be:
-    # - int: Fixed minimum difficulty (only applied if > pool difficulty)
-    # - "highest-seen": Use highest pool difficulty seen (prevents vardiff lowering)
-    # - "highest-seen-with-minimum": Combines highest-seen ceiling with a minimum floor
-    # - "off": No override, use pool difficulty as-is
-    difficulty: Union[int, Literal["highest-seen", "highest-seen-with-minimum", "off"]] = Field(
-        ..., description="Difficulty override mode: number, 'highest-seen', 'highest-seen-with-minimum', or 'off'"
-    )
-    # Minimum difficulty floor (required when difficulty is "highest-seen-with-minimum")
-    # The effective difficulty is max(minimum_difficulty, highest_seen_pool_difficulty)
-    minimum_difficulty: Optional[int] = Field(
-        default=None, description="Minimum difficulty floor for 'highest-seen-with-minimum' mode"
-    )
-
-    @field_validator("username")
-    @classmethod
-    def validate_username(cls, v: str) -> str:
-        """Validate username is not empty."""
-        if not v or not v.strip():
-            raise ValueError("Worker username cannot be empty")
-        return v.strip()
-
-    @field_validator("difficulty")
-    @classmethod
-    def validate_difficulty(cls, v: Union[int, str]) -> Union[int, str]:
-        """Validate difficulty value."""
-        if isinstance(v, int):
-            if v < 1:
-                raise ValueError("Difficulty must be >= 1")
-            return v
-        if isinstance(v, str):
-            v_lower = v.lower().strip()
-            if v_lower not in ("highest-seen", "highest-seen-with-minimum", "off"):
-                raise ValueError(
-                    f"Invalid difficulty mode '{v}'. "
-                    f"Must be a number, 'highest-seen', 'highest-seen-with-minimum', or 'off'"
-                )
-            return v_lower
-        raise ValueError(
-            f"Invalid difficulty type: {type(v).__name__}. Must be int or string"
-        )
-
-    @field_validator("minimum_difficulty")
-    @classmethod
-    def validate_minimum_difficulty(cls, v: Optional[int]) -> Optional[int]:
-        """Validate minimum_difficulty value."""
-        if v is not None and v < 1:
-            raise ValueError("minimum_difficulty must be >= 1")
-        return v
-
-
-
 class Config(BaseModel):
     """Main configuration model."""
 
@@ -324,7 +268,6 @@ class Config(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
-    workers: List[WorkerConfig] = Field(default_factory=list, description="Per-worker settings")
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
@@ -447,34 +390,3 @@ class Config(BaseModel):
     def get_server_names(self) -> List[str]:
         """Get list of all server names."""
         return [s.name for s in self.servers]
-
-    def get_worker_difficulty(self, username: str) -> Optional[Union[int, str]]:
-        """
-        Get configured difficulty for a worker, if defined.
-
-        Returns:
-            - int: Fixed minimum difficulty
-            - "highest-seen": Use highest pool difficulty seen
-            - "highest-seen-with-minimum": Combines highest-seen with a minimum floor
-            - "off": No override
-            - None: No config for this worker
-        """
-        for worker in self.workers:
-            if worker.username == username:
-                return worker.difficulty
-        return None
-
-    def get_worker_minimum_difficulty(self, username: str) -> Optional[int]:
-        """
-        Get configured minimum_difficulty for a worker, if defined.
-
-        Used with "highest-seen-with-minimum" mode to provide a floor.
-
-        Returns:
-            - int: Minimum difficulty floor
-            - None: No minimum configured
-        """
-        for worker in self.workers:
-            if worker.username == username:
-                return worker.minimum_difficulty
-        return None
