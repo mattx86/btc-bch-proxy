@@ -2468,6 +2468,12 @@ class MinerSession:
                 StratumMethods.MINING_SET_EXTRANONCE,
             ):
                 if msg.method == StratumMethods.MINING_NOTIFY:
+                    # Log raw params for debugging (especially for zkSNARK)
+                    if self.algorithm == "zksnark":
+                        logger.info(
+                            f"[{self.session_id}] Raw mining.notify params ({len(msg.params)}): "
+                            f"{msg.params[:6] if len(msg.params) >= 6 else msg.params}"
+                        )
                     # Queue job if:
                     # 1. Not yet authorized (waiting for worker_name)
                     # 2. After pool switch, waiting for first difficulty
