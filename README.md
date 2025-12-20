@@ -7,23 +7,23 @@ A cross-platform cryptocurrency stratum proxy with time-based server routing. Au
 **Supported Algorithms:**
 - **SHA-256**: Bitcoin (BTC), Bitcoin Cash (BCH), DigiByte (DGB), and other SHA-256 coins
 - **RandomX**: Monero (XMR) and other RandomX coins
-- **zkSNARK**: ALEO
+- **zkSNARK**: ALEO and other zkSNARK coins
 
 ## Features
 
-- **Multi-coin support**: SHA-256 (BTC/BCH), RandomX (XMR), and ALEO with per-server coin type configuration
-- **Time-based routing**: Automatically switch between stratum servers on a schedule
-- **Multiple miners**: Support for concurrent miner connections
-- **Failover**: Configurable retry period (default 20 min) before failing over to backup server
-- **Graceful switching**: Waits for pending share submissions before switching servers
+- **Multi-coin support**: SHA-256 (BTC/BCH), RandomX (XMR), and zkSNARK (ALEO) with per-algorithm proxy ports
+- **Time-based routing**: Automatically switch between stratum servers on a schedule (configured per-server)
+- **Multiple miners**: Support for concurrent miner connections (default 1024 per algorithm)
+- **Circuit breaker**: Automatic failure handling with configurable thresholds and recovery
+- **Graceful switching**: Waits for pending share submissions before switching servers, with grace period for in-flight work
 - **Cross-platform**: Runs on Windows and Linux
 - **Background mode**: Run as a daemon/background service
 - **Config validation**: Detects overlapping timeframes and invalid configurations at startup
 - **Statistics**: Tracks accepts/rejects per pool with periodic logging (every 15 min)
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
-- **Connection health**: TCP keepalives and automatic reconnection on connection failures
-- **Automatic difficulty management**: Coin-specific difficulty buffers with highest-seen tracking
+- **Connection health**: TCP keepalives, upstream health monitoring, and automatic reconnection
+- **Adaptive difficulty management**: Automatic buffer adjustment, share rate monitoring, and per-server overrides
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
@@ -78,7 +78,7 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
    ```yaml
    proxy:
      global:
-       max_connections: 100
+       max_connections: 1024
      sha256:
        enabled: true
        bind_host: "0.0.0.0"
@@ -92,6 +92,8 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
          port: 3333
          username: "your_wallet.worker1"
          password: "x"
+         start: "00:00"        # Schedule start time
+         end: "12:00"          # Schedule end time
 
        - name: "bch"
          enabled: true
@@ -99,16 +101,8 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
          port: 3333
          username: "your_wallet.worker1"
          password: "x"
-
-   schedule:
-     sha256:
-       - server: "btc"
-         start: "00:00"
-         end: "12:00"
-
-       - server: "bch"
          start: "12:00"
-         end: "24:00"
+         end: "24:00"          # Use 24:00 for end of day
    ```
 
 3. **Validate the configuration:**
@@ -180,43 +174,65 @@ Options:
 proxy:
   # Global settings shared by all algorithms
   global:
-    max_connections: 100        # Maximum concurrent miner connections
-    connection_timeout: 60      # Miner connection timeout (seconds)
-    miner_read_timeout: 600     # Miner read timeout (seconds, default 10 min)
-    send_timeout: 30            # Send to miner timeout (seconds)
-    pending_shares_timeout: 10  # Wait for pending shares during switch (seconds)
-    tcp_keepalive: true         # Enable TCP keepalive on connections
-    keepalive_idle: 60          # Seconds before sending keepalive probes
-    keepalive_interval: 10      # Seconds between keepalive probes
-    keepalive_count: 3          # Failed probes before connection is dead
-    share_submit_retries: 3     # Retries for failed share submissions
-    upstream_health_timeout: 300  # Seconds without upstream messages before reconnecting
-
-  # Failover settings
-  failover:
-    retry_timeout_minutes: 20   # Retry primary server for this long before failover
+    max_connections: 1024         # Maximum concurrent miner connections
+    miner_read_timeout: 180       # Miner read timeout (seconds, default 3 min)
+    miner_write_timeout: 30       # Miner write timeout (seconds)
+    upstream_idle_timeout: 300    # Seconds without upstream messages before reconnecting
+    server_switch_timeout: 900    # Seconds to retry connecting to new server during switch (15 min)
+    tcp_keepalive: true           # Enable TCP keepalive on connections
+    keepalive_idle: 60            # Seconds before sending keepalive probes
+    keepalive_interval: 10        # Seconds between keepalive probes
+    keepalive_count: 3            # Failed probes before connection is dead
+    share_submit_retries: 3       # Retries for failed share submissions
+    pending_shares_timeout: 10    # Wait for pending shares during switch (seconds)
 
   # Share validation settings
   validation:
-    reject_duplicates: true     # Reject duplicate share submissions
-    reject_stale: true          # Reject shares for stale/unknown jobs
-    validate_difficulty: false  # Validate share hash meets difficulty (CPU intensive)
+    reject_duplicates: true       # Reject duplicate share submissions
+    reject_stale: true            # Reject shares for stale/unknown jobs
+    share_cache_size: 1000        # Max recent shares to track per session
+    share_cache_ttl: 300          # Share cache TTL in seconds
+    job_cache_size: 10            # Max jobs to track per session
+
+  # Difficulty management settings
+  difficulty:
+    change_cooldown: 30           # Minimum seconds between difficulty changes
+    decay_enabled: true           # Enable gradual decay toward pool difficulty
+    decay_interval: 300           # Seconds between decay checks (5 min)
+    decay_percent: 0.05           # Decay percentage per interval (5%)
+    floor_trigger_ratio: 0.50     # Trigger floor-reset when pool < 50% of miner difficulty
+    floor_reset_ratio: 0.75       # Reset to 75% of current miner difficulty
+    share_rate_window: 300        # Window in seconds to track share rate
+    share_rate_min_shares: 3      # Minimum shares needed before analyzing rate
+    share_rate_low_multiplier: 0.5  # Lower difficulty if rate drops to this fraction
+    buffer_start: 0.05            # Starting buffer percentage (5%)
+    buffer_min: 0.02              # Minimum buffer percentage (2%)
+    buffer_max: 0.20              # Maximum buffer percentage (20%)
+    buffer_increase_step: 0.01    # Buffer increase step on rejection (1%)
+    buffer_decrease_interval: 3600  # Seconds without rejection before decreasing buffer
+
+  # Circuit breaker - stop trying failed pools temporarily
+  circuit_breaker:
+    enabled: true                 # Enable circuit breaker pattern
+    failure_threshold: 5          # Failures before opening circuit
+    recovery_timeout: 60          # Seconds to wait before retry
+    success_threshold: 2          # Successes needed to close circuit
 
   # Per-algorithm settings (each algorithm runs on its own port)
   sha256:
-    enabled: true               # Enable SHA-256 proxy
-    bind_host: "0.0.0.0"        # Address to listen on
-    bind_port: 3333             # Port for SHA-256 miners
+    enabled: true                 # Enable SHA-256 proxy
+    bind_host: "0.0.0.0"          # Address to listen on
+    bind_port: 3333               # Port for SHA-256 miners
 
   randomx:
-    enabled: false              # Enable RandomX proxy
+    enabled: false                # Enable RandomX proxy
     bind_host: "0.0.0.0"
-    bind_port: 3334             # Port for RandomX miners
+    bind_port: 3334               # Port for RandomX miners
 
-  aleo:
-    enabled: false              # Enable ALEO proxy
+  zksnark:
+    enabled: false                # Enable zkSNARK (ALEO) proxy
     bind_host: "0.0.0.0"
-    bind_port: 3335             # Port for ALEO miners
+    bind_port: 3335               # Port for zkSNARK miners
 ```
 
 **Keepalive Settings:**
@@ -230,25 +246,34 @@ The proxy automatically applies socket optimizations for low-latency stratum com
 **Share Retry Settings:**
 When a share submission fails due to transient errors (timeouts, connection issues), the proxy will retry up to `share_submit_retries` times with exponential backoff. Explicit pool rejections (duplicate, stale, low difficulty) are not retried.
 
-**Upstream Health Timeout:**
-The proxy monitors connection health by tracking when the last message was received from the upstream pool. Pools typically send `mining.notify` messages every 30-60 seconds. If no messages are received for `upstream_health_timeout` seconds (default 300), the connection is considered unhealthy and will be reconnected. This detects zombie connections that TCP keepalive may not catch.
+**Upstream Idle Timeout:**
+The proxy monitors connection health by tracking when the last message was received from the upstream pool. Pools typically send `mining.notify` messages every 30-60 seconds. If no messages are received for `upstream_idle_timeout` seconds (default 300), the connection is considered unhealthy and will be reconnected. This detects zombie connections that TCP keepalive may not catch.
+
+**Circuit Breaker:**
+The circuit breaker pattern prevents repeated connection attempts to failed pools. After `failure_threshold` consecutive failures, the circuit "opens" and the proxy stops trying that pool for `recovery_timeout` seconds. After the timeout, the circuit enters "half-open" state and allows test connections. After `success_threshold` successful connections, the circuit "closes" and normal operation resumes.
 
 ### Server Settings
 
-Servers are organized by algorithm:
+Servers are organized by algorithm, with schedule times embedded in each server:
 
 ```yaml
 servers:
   sha256:
-    - name: "unique_name"     # Unique identifier for this server
-      enabled: true           # Enable/disable this server
+    - name: "unique_name"       # Unique identifier for this server
+      enabled: true             # Enable/disable this server
       host: "pool.example.com"
       port: 3333
       username: "wallet.worker"
       password: "x"
-      ssl: false              # Use SSL/TLS connection
-      timeout: 30             # Connection timeout (seconds)
-      retry_interval: 5       # Seconds between reconnection attempts
+      ssl: false                # Use SSL/TLS connection
+      connect_timeout: 30       # Connection timeout (seconds)
+      retry_interval: 5         # Seconds between reconnection attempts
+      start: "00:00"            # Schedule start time (HH:MM)
+      end: "12:00"              # Schedule end time (HH:MM, use 24:00 for midnight)
+      # Per-server difficulty overrides (optional)
+      # buffer_percent: 0.10    # Override global buffer (e.g., 10% for this pool)
+      # min_difficulty: 1000    # Minimum difficulty for this pool
+      # max_difficulty: 1000000 # Maximum difficulty for this pool
 
   randomx:
     - name: "xmr_pool"
@@ -257,39 +282,58 @@ servers:
       port: 3333
       username: "wallet_address"
       password: "x"
+      start: "00:00"
+      end: "24:00"              # Run 24/7 on this pool
+
+  zksnark:
+    - name: "aleo_pool"
+      enabled: true
+      host: "aleo.pool.com"
+      port: 3335
+      username: "wallet_address"
+      password: "x"
+      start: "00:00"
+      end: "24:00"
 ```
 
 **Algorithm Types:**
-| Algorithm | Coins | Difficulty Buffer |
-|-----------|-------|-------------------|
-| `sha256` | Bitcoin, Bitcoin Cash, DigiByte | Fixed +1000 |
-| `randomx` | Monero (XMR) | 5% of pool difficulty |
-| `aleo` | ALEO | 5% of pool difficulty |
+| Algorithm | Coins | Default Buffer |
+|-----------|-------|----------------|
+| `sha256` | Bitcoin, Bitcoin Cash, DigiByte | 5% (adaptive) |
+| `randomx` | Monero (XMR) | 5% (adaptive) |
+| `zksnark` | ALEO | 5% (adaptive) |
 
-**Note:** Hash validation (`validate_difficulty`) is only supported for SHA-256 coins. For other algorithms, this setting is automatically disabled.
+**Per-Server Difficulty Overrides:**
+Each server can override the global difficulty settings:
+- `buffer_percent`: Override the buffer percentage (0.01-0.50)
+- `min_difficulty`: Set a minimum difficulty floor
+- `max_difficulty`: Set a maximum difficulty ceiling
 
 ### Schedule Settings
 
-Schedules are organized by algorithm:
+Schedules are configured directly on each server using `start` and `end` fields:
 
 ```yaml
-schedule:
+servers:
   sha256:
-    - server: "server_name"   # Server to use during this period
+    - name: "pool1"
+      # ... other settings ...
       start: "00:00"          # Start time (HH:MM)
-      end: "12:00"            # End time (HH:MM, use 24:00 for midnight)
+      end: "12:00"            # End time (HH:MM)
 
-  randomx:
-    - server: "xmr_pool"
-      start: "00:00"
-      end: "24:00"            # Run 24/7 on this pool
+    - name: "pool2"
+      # ... other settings ...
+      start: "12:00"
+      end: "24:00"            # Use 24:00 for end of day
 ```
 
 **Notes:**
 - Times are in 24-hour format (local time)
-- Use `24:00` to represent end of day
+- Use `24:00` to represent end of day (midnight)
 - Timeframes must not overlap within each algorithm
-- All servers referenced in schedule must be defined in the same algorithm's `servers` section
+- Schedules must cover all 24 hours (no gaps allowed)
+- End time is exclusive: schedule "00:00-12:00" includes 11:59:59 but not 12:00:00
+- Midnight crossover is supported (e.g., "22:00" to "02:00")
 
 ### Logging Settings
 
@@ -304,21 +348,37 @@ logging:
 
 ### Automatic Difficulty Management
 
-The proxy automatically manages difficulty to combat vardiff-induced duplicate share rejections. No configuration is required.
+The proxy automatically manages difficulty to combat vardiff-induced duplicate share rejections. All settings are configurable but work well with defaults.
 
-**Behavior:**
+**Core Behavior:**
 - When pool sets difficulty, proxy sends `(pool_difficulty + buffer)` to miner
-- Buffer is algorithm-specific: +1000 for SHA-256, +5% for RandomX/ALEO
-- Difficulty only increases, never decreases (highest-seen tracking)
+- Buffer starts at 5% and adapts based on rejection patterns (range: 2%-20%)
+- Difficulty only increases normally (highest-seen tracking)
 - Miner `mining.suggest_difficulty` requests are forwarded to pool unchanged
 - Difficulty resets on pool switch (new session with new pool)
 
-**Auto-adjustment:**
-- **Low difficulty rejection**: If pool rejects share as "low difficulty" (or similar), proxy raises difficulty to `(rejected_difficulty + buffer)` if that's higher than current
-- **Stale share rejection**: If pool rejects share as "stale" or "job not found", proxy lowers difficulty by buffer (if still above pool difficulty)
-- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 75% of miner difficulty (25% reduction) if still > pool difficulty + buffer. This prevents excessive divergence from pool expectations.
+**Adaptive Buffer:**
+- Starts at `buffer_start` (default 5%)
+- Increases by `buffer_increase_step` (1%) after each low-difficulty rejection
+- Decreases by `buffer_increase_step` after `buffer_decrease_interval` (1 hour) without rejections
+- Stays within `buffer_min` (2%) and `buffer_max` (20%) bounds
 
-**Note:** The automatic difficulty buffer prevents most vardiff-induced duplicate rejections while keeping the miner working at a difficulty close to what the pool expects.
+**Auto-adjustment:**
+- **Low difficulty rejection**: If pool rejects share as "low difficulty", proxy raises difficulty to `(rejected_difficulty + buffer)` and increases adaptive buffer
+- **Floor-reset**: If pool difficulty drops below `floor_trigger_ratio` (50%) of miner difficulty, proxy resets to `floor_reset_ratio` (75%) of miner difficulty
+- **Time-based decay**: Every `decay_interval` (5 min), difficulty decays by `decay_percent` (5%) toward pool+buffer if above target
+- **Cooldown**: Changes are rate-limited to once per `change_cooldown` (30s) except for low-diff rejections
+
+**Share Rate Monitoring:**
+- Tracks share submission rate over `share_rate_window` (5 min)
+- Learns a baseline share rate from initial mining
+- If rate drops below `share_rate_low_multiplier` (50%) of baseline, lowers difficulty (may indicate difficulty is too high)
+
+**Per-Server Overrides:**
+Configure different settings per pool using server-level options:
+- `buffer_percent`: Override the adaptive buffer for this pool
+- `min_difficulty`: Set a minimum difficulty floor
+- `max_difficulty`: Set a maximum difficulty ceiling
 
 ## Statistics
 
@@ -377,7 +437,8 @@ Server: pool2
 2. Proxy authenticates with upstream pools using configured credentials
 3. At scheduled times, proxy switches all miners to the new pool
 4. Pending share submissions complete before switching
-5. Miners receive new job notifications automatically
+5. A grace period allows in-flight work from the old pool to be submitted
+6. Miners receive new job notifications automatically
 
 ## Use Cases
 
