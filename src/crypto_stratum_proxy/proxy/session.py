@@ -924,12 +924,18 @@ class MinerSession:
         logger.debug(f"{self._log_prefix} Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
             logger.info(f"{self._log_prefix} Miner request: {msg.method}")
-            if msg.method == StratumMethods.MINING_CONFIGURE:
+            # Handle Monero 'login' for RandomX miners (XMRig uses this instead of subscribe)
+            if msg.method == "login" and self.algorithm == "randomx":
+                await self._handle_monero_login(msg)
+            elif msg.method == StratumMethods.MINING_CONFIGURE:
                 await self._handle_configure(msg)
             elif msg.method == StratumMethods.MINING_SUBSCRIBE:
                 await self._handle_subscribe(msg)
             elif msg.method == StratumMethods.MINING_AUTHORIZE:
                 await self._handle_authorize(msg)
+            elif msg.method == "submit" and self.algorithm == "randomx":
+                # Handle Monero 'submit' (XMRig uses this instead of mining.submit)
+                await self._handle_monero_submit(msg)
             elif msg.method == StratumMethods.MINING_SUBMIT:
                 if self.algorithm == "sha256":
                     await self._handle_submit_sha256(msg)
@@ -2587,6 +2593,196 @@ class MinerSession:
             priority=MessagePriority.HIGH,
         )
 
+    async def _handle_monero_login(self, msg: StratumRequest) -> None:
+        """
+        Handle Monero 'login' from miner (XMRig uses this instead of subscribe+authorize).
+
+        Login params is a dict with: login, pass, agent, algo, rigid
+        We respond with: {id: session_id, job: {...}, status: "OK"}
+
+        Args:
+            msg: The login request from miner.
+        """
+        params = msg.params
+        if isinstance(params, list) and len(params) > 0:
+            params = params[0]
+
+        if not isinstance(params, dict):
+            error = {"code": -1, "message": "Invalid login params"}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        # Extract worker info
+        login = params.get("login", "")
+        agent = params.get("agent", "")
+        rigid = params.get("rigid", "")
+
+        # Extract worker name from login (wallet.worker format) or rigid
+        if rigid:
+            self.worker_name = _sanitize_miner_string(rigid, max_length=MAX_WORKER_USERNAME_LENGTH)
+        elif "." in login:
+            # Extract worker part after last dot
+            worker_part = login.rsplit(".", 1)[-1]
+            self.worker_name = _sanitize_miner_string(worker_part, max_length=MAX_WORKER_USERNAME_LENGTH)
+        else:
+            self.worker_name = _sanitize_miner_string(login[:32], max_length=MAX_WORKER_USERNAME_LENGTH)
+
+        self.user_agent = _sanitize_miner_string(agent) if agent else None
+
+        # Update validator's log prefix with full context
+        self._validator.set_log_prefix(self._log_prefix)
+
+        logger.info(f"{self._log_prefix} Miner logged in (Monero protocol)")
+
+        # Record worker for stats tracking
+        if self.worker_name:
+            stats = ProxyStats.get_instance()
+            await stats.record_worker_authorized(self.session_id, self.worker_name)
+
+        # Mark as subscribed and authorized
+        self._subscribed = True
+        self._authorized = True
+
+        # Get initial job from upstream
+        initial_job = None
+        if self._upstream:
+            initial_job = self._upstream.get_monero_initial_job()
+            if initial_job:
+                self._validator.add_job_from_monero(initial_job, self._current_server)
+
+        # Build Monero login response
+        # Use the upstream's Monero session ID for the response
+        session_id = self._upstream.monero_session_id if self._upstream else self.session_id
+
+        result = {
+            "id": session_id,
+            "status": "OK",
+        }
+        if initial_job:
+            result["job"] = initial_job
+
+        await self._send_to_miner(
+            self._protocol.build_response(msg.id, result),
+            priority=MessagePriority.HIGH,
+        )
+
+        logger.debug(f"{self._log_prefix} Sent login response with job")
+
+    async def _handle_monero_submit(self, msg: StratumRequest) -> None:
+        """
+        Handle Monero 'submit' from miner (XMRig uses this instead of mining.submit).
+
+        Submit params is a dict with: id, job_id, nonce, result
+        We respond with: {status: "OK"} on success or error
+
+        Args:
+            msg: The submit request from miner.
+        """
+        # Common precondition checks
+        if await self._reject_share_if_closing(msg.id):
+            return
+        if await self._reject_share_if_switching(msg.id):
+            return
+        await self._cleanup_expired_grace_period()
+        if await self._reject_share_if_not_connected(msg.id):
+            return
+
+        params = msg.params
+        if isinstance(params, list) and len(params) > 0:
+            params = params[0]
+
+        if not isinstance(params, dict):
+            error = {"code": -1, "message": "Invalid submit params"}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        job_id = str(params.get("job_id", ""))
+        nonce = str(params.get("nonce", ""))
+        result_hash = str(params.get("result", ""))
+
+        if not job_id or not nonce or not result_hash:
+            error = {"code": -1, "message": "Missing job_id, nonce, or result"}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        logger.debug(f"{self._log_prefix} Monero submit: job={job_id}, nonce={nonce}")
+
+        # Record share for rate monitoring
+        self._record_share_for_rate_monitoring()
+        await self._check_share_rate_and_adjust()
+
+        # Validate share locally
+        valid, reject_reason = self._validator.validate_randomx_share(job_id, nonce)
+        if not valid:
+            error = {"code": -1, "message": reject_reason or "Invalid share"}
+            logger.debug(f"{self._log_prefix} Share rejected locally: {reject_reason}")
+            stats = ProxyStats.get_instance()
+            fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason or "validation failed"))
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        # Submit to upstream
+        current_upstream = self._upstream
+        if not current_upstream or not current_upstream.connected:
+            error = {"code": -1, "message": "Upstream not connected"}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        accepted, upstream_error, bundled_notifications = await current_upstream.submit_share_monero(
+            job_id, nonce, result_hash
+        )
+
+        # Process any notifications bundled with the response
+        if bundled_notifications:
+            for notification in bundled_notifications:
+                await self._handle_upstream_message(notification)
+
+        # Record stats
+        stats = ProxyStats.get_instance()
+        if accepted:
+            logger.info(f"{self._log_prefix} Share accepted: job={job_id}, nonce={nonce}")
+            fire_and_forget(stats.record_share_accepted(self._current_server))
+            self._validator.record_accepted_randomx_share(job_id, nonce)
+            self._update_adaptive_buffer(increase=False)
+
+            # Respond with Monero success format
+            result = {"status": "OK"}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, result),
+                priority=MessagePriority.HIGH,
+            )
+        else:
+            reason = _get_error_message(upstream_error)
+            logger.warning(f"{self._log_prefix} Share rejected: {reason}")
+            fire_and_forget(stats.record_share_rejected(self._current_server, reason))
+
+            await self._handle_low_difficulty_rejection(reason)
+
+            if reason and "duplicate" in reason.lower():
+                self._validator.record_accepted_randomx_share(job_id, nonce)
+
+            # Respond with Monero error format
+            error = {"code": -1, "message": reason}
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, None, error),
+                priority=MessagePriority.HIGH,
+            )
+
     async def _handle_monero_job_notification(self, msg: StratumNotification) -> None:
         """
         Handle a Monero 'job' notification from the pool.
@@ -2628,36 +2824,20 @@ class MinerSession:
 
     async def _send_monero_job_to_miner(self, job_data: dict) -> None:
         """
-        Send a Monero job to the miner in standard mining.notify format.
+        Send a Monero job to the miner in Monero 'job' notification format.
 
-        Converts Monero job format to standard stratum mining.notify so miners
-        using standard stratum clients can work with Monero pools.
-
-        Monero job format:
-            {blob, job_id, target, seed_hash, algo, height, ...}
-
-        Standard mining.notify format for RandomX:
-            [job_id, blob, target, height, seed_hash, clean_jobs]
+        XMRig and other Monero miners expect 'job' notifications with dict params,
+        not standard stratum 'mining.notify' with list params.
 
         Args:
-            job_data: Monero job dict from pool.
+            job_data: Monero job dict from pool (passed through as-is).
         """
         job_id = job_data.get("job_id", "")
-        blob = job_data.get("blob", "")
-        target = job_data.get("target", "")
-        seed_hash = job_data.get("seed_hash", "")
-        height = job_data.get("height", 0)
 
-        # Determine clean_jobs - some pools set this explicitly
-        # Default to True on new jobs to be safe
-        clean_jobs = job_data.get("clean_jobs", True)
-
-        # Build standard mining.notify params for RandomX
-        notify_params = [job_id, blob, target, height, seed_hash, clean_jobs]
-
+        # Send job notification in Monero format (method="job", params=dict)
         notification = StratumNotification(
-            method=StratumMethods.MINING_NOTIFY,
-            params=notify_params,
+            method="job",
+            params=job_data,  # Pass the job dict directly
         )
 
         data = StratumProtocol.encode_message(notification)
