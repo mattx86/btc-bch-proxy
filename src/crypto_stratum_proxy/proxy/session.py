@@ -491,22 +491,37 @@ class MinerSession:
                 server_config, self.config.proxy.global_, self.session_id
             )
 
-            # Attempt full handshake: connect -> configure -> subscribe -> authorize
+            # Attempt full handshake: connect -> configure -> subscribe/login -> authorize
             connected = await new_upstream.connect()
             if connected:
-                await new_upstream.configure()
-                subscribed = await new_upstream.subscribe()
-                if subscribed:
-                    authorized = await new_upstream.authorize()
-                    if authorized:
+                # For RandomX/Monero, use login (combines subscribe+authorize)
+                if self.algorithm == "randomx":
+                    # Monero pools use login instead of subscribe+authorize
+                    success, initial_job = await new_upstream.login_monero(
+                        worker_name=self.worker_name,
+                    )
+                    if success:
                         # SUCCESS - new server is fully ready!
+                        # Store initial job for later processing
                         break
                     else:
                         await new_upstream.disconnect()
                         new_upstream = None
                 else:
-                    await new_upstream.disconnect()
-                    new_upstream = None
+                    # Standard stratum: configure -> subscribe -> authorize
+                    await new_upstream.configure()
+                    subscribed = await new_upstream.subscribe()
+                    if subscribed:
+                        authorized = await new_upstream.authorize()
+                        if authorized:
+                            # SUCCESS - new server is fully ready!
+                            break
+                        else:
+                            await new_upstream.disconnect()
+                            new_upstream = None
+                    else:
+                        await new_upstream.disconnect()
+                        new_upstream = None
             else:
                 new_upstream = None
 
@@ -599,6 +614,9 @@ class MinerSession:
             self._upstream = new_upstream
             self._current_server = server_name
 
+            # Update upstream's log prefix now that we have full context
+            new_upstream.set_log_prefix(self._log_prefix)
+
             # Load per-server difficulty overrides
             self._server_buffer_percent = server_config.buffer_percent
             self._server_min_difficulty = server_config.min_difficulty
@@ -611,6 +629,10 @@ class MinerSession:
 
             elapsed = time.time() - start_time
             logger.info(f"{self._log_prefix} Connected to upstream (after {int(elapsed)}s)")
+
+            # Note: For RandomX/Monero, the initial job from login response is NOT sent here.
+            # It will be sent when the miner subscribes (in _handle_subscribe), because
+            # we can't send jobs until the miner has completed the subscription handshake.
 
             # Record success for circuit breaker
             circuit_breaker.record_success(server_name)
@@ -973,14 +995,25 @@ class MinerSession:
             if self._upstream.extranonce2_size is not None:
                 self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
 
+            # For RandomX/Monero, extranonce values aren't used - provide placeholders
+            # Monero pools use the 'login' method which doesn't return extranonce values
+            if self.algorithm == "randomx":
+                # Monero miners don't use extranonce, but we need to respond
+                # with valid-looking values for protocol compatibility
+                extranonce1 = ""
+                extranonce2_size = 0
+            else:
+                extranonce1 = self._upstream.extranonce1
+                extranonce2_size = self._upstream.extranonce2_size
+
             # Send response with upstream's extranonce values
             result = [
                 [
                     ["mining.set_difficulty", self.session_id],
                     ["mining.notify", self.session_id],
                 ],
-                self._upstream.extranonce1,
-                self._upstream.extranonce2_size,
+                extranonce1,
+                extranonce2_size,
             ]
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, result)
@@ -990,13 +1023,21 @@ class MinerSession:
 
             # Forward any notifications received during upstream handshake
             # These must be sent AFTER the subscribe response
-            pending = await self._upstream.get_pending_notifications()
-            if pending:
-                logger.info(
-                    f"{self._log_prefix} Forwarding {len(pending)} queued notifications to miner"
-                )
-                for notification in pending:
-                    await self._handle_upstream_message(notification)
+            # For RandomX, also check for initial Monero job
+            if self.algorithm == "randomx":
+                # Get initial job from Monero login if available
+                initial_job = self._upstream.get_monero_initial_job()
+                if initial_job:
+                    self._validator.add_job_from_monero(initial_job, self._current_server)
+                    await self._send_monero_job_to_miner(initial_job)
+            else:
+                pending = await self._upstream.get_pending_notifications()
+                if pending:
+                    logger.info(
+                        f"{self._log_prefix} Forwarding {len(pending)} queued notifications to miner"
+                    )
+                    for notification in pending:
+                        await self._handle_upstream_message(notification)
         else:
             # No upstream connected yet
             error = [20, "Upstream not available", None]
@@ -2352,9 +2393,9 @@ class MinerSession:
             return
 
         # Monero submit params: [worker_name, job_id, nonce, result]
-        # Require at least worker_name, job_id, and nonce
-        if len(msg.params) < 3:
-            error = [20, "Invalid submit parameters: need worker, job_id, and nonce", None]
+        # Require all 4 parameters for Monero pools
+        if len(msg.params) < 4:
+            error = [20, "Invalid submit parameters: need worker, job_id, nonce, and result", None]
             logger.warning(f"{self._log_prefix} {error[1]}: {msg.params}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
@@ -2365,9 +2406,10 @@ class MinerSession:
         worker_name = msg.params[0]
         job_id = str(msg.params[1])
         nonce = str(msg.params[2])
+        result_hash = str(msg.params[3])
 
         logger.debug(
-            f"{self._log_prefix} Share submit: job={job_id}, params_count={len(msg.params)}"
+            f"{self._log_prefix} Share submit: job={job_id}, nonce={nonce}"
         )
 
         # Check job source to determine which pool should receive this share
@@ -2385,7 +2427,10 @@ class MinerSession:
                 f"{self._log_prefix} Routing share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            accepted, error, _ = await self._old_upstream.submit_share_raw(msg.params)
+            # Use Monero submit format for old pool as well
+            accepted, error, _ = await self._old_upstream.submit_share_monero(
+                job_id, nonce, result_hash
+            )
             # Note: We ignore notifications from old pool - they're not relevant for the new pool
             stats = ProxyStats.get_instance()
             if accepted:
@@ -2467,7 +2512,10 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error, bundled_notifications = await current_upstream.submit_share_raw(msg.params)
+            # Use Monero submit format: {id: session_id, job_id, nonce, result}
+            accepted, error, bundled_notifications = await current_upstream.submit_share_monero(
+                job_id, nonce, result_hash
+            )
 
             # Process any notifications bundled with the response
             if bundled_notifications:
@@ -2539,6 +2587,84 @@ class MinerSession:
             priority=MessagePriority.HIGH,
         )
 
+    async def _handle_monero_job_notification(self, msg: StratumNotification) -> None:
+        """
+        Handle a Monero 'job' notification from the pool.
+
+        Monero pools send job notifications with a different format than standard stratum.
+        The job data is in msg.params as a dict with: blob, job_id, target, seed_hash, algo, etc.
+
+        Args:
+            msg: The job notification message.
+        """
+        if not msg.params:
+            logger.warning(f"{self._log_prefix} Empty job notification")
+            return
+
+        # Monero job params can be a dict (common) or occasionally a list
+        job_data = msg.params
+        if isinstance(msg.params, list) and len(msg.params) > 0:
+            # Some pools send job as first element of list
+            job_data = msg.params[0] if isinstance(msg.params[0], dict) else None
+
+        if not isinstance(job_data, dict):
+            logger.warning(f"{self._log_prefix} Invalid job format: {type(job_data)}")
+            return
+
+        job_id = job_data.get("job_id")
+        if not job_id:
+            logger.warning(f"{self._log_prefix} Job missing job_id")
+            return
+
+        logger.debug(
+            f"{self._log_prefix} Monero job: id={job_id}, algo={job_data.get('algo', 'rx/0')}"
+        )
+
+        # Add job to validator for tracking
+        self._validator.add_job_from_monero(job_data, self._current_server)
+
+        # Forward job to miner
+        await self._send_monero_job_to_miner(job_data)
+
+    async def _send_monero_job_to_miner(self, job_data: dict) -> None:
+        """
+        Send a Monero job to the miner in standard mining.notify format.
+
+        Converts Monero job format to standard stratum mining.notify so miners
+        using standard stratum clients can work with Monero pools.
+
+        Monero job format:
+            {blob, job_id, target, seed_hash, algo, height, ...}
+
+        Standard mining.notify format for RandomX:
+            [job_id, blob, target, height, seed_hash, clean_jobs]
+
+        Args:
+            job_data: Monero job dict from pool.
+        """
+        job_id = job_data.get("job_id", "")
+        blob = job_data.get("blob", "")
+        target = job_data.get("target", "")
+        seed_hash = job_data.get("seed_hash", "")
+        height = job_data.get("height", 0)
+
+        # Determine clean_jobs - some pools set this explicitly
+        # Default to True on new jobs to be safe
+        clean_jobs = job_data.get("clean_jobs", True)
+
+        # Build standard mining.notify params for RandomX
+        notify_params = [job_id, blob, target, height, seed_hash, clean_jobs]
+
+        notification = StratumNotification(
+            method=StratumMethods.MINING_NOTIFY,
+            params=notify_params,
+        )
+
+        data = StratumProtocol.encode_message(notification)
+        await self._send_to_miner(data)
+
+        logger.debug(f"{self._log_prefix} Sent job {job_id} to miner")
+
     async def _forward_to_upstream(self, msg: StratumRequest) -> None:
         """Forward a request to the upstream server."""
         if not self._upstream or not self._upstream.connected:
@@ -2560,7 +2686,12 @@ class MinerSession:
             msg: Parsed stratum message.
         """
         if isinstance(msg, StratumNotification):
-            # Forward notifications directly to miner
+            # Handle Monero 'job' notifications for RandomX
+            if msg.method == "job" and self.algorithm == "randomx":
+                await self._handle_monero_job_notification(msg)
+                return
+
+            # Forward standard stratum notifications to miner
             if msg.method in (
                 StratumMethods.MINING_NOTIFY,
                 StratumMethods.MINING_SET_DIFFICULTY,

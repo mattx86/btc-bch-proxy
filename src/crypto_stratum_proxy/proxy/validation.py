@@ -448,6 +448,66 @@ class ShareValidator:
         except (ValueError, TypeError) as e:
             logger.warning(f"[{self.session_id}] Error parsing RandomX job params: {e}")
 
+    def add_job_from_monero(self, job_data: dict, source_server: Optional[str] = None) -> None:
+        """
+        Parse and add a job from Monero pool 'job' notification.
+
+        Monero job format is a dict with:
+        - job_id: Job identifier
+        - blob: Block template blob (hex)
+        - target: Mining target (hex string)
+        - seed_hash: RandomX seed hash (optional)
+        - height: Block height (optional)
+        - algo: Algorithm identifier (optional, e.g., "rx/0")
+
+        Args:
+            job_data: Dict containing Monero job fields.
+            source_server: Optional server name that issued this job.
+        """
+        if not isinstance(job_data, dict):
+            logger.warning(f"[{self.session_id}] Invalid Monero job data type: {type(job_data)}")
+            return
+
+        try:
+            job_id = str(job_data.get("job_id", ""))
+            if not job_id:
+                logger.warning(f"[{self.session_id}] Monero job missing job_id")
+                return
+
+            blob = str(job_data.get("blob", ""))
+            target_hex = str(job_data.get("target", ""))
+            seed_hash = job_data.get("seed_hash")
+            if seed_hash:
+                seed_hash = str(seed_hash)
+
+            # Height is optional
+            height = None
+            if job_data.get("height") is not None:
+                try:
+                    height = int(job_data["height"])
+                except (ValueError, TypeError):
+                    pass
+
+            # Clean jobs - some pools set this explicitly, default False
+            clean_jobs = bool(job_data.get("clean_jobs", False))
+
+            job_info = JobInfo(
+                job_id=job_id,
+                clean_jobs=clean_jobs,
+                height=height,
+                blob=blob,
+                target_hex=target_hex,
+                seed_hash=seed_hash,
+            )
+            self.add_job(job_info, source_server)
+
+            logger.debug(
+                f"[{self.session_id}] Added Monero job: id={job_id}, "
+                f"algo={job_data.get('algo', 'rx/0')}, clean={clean_jobs}"
+            )
+        except Exception as e:
+            logger.warning(f"[{self.session_id}] Error parsing Monero job: {e}")
+
     def _add_generic_job(self, params: list, source_server: Optional[str] = None) -> None:
         """
         Parse generic mining.notify params when algorithm is unknown or unsupported.
