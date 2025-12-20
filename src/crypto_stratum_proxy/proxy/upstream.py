@@ -76,17 +76,25 @@ class UpstreamConnection:
         fresh notifications after reconnection.
     """
 
-    def __init__(self, config: StratumServerConfig, global_config: Optional[GlobalProxyConfig] = None):
+    def __init__(
+        self,
+        config: StratumServerConfig,
+        global_config: Optional[GlobalProxyConfig] = None,
+        session_id: Optional[str] = None,
+    ):
         """
         Initialize upstream connection.
 
         Args:
             config: Server configuration.
             global_config: Global proxy configuration (for keepalive settings).
+            session_id: Optional session ID for log prefixing.
         """
         self.config = config
         self.global_config = global_config
         self.name = config.name
+        self._session_id = session_id
+        self._log_prefix = f"[{session_id}]" if session_id else ""
 
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -134,6 +142,10 @@ class UpstreamConnection:
         )
         # Track whether we've logged the unhealthy state (to avoid log spam)
         self._unhealthy_logged: bool = False
+
+    def set_log_prefix(self, prefix: str) -> None:
+        """Update the log prefix (called by session when full context is available)."""
+        self._log_prefix = prefix
 
     @property
     def connected(self) -> bool:
@@ -274,8 +286,9 @@ class UpstreamConnection:
         self._last_connect_attempt = now
 
         try:
+            prefix = f"{self._log_prefix} " if self._log_prefix else ""
             logger.info(
-                f"Connecting to upstream {self.name} ({self.config.host}:{self.config.port})"
+                f"{prefix}Connecting to upstream {self.name} ({self.config.host}:{self.config.port})"
             )
 
             # Setup SSL if needed
@@ -323,7 +336,7 @@ class UpstreamConnection:
             fire_and_forget(stats.record_upstream_connect(self.name))
             self._has_connected_before = True
 
-            logger.info(f"Connected to upstream {self.name}")
+            logger.info(f"{prefix}Connected to upstream {self.name}")
             return True
 
         except asyncio.TimeoutError:
@@ -422,7 +435,8 @@ class UpstreamConnection:
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_upstream_disconnect(self.name))
 
-        logger.info(f"Disconnected from upstream {self.name}")
+        prefix = f"{self._log_prefix} " if self._log_prefix else ""
+        logger.info(f"{prefix}Disconnected from upstream {self.name}")
 
     async def configure(self, extensions: list[str] = None) -> bool:
         """
@@ -443,6 +457,8 @@ class UpstreamConnection:
         req_id = await self._next_id()
         # Request version-rolling with full mask
         params = [extensions, {"version-rolling.mask": "ffffffff"}]
+
+        prefix = f"{self._log_prefix} " if self._log_prefix else ""
 
         try:
             response = await self._send_request(
@@ -479,7 +495,7 @@ class UpstreamConnection:
                         # Store normalized hex (without 0x prefix) for consistency
                         self.version_rolling_mask = mask_hex
                         logger.info(
-                            f"Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
+                            f"{prefix}Pool {self.name} supports version-rolling with mask {self.version_rolling_mask}"
                         )
                     except ValueError as e:
                         logger.warning(
@@ -489,7 +505,7 @@ class UpstreamConnection:
                         self.version_rolling_supported = False
                         self.version_rolling_mask = None
                 else:
-                    logger.info(f"Pool {self.name} does not support version-rolling")
+                    logger.info(f"{prefix}Pool {self.name} does not support version-rolling")
             else:
                 logger.debug(f"Pool {self.name} returned unexpected configure result: {result}")
 
@@ -523,6 +539,7 @@ class UpstreamConnection:
 
         req_id = await self._next_id()
         params = [user_agent]
+        prefix = f"{self._log_prefix} " if self._log_prefix else ""
 
         try:
             response = await self._send_request(
@@ -604,7 +621,7 @@ class UpstreamConnection:
 
                 self._subscribed = True
                 logger.info(
-                    f"Subscribed to {self.name}: extranonce1={self.extranonce1}, "
+                    f"{prefix}Subscribed to {self.name}: extranonce1={self.extranonce1}, "
                     f"extranonce2_size={self.extranonce2_size}"
                 )
                 return True
@@ -631,6 +648,7 @@ class UpstreamConnection:
 
         req_id = await self._next_id()
         params = [self.config.username, self.config.password]
+        prefix = f"{self._log_prefix} " if self._log_prefix else ""
 
         try:
             response = await self._send_request(
@@ -643,7 +661,7 @@ class UpstreamConnection:
 
             if response.result:
                 self._authorized = True
-                logger.info(f"Authorized with {self.name} as {self.config.username}")
+                logger.info(f"{prefix}Authorized with {self.name} as {self.config.username}")
                 return True
             else:
                 logger.error(f"Authorization rejected by {self.name}")

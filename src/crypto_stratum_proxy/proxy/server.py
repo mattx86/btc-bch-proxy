@@ -88,7 +88,6 @@ class StratumProxyServer:
     async def start(self) -> None:
         """Start the proxy server."""
         logger.info("Starting stratum proxy server...")
-        logger.info(f"Enabled algorithms: {', '.join(self._enabled_algorithms)}")
 
         # Initialize stats with server configuration
         self._init_stats_server_configs()

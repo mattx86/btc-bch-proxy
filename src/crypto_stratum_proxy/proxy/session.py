@@ -487,7 +487,9 @@ class MinerSession:
                 return False
 
             # Create a NEW upstream connection for this attempt
-            new_upstream = UpstreamConnection(server_config, self.config.proxy.global_)
+            new_upstream = UpstreamConnection(
+                server_config, self.config.proxy.global_, self.session_id
+            )
 
             # Attempt full handshake: connect -> configure -> subscribe -> authorize
             connected = await new_upstream.connect()
@@ -692,7 +694,7 @@ class MinerSession:
                 )
 
                 if not data:
-                    logger.info(f"[{self.session_id}] Miner disconnected")
+                    logger.info(f"{self._log_prefix} Miner disconnected")
                     break
 
                 # Sanitize for logging (prevent log injection via control characters)
@@ -991,7 +993,7 @@ class MinerSession:
             pending = await self._upstream.get_pending_notifications()
             if pending:
                 logger.info(
-                    f"[{self.session_id}] Forwarding {len(pending)} queued notifications to miner"
+                    f"{self._log_prefix} Forwarding {len(pending)} queued notifications to miner"
                 )
                 for notification in pending:
                     await self._handle_upstream_message(notification)
