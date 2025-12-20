@@ -172,6 +172,9 @@ class ShareValidator:
         # Current difficulty
         self._difficulty: float = 1.0
 
+        # zkSNARK/ALEO target tracking (for logging target changes)
+        self._last_zksnark_target: Optional[int] = None
+
         # Expected extranonce2 size (in bytes, set by pool)
         self._extranonce2_size: Optional[int] = None
 
@@ -362,14 +365,33 @@ class ShareValidator:
                 clean_jobs = bool(clean_jobs_raw)
 
             height_val = int(params[1]) if params[1] is not None else None
+            new_target = int(params[2]) if params[2] is not None else None
             job_info = JobInfo(
                 job_id=str(params[0]),
                 clean_jobs=clean_jobs,
                 height=height_val,
-                target=int(params[2]) if params[2] is not None else None,
+                target=new_target,
                 block_header_root=str(params[3]) if params[3] else None,
                 hashed_beacons_root=str(params[4]) if params[4] else None,
             )
+
+            # Log target changes for difficulty tracking visibility
+            if new_target is not None and self._last_zksnark_target is not None:
+                if new_target != self._last_zksnark_target:
+                    # Calculate change direction and magnitude
+                    if new_target > self._last_zksnark_target:
+                        change = "increased"
+                        ratio = new_target / self._last_zksnark_target
+                    else:
+                        change = "decreased"
+                        ratio = self._last_zksnark_target / new_target
+                    logger.info(
+                        f"[{self.session_id}] zkSNARK target {change}: "
+                        f"{self._last_zksnark_target} -> {new_target} ({ratio:.1f}x)"
+                    )
+
+            self._last_zksnark_target = new_target
+
             logger.info(
                 f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, height={height_val}, "
                 f"target={job_info.target}, clean={clean_jobs}"
@@ -493,6 +515,42 @@ class ShareValidator:
         if time.time() - timestamp > JOB_SOURCE_TTL:
             return None
         return server
+
+    def get_current_zksnark_target(self) -> Optional[int]:
+        """
+        Get the target from the current zkSNARK job.
+
+        ALEO pools embed difficulty target in job notifications. This method
+        returns that target for use in logging and diagnostics.
+
+        Returns:
+            Target value from current job, or None if no job or not zkSNARK.
+        """
+        if self._algorithm != "zksnark":
+            return None
+        if self._current_job_id is None:
+            return None
+        job = self._jobs.get(self._current_job_id)
+        if job is None:
+            return None
+        return job.target
+
+    def get_job_target(self, job_id: str) -> Optional[int]:
+        """
+        Get the target from a specific job (zkSNARK only).
+
+        Args:
+            job_id: Job ID to look up.
+
+        Returns:
+            Target value from job, or None if not found or not zkSNARK.
+        """
+        if self._algorithm != "zksnark":
+            return None
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        return job.target
 
     def validate_share(
         self,

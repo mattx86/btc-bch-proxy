@@ -1273,10 +1273,25 @@ class MinerSession:
         # Extract difficulty from rejection message: "low difficulty share (19188.02)"
         match = re.search(r"\((\d+(?:\.\d+)?)\)", reason)
         if not match:
-            # For ALEO pools, this is expected - they don't include difficulty in rejection
-            logger.debug(
-                f"{self._log_prefix} Low-diff rejection, no difficulty value in message: {reason}"
-            )
+            # For zkSNARK/ALEO pools, difficulty is in the job target, not rejection message
+            # Still update adaptive buffer to track rejection rate
+            self._update_adaptive_buffer(increase=True)
+
+            if self.algorithm == "zksnark":
+                # Log the job target for diagnostics - ALEO target is in the job itself
+                current_target = self._validator.get_current_zksnark_target()
+                if current_target:
+                    logger.debug(
+                        f"{self._log_prefix} High-hash rejection (pool target: {current_target})"
+                    )
+                else:
+                    logger.debug(
+                        f"{self._log_prefix} High-hash rejection (no target available)"
+                    )
+            else:
+                logger.debug(
+                    f"{self._log_prefix} Low-diff rejection, no difficulty value in message: {reason}"
+                )
             return
 
         try:
