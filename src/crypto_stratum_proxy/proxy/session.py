@@ -1670,66 +1670,6 @@ class MinerSession:
             )
             return
 
-        # Reject shares during brief server switchover (while draining old shares)
-        if self._switching_servers:
-            error = [25, "Server switch in progress", None]
-            logger.info(
-                f"[{self.session_id}] Share rejected: server switch in progress "
-                f"(switching to {self._switch_target_server})"
-            )
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(
-                self._switch_target_server or self._current_server, "server switch"
-            ))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
-            return
-
-        # Clean up old upstream if grace period has expired
-        if (
-            self._old_upstream is not None
-            and self._grace_period_end_time > 0
-            and time.time() >= self._grace_period_end_time
-        ):
-            logger.info(
-                f"[{self.session_id}] Grace period expired, disconnecting old upstream "
-                f"({self._old_upstream_server_name})"
-            )
-            try:
-                await self._old_upstream.disconnect()
-            except Exception as e:
-                logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
-            self._old_upstream = None
-            self._old_upstream_server_name = None
-            self._grace_period_end_time = 0.0
-
-        if not self._upstream or not self._upstream.authorized:
-            error = [24, "Not authorized", None]
-            logger.warning(
-                f"[{self.session_id}] Share rejected: upstream not connected/authorized "
-                f"(current_server={self._current_server})"
-            )
-            # Record the rejection in stats
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(self._current_server, "not connected"))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
-            return
-
-        # Validate params is a list/tuple
-        if not isinstance(msg.params, (list, tuple)):
-            error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
-            logger.error(f"[{self.session_id}] {error[1]}")
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
-            return
-
         # SHA-256 submit params: [worker_name, job_id, extranonce2, ntime, nonce, version_bits?]
         # version_bits is optional and only present when version-rolling is enabled
         if len(msg.params) < 5:

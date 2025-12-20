@@ -71,33 +71,23 @@ class ShareKey:
 
 
 @dataclass
-class ZkSnarkShareKey:
-    """Unique identifier for a zkSNARK/ALEO share submission."""
+class SimpleShareKey:
+    """
+    Unique identifier for a simple share submission (job_id + nonce).
+
+    Used by zkSNARK/ALEO and RandomX/Monero algorithms which only use
+    job_id and nonce to identify a share (unlike SHA-256 which also
+    includes extranonce2, ntime, and version_bits).
+    """
 
     job_id: str
-    nonce: str  # ALEO nonce is typically a large hex string
+    nonce: str
 
     def __hash__(self):
         return hash((self.job_id, self.nonce))
 
     def __eq__(self, other):
-        if not isinstance(other, ZkSnarkShareKey):
-            return False
-        return self.job_id == other.job_id and self.nonce == other.nonce
-
-
-@dataclass
-class RandomXShareKey:
-    """Unique identifier for a RandomX/Monero share submission."""
-
-    job_id: str
-    nonce: str  # 4-byte nonce as hex string
-
-    def __hash__(self):
-        return hash((self.job_id, self.nonce))
-
-    def __eq__(self, other):
-        if not isinstance(other, RandomXShareKey):
+        if not isinstance(other, SimpleShareKey):
             return False
         return self.job_id == other.job_id and self.nonce == other.nonce
 
@@ -663,7 +653,7 @@ class ShareValidator:
 
         # Check for duplicate (still useful - uses miner's job ID)
         if self._reject_duplicates:
-            share_key = ZkSnarkShareKey(job_id, nonce)
+            share_key = SimpleShareKey(job_id, nonce)
             if share_key in self._recent_shares:
                 self.duplicates_rejected += 1
                 return False, f"Duplicate share (job={job_id})"
@@ -677,7 +667,7 @@ class ShareValidator:
         # Record share BEFORE submission to prevent duplicate submissions in same batch
         # This is critical for high-speed miners that may send many shares at once
         if self._reject_duplicates:
-            share_key = ZkSnarkShareKey(job_id, nonce)
+            share_key = SimpleShareKey(job_id, nonce)
             self._recent_shares[share_key] = time.time()
             # Maintain cache size
             while len(self._recent_shares) > self._max_share_cache:
@@ -701,7 +691,7 @@ class ShareValidator:
         if not self._reject_duplicates:
             return
 
-        share_key = ZkSnarkShareKey(job_id, nonce)
+        share_key = SimpleShareKey(job_id, nonce)
         self._recent_shares[share_key] = time.time()
 
         # Maintain cache size
@@ -767,7 +757,7 @@ class ShareValidator:
 
         # Check for duplicate
         if self._reject_duplicates:
-            share_key = RandomXShareKey(job_id, nonce)
+            share_key = SimpleShareKey(job_id, nonce)
             if share_key in self._recent_shares:
                 self.duplicates_rejected += 1
                 return False, f"Duplicate share (job={job_id})"
@@ -795,7 +785,7 @@ class ShareValidator:
         if not self._reject_duplicates:
             return
 
-        share_key = RandomXShareKey(job_id, nonce)
+        share_key = SimpleShareKey(job_id, nonce)
         self._recent_shares[share_key] = time.time()
 
         # Maintain cache size
