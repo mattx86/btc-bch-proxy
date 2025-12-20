@@ -39,10 +39,15 @@ class JobInfo:
     block_header_root: Optional[str] = None
     hashed_beacons_root: Optional[str] = None
 
+    # RandomX/Monero specific fields (optional)
+    blob: Optional[str] = None  # Block template blob (hex)
+    target_hex: Optional[str] = None  # Mining target (hex string)
+    seed_hash: Optional[str] = None  # RandomX seed hash
+
 
 @dataclass
 class ShareKey:
-    """Unique identifier for a share submission."""
+    """Unique identifier for a SHA-256 share submission."""
 
     job_id: str
     extranonce2: str
@@ -63,6 +68,38 @@ class ShareKey:
             and self.nonce == other.nonce
             and self.version_bits == other.version_bits
         )
+
+
+@dataclass
+class ZkSnarkShareKey:
+    """Unique identifier for a zkSNARK/ALEO share submission."""
+
+    job_id: str
+    nonce: str  # ALEO nonce is typically a large hex string
+
+    def __hash__(self):
+        return hash((self.job_id, self.nonce))
+
+    def __eq__(self, other):
+        if not isinstance(other, ZkSnarkShareKey):
+            return False
+        return self.job_id == other.job_id and self.nonce == other.nonce
+
+
+@dataclass
+class RandomXShareKey:
+    """Unique identifier for a RandomX/Monero share submission."""
+
+    job_id: str
+    nonce: str  # 4-byte nonce as hex string
+
+    def __hash__(self):
+        return hash((self.job_id, self.nonce))
+
+    def __eq__(self, other):
+        if not isinstance(other, RandomXShareKey):
+            return False
+        return self.job_id == other.job_id and self.nonce == other.nonce
 
 
 class ShareValidator:
@@ -306,10 +343,52 @@ class ShareValidator:
         """
         Parse RandomX (Monero-style) mining.notify params.
 
-        RandomX/Monero stratum is similar to Bitcoin but may have variations.
-        For now, use generic parsing - can be enhanced if needed.
+        Monero stratum format varies by pool but commonly:
+        - [job_id, blob, target] - minimal format
+        - [job_id, blob, target, height] - with height
+        - [job_id, blob, target, height, seed_hash] - with RandomX seed
+        - [job_id, blob, target, height, seed_hash, next_seed_hash] - full format
+
+        The last param may be clean_jobs boolean in some implementations.
         """
-        self._add_generic_job(params, source_server)
+        if len(params) < 3:
+            logger.warning(f"[{self.session_id}] Invalid RandomX mining.notify params: {params}")
+            return
+
+        try:
+            job_id = str(params[0])
+            blob = str(params[1])
+            target_hex = str(params[2])
+
+            # Height is optional (4th param if present and numeric)
+            height = None
+            if len(params) > 3 and params[3] is not None:
+                try:
+                    height = int(params[3])
+                except (ValueError, TypeError):
+                    pass
+
+            # Seed hash is optional (5th param if present)
+            seed_hash = None
+            if len(params) > 4 and params[4] is not None:
+                seed_hash = str(params[4])
+
+            # Clean jobs - check last param if it's a boolean
+            clean_jobs = False
+            if params and isinstance(params[-1], bool):
+                clean_jobs = params[-1]
+
+            job_info = JobInfo(
+                job_id=job_id,
+                clean_jobs=clean_jobs,
+                height=height,
+                blob=blob,
+                target_hex=target_hex,
+                seed_hash=seed_hash,
+            )
+            self.add_job(job_info, source_server)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[{self.session_id}] Error parsing RandomX job params: {e}")
 
     def _add_generic_job(self, params: list, source_server: Optional[str] = None) -> None:
         """
@@ -455,6 +534,122 @@ class ShareValidator:
             return
 
         share_key = ShareKey(job_id, extranonce2, ntime, nonce, version_bits)
+        self._recent_shares[share_key] = time.time()
+
+        # Maintain cache size
+        while len(self._recent_shares) > self._max_share_cache:
+            self._recent_shares.popitem(last=False)
+
+    def validate_zksnark_share(
+        self,
+        job_id: str,
+        nonce: str,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Validate a zkSNARK/ALEO share before submission.
+
+        Args:
+            job_id: Job ID.
+            nonce: ALEO nonce value.
+
+        Returns:
+            Tuple of (valid, error_reason).
+        """
+        # Clean expired shares from cache (throttled)
+        now = time.time()
+        if now - self._last_cache_cleanup > self._cache_cleanup_interval:
+            self._clean_share_cache()
+            self._last_cache_cleanup = now
+
+        # Check for duplicate
+        if self._reject_duplicates:
+            share_key = ZkSnarkShareKey(job_id, nonce)
+            if share_key in self._recent_shares:
+                self.duplicates_rejected += 1
+                return False, f"Duplicate share (job={job_id})"
+
+        # Check for stale job (only if we have received at least one job)
+        if self._reject_stale and self._jobs and job_id not in self._jobs:
+            self.stale_rejected += 1
+            return False, f"Stale job (job={job_id})"
+
+        # Share passes local validation
+        return True, None
+
+    def record_accepted_zksnark_share(
+        self,
+        job_id: str,
+        nonce: str,
+    ) -> None:
+        """
+        Record a zkSNARK/ALEO share that was accepted by the upstream pool.
+
+        Args:
+            job_id: Job ID.
+            nonce: ALEO nonce value.
+        """
+        if not self._reject_duplicates:
+            return
+
+        share_key = ZkSnarkShareKey(job_id, nonce)
+        self._recent_shares[share_key] = time.time()
+
+        # Maintain cache size
+        while len(self._recent_shares) > self._max_share_cache:
+            self._recent_shares.popitem(last=False)
+
+    def validate_randomx_share(
+        self,
+        job_id: str,
+        nonce: str,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Validate a RandomX/Monero share before submission.
+
+        Args:
+            job_id: Job ID.
+            nonce: Nonce value (4 bytes as hex string).
+
+        Returns:
+            Tuple of (valid, error_reason).
+        """
+        # Clean expired shares from cache (throttled)
+        now = time.time()
+        if now - self._last_cache_cleanup > self._cache_cleanup_interval:
+            self._clean_share_cache()
+            self._last_cache_cleanup = now
+
+        # Check for duplicate
+        if self._reject_duplicates:
+            share_key = RandomXShareKey(job_id, nonce)
+            if share_key in self._recent_shares:
+                self.duplicates_rejected += 1
+                return False, f"Duplicate share (job={job_id})"
+
+        # Check for stale job (only if we have received at least one job)
+        if self._reject_stale and self._jobs and job_id not in self._jobs:
+            self.stale_rejected += 1
+            return False, f"Stale job (job={job_id})"
+
+        # Share passes local validation
+        return True, None
+
+    def record_accepted_randomx_share(
+        self,
+        job_id: str,
+        nonce: str,
+    ) -> None:
+        """
+        Record a RandomX/Monero share that was accepted by the upstream pool.
+
+        Args:
+            job_id: Job ID.
+            nonce: Nonce value (4 bytes as hex string).
+        """
+        if not self._reject_duplicates:
+            return
+
+        share_key = RandomXShareKey(job_id, nonce)
         self._recent_shares[share_key] = time.time()
 
         # Maintain cache size

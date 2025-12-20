@@ -764,6 +764,59 @@ class UpstreamConnection:
             async with self._pending_shares_lock:
                 self._pending_shares.discard(req_id)
 
+    async def submit_share_raw(
+        self,
+        params: list,
+    ) -> tuple[bool, Optional[list]]:
+        """
+        Submit a share to the pool with raw parameters.
+
+        Used for non-SHA256 algorithms that have different submit formats.
+        The first parameter is replaced with the pool's configured username.
+
+        Args:
+            params: Raw mining.submit parameters from the miner.
+
+        Returns:
+            Tuple of (accepted, error).
+        """
+        if not self._connected or not self._authorized:
+            return False, [20, "Not connected or authorized", None]
+
+        if not params:
+            return False, [20, "Empty params", None]
+
+        req_id = await self._next_id()
+
+        # Replace worker_name (first param) with pool's configured username
+        submit_params = [self.config.username] + list(params[1:])
+
+        async with self._pending_shares_lock:
+            self._pending_shares.add(req_id)
+
+        try:
+            response = await self._send_request(
+                req_id, StratumMethods.MINING_SUBMIT, submit_params
+            )
+
+            if response.is_error:
+                return False, response.error
+            if response.is_rejected:
+                if response.reject_reason:
+                    return False, [20, response.reject_reason, None]
+                return False, [20, "Rejected by pool", None]
+            return response.result is True, None
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Share submit (raw) timeout for {self.name}")
+            return False, [20, "Timeout", None]
+        except Exception as e:
+            logger.error(f"Share submit (raw) error for {self.name}: {e}")
+            return False, [20, str(e), None]
+        finally:
+            async with self._pending_shares_lock:
+                self._pending_shares.discard(req_id)
+
     async def _send_request(
         self, req_id: int, method: str, params: list
     ) -> StratumResponse:
