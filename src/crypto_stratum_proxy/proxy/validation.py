@@ -164,6 +164,10 @@ class ShareValidator:
         self._max_job_sources = 4096  # Limit to prevent unbounded growth
         self._last_job_source_cleanup: float = 0.0
 
+        # zkSNARK height -> pool job_id mapping
+        # Used to correlate miner shares with pool jobs
+        self._zksnark_height_to_job: dict[int, str] = {}
+
         # Current difficulty
         self._difficulty: float = 1.0
 
@@ -338,17 +342,25 @@ class ShareValidator:
             else:
                 clean_jobs = bool(clean_jobs_raw)
 
+            height_val = int(params[1]) if params[1] is not None else None
             job_info = JobInfo(
                 job_id=str(params[0]),
                 clean_jobs=clean_jobs,
-                height=int(params[1]) if params[1] is not None else None,
+                height=height_val,
                 target=int(params[2]) if params[2] is not None else None,
                 block_header_root=str(params[3]) if params[3] else None,
                 hashed_beacons_root=str(params[4]) if params[4] else None,
             )
+            # Store height -> job_id mapping for zkSNARK share validation
+            if height_val is not None:
+                self._zksnark_height_to_job[height_val] = job_info.job_id
+                # Keep limited history
+                if len(self._zksnark_height_to_job) > 100:
+                    oldest = min(self._zksnark_height_to_job.keys())
+                    del self._zksnark_height_to_job[oldest]
             logger.info(
-                f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, "
-                f"clean={clean_jobs} (raw={clean_jobs_raw!r}), tracked_jobs={len(self._jobs) + 1}"
+                f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, height={height_val}, "
+                f"clean={clean_jobs}, tracked_jobs={len(self._jobs) + 1}"
             )
             self.add_job(job_info, source_server)
         except (ValueError, TypeError) as e:
@@ -563,8 +575,12 @@ class ShareValidator:
         """
         Validate a zkSNARK/ALEO share before submission.
 
+        Note: ALEO miners use their own internal job ID format that differs from
+        the pool's job IDs, so stale job detection is disabled. The pool will
+        reject truly stale shares.
+
         Args:
-            job_id: Job ID.
+            job_id: Job ID (from miner, may differ from pool's job ID format).
             nonce: ALEO nonce value.
 
         Returns:
@@ -576,22 +592,38 @@ class ShareValidator:
             self._clean_share_cache()
             self._last_cache_cleanup = now
 
-        # Check for duplicate
+        # Log share for pattern analysis - try to extract embedded data from miner job ID
+        try:
+            # Miner job IDs appear to be 16 hex chars (8 bytes)
+            # Format seems to be: [2 bytes prefix][6 bytes data]
+            if len(job_id) >= 16:
+                prefix = job_id[:4]  # e.g., "1a1f"
+                data = job_id[4:]    # remaining bytes
+                # Try to extract potential height from data bytes
+                # Different byte orderings to test
+                data_bytes = bytes.fromhex(job_id)
+                # Log the current pool job for correlation
+                current_heights = list(self._zksnark_height_to_job.keys())[-3:] if self._zksnark_height_to_job else []
+                current_pool_jobs = [self._zksnark_height_to_job.get(h) for h in current_heights]
+                logger.debug(
+                    f"[{self.session_id}] zkSNARK share: miner_job={job_id} "
+                    f"(prefix={prefix}), recent_pool_jobs={list(zip(current_heights, current_pool_jobs))}"
+                )
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] Error parsing miner job_id: {e}")
+
+        # Check for duplicate (still useful - uses miner's job ID)
         if self._reject_duplicates:
             share_key = ZkSnarkShareKey(job_id, nonce)
             if share_key in self._recent_shares:
                 self.duplicates_rejected += 1
                 return False, f"Duplicate share (job={job_id})"
 
-        # Check for stale job (only if we have received at least one job)
-        if self._reject_stale and self._jobs and job_id not in self._jobs:
-            self.stale_rejected += 1
-            cached_jobs = list(self._jobs.keys())
-            logger.info(
-                f"[{self.session_id}] Stale zkSNARK share: job={job_id} not in cache. "
-                f"Cached jobs ({len(cached_jobs)}): {cached_jobs}"
-            )
-            return False, f"Stale job (job={job_id})"
+        # NOTE: Stale job detection is DISABLED for zkSNARK/ALEO because:
+        # - ALEO miners use their own internal job ID format (e.g., '1a1f0117189253c0')
+        # - Pool job IDs are different format (e.g., 'TjF58R3skI')
+        # - No reliable way to map between them
+        # - Let the pool handle stale share rejection
 
         # Share passes local validation
         return True, None
