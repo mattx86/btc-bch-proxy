@@ -1,8 +1,8 @@
 #!/bin/bash
-# Initialize btc-bch-proxy: create venv, install dependencies, create config
+# Initialize crypto-stratum-proxy: create venv, install dependencies, create config
 
 echo "========================================"
-echo " BTC-BCH Proxy Initialization"
+echo " Crypto Stratum Proxy Initialization"
 echo "========================================"
 echo
 
@@ -57,7 +57,7 @@ if [ -f "config.yaml" ]; then
     echo "config.yaml already exists, skipping..."
 else
     echo "Creating config.yaml..."
-    btc-bch-proxy init
+    crypto-stratum-proxy init
 fi
 
 # Deactivate virtual environment

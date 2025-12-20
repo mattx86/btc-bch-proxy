@@ -1,5 +1,5 @@
 #!/bin/bash
-# Validate btc-bch-proxy configuration
+# Validate crypto-stratum-proxy configuration
 
 # Check if venv exists
 if [ ! -f "venv/bin/activate" ]; then
@@ -15,5 +15,5 @@ fi
 
 # Activate virtual environment and validate config
 source venv/bin/activate
-btc-bch-proxy validate config.yaml
+crypto-stratum-proxy validate config.yaml
 deactivate

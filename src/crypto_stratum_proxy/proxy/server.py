@@ -16,12 +16,12 @@ RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_CLEANUP_INTERVAL = 300  # Clean up stale entries every 5 minutes
 RATE_LIMIT_MAX_IPS = 10000  # Maximum unique IPs to track (prevents memory exhaustion)
 
-from btc_bch_proxy.proxy.router import TimeBasedRouter
-from btc_bch_proxy.proxy.session import MinerSession
-from btc_bch_proxy.proxy.stats import ProxyStats, ServerConfigInfo, run_stats_logger
+from crypto_stratum_proxy.proxy.router import TimeBasedRouter
+from crypto_stratum_proxy.proxy.session import MinerSession
+from crypto_stratum_proxy.proxy.stats import ProxyStats, ServerConfigInfo, run_stats_logger
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import Config
+    from crypto_stratum_proxy.config.models import Config
 
 
 def _log_task_exception(task: asyncio.Task, task_name: str) -> None:
@@ -44,9 +44,9 @@ class StratumProxyServer:
     Main stratum proxy server.
 
     Handles:
-    - Accepting miner connections
+    - Accepting miner connections on per-algorithm ports
     - Managing miner sessions
-    - Coordinating with the time-based router
+    - Coordinating with time-based routers (one per algorithm)
     - Graceful shutdown
 
     Each miner session creates its own upstream connection for isolation.
@@ -61,20 +61,26 @@ class StratumProxyServer:
         """
         self.config = config
 
-        # Create time-based router
-        self.router = TimeBasedRouter(config)
+        # Get enabled algorithms
+        self._enabled_algorithms = config.proxy.get_enabled_algorithms()
 
-        # Session management
+        # Create time-based router per algorithm
+        self._routers: Dict[str, TimeBasedRouter] = {
+            algo: TimeBasedRouter(config, algo)
+            for algo in self._enabled_algorithms
+        }
+
+        # Session management (shared across all algorithms)
         self._sessions: Dict[str, MinerSession] = {}
         self._session_lock = asyncio.Lock()
 
-        # Server state
-        self._server: Optional[asyncio.Server] = None
+        # Server state - one server per algorithm
+        self._servers: Dict[str, asyncio.Server] = {}
         self._stop_event = asyncio.Event()
-        self._scheduler_task: Optional[asyncio.Task] = None
+        self._scheduler_tasks: Dict[str, asyncio.Task] = {}
         self._stats_task: Optional[asyncio.Task] = None
 
-        # Rate limiting - track connection timestamps per IP
+        # Rate limiting - track connection timestamps per IP (shared across algorithms)
         self._connection_attempts: Dict[str, List[float]] = defaultdict(list)
         self._rate_limit_last_cleanup = time.time()
         self._rate_limit_lock = asyncio.Lock()  # Lock for rate limit operations
@@ -82,22 +88,46 @@ class StratumProxyServer:
     async def start(self) -> None:
         """Start the proxy server."""
         logger.info("Starting stratum proxy server...")
+        logger.info(f"Enabled algorithms: {', '.join(self._enabled_algorithms)}")
 
         # Initialize stats with server configuration
         self._init_stats_server_configs()
 
-        # Log initial server
-        initial_server = self.router.get_current_server()
-        logger.info(f"Initial server: {initial_server}")
+        # Start per-algorithm routers and servers
+        for algo in self._enabled_algorithms:
+            router = self._routers[algo]
 
-        # Register for server switch notifications
-        await self.router.register_switch_callback(self._on_server_switch)
+            # Log initial server for this algorithm
+            try:
+                initial_server = router.get_current_server()
+                logger.info(f"[{algo}] Initial server: {initial_server}")
+            except RuntimeError as e:
+                logger.error(f"[{algo}] {e}")
+                continue
 
-        # Start the time-based scheduler
-        self._scheduler_task = asyncio.create_task(
-            self.router.run_scheduler(self._stop_event)
-        )
-        _log_task_exception(self._scheduler_task, "Scheduler task")
+            # Register for server switch notifications
+            await router.register_switch_callback(
+                lambda new_server, a=algo: self._on_server_switch(a, new_server)
+            )
+
+            # Start the time-based scheduler for this algorithm
+            task = asyncio.create_task(
+                router.run_scheduler(self._stop_event)
+            )
+            _log_task_exception(task, f"Scheduler task ({algo})")
+            self._scheduler_tasks[algo] = task
+
+            # Start accepting connections for this algorithm
+            algo_config = getattr(self.config.proxy, algo)
+            server = await asyncio.start_server(
+                lambda r, w, a=algo: self._handle_connection(r, w, a),
+                algo_config.bind_host,
+                algo_config.bind_port,
+            )
+            self._servers[algo] = server
+
+            addr = server.sockets[0].getsockname()
+            logger.info(f"[{algo}] Listening on {addr[0]}:{addr[1]}")
 
         # Start the stats logger (logs at minute 0, 15, 30, 45 of every hour)
         self._stats_task = asyncio.create_task(
@@ -105,19 +135,17 @@ class StratumProxyServer:
         )
         _log_task_exception(self._stats_task, "Stats logger task")
 
-        # Start accepting connections
-        self._server = await asyncio.start_server(
-            self._handle_connection,
-            self.config.proxy.bind_host,
-            self.config.proxy.bind_port,
-        )
+        # Serve all algorithms until stopped
+        if self._servers:
+            serve_tasks = []
+            for algo, server in self._servers.items():
+                async def serve_algo(s: asyncio.Server, a: str):
+                    async with s:
+                        await s.serve_forever()
+                serve_tasks.append(asyncio.create_task(serve_algo(server, algo)))
 
-        addr = self._server.sockets[0].getsockname()
-        logger.info(f"Proxy server listening on {addr[0]}:{addr[1]}")
-
-        # Serve until stopped
-        async with self._server:
-            await self._server.serve_forever()
+            # Wait for all to complete (they won't unless stopped)
+            await asyncio.gather(*serve_tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop the proxy server gracefully."""
@@ -126,9 +154,9 @@ class StratumProxyServer:
         # Signal stop
         self._stop_event.set()
 
-        # Stop accepting new connections (but don't wait yet - that would deadlock)
-        if self._server:
-            self._server.close()
+        # Stop accepting new connections on all servers (but don't wait yet - that would deadlock)
+        for algo, server in self._servers.items():
+            server.close()
 
         # CLOSE SESSIONS FIRST - this must happen before wait_closed()
         # because wait_closed() waits for all _handle_connection callbacks to finish,
@@ -152,18 +180,18 @@ class StratumProxyServer:
         async with self._session_lock:
             self._sessions.clear()
 
-        # NOW wait for all connection handlers to finish (should be quick since sessions are closed)
-        if self._server:
+        # NOW wait for all connection handlers to finish on all servers
+        for algo, server in self._servers.items():
             try:
-                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
             except asyncio.TimeoutError:
-                logger.warning("Timeout waiting for server to close")
+                logger.warning(f"Timeout waiting for {algo} server to close")
 
-        # Stop scheduler
-        if self._scheduler_task:
-            self._scheduler_task.cancel()
+        # Stop all scheduler tasks
+        for algo, task in self._scheduler_tasks.items():
+            task.cancel()
             try:
-                await self._scheduler_task
+                await task
             except asyncio.CancelledError:
                 pass
 
@@ -184,6 +212,7 @@ class StratumProxyServer:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
+        algorithm: str,
     ) -> None:
         """
         Handle a new miner connection.
@@ -191,6 +220,7 @@ class StratumProxyServer:
         Args:
             reader: Async stream reader.
             writer: Async stream writer.
+            algorithm: The algorithm for this connection (sha256, randomx, zksnark).
         """
         # Get client IP for rate limiting
         client_addr = writer.get_extra_info("peername")
@@ -198,7 +228,7 @@ class StratumProxyServer:
 
         # Check per-IP rate limit
         if not await self._check_rate_limit(client_ip):
-            logger.warning(f"Rate limit exceeded for {client_ip}, rejecting connection")
+            logger.warning(f"[{algorithm}] Rate limit exceeded for {client_ip}, rejecting connection")
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -206,10 +236,10 @@ class StratumProxyServer:
                 pass  # Connection already broken
             return
 
-        # Check connection limit
+        # Check connection limit (global across all algorithms)
         async with self._session_lock:
-            if len(self._sessions) >= self.config.proxy.max_connections:
-                logger.warning("Max connections reached, rejecting new connection")
+            if len(self._sessions) >= self.config.proxy.global_.max_connections:
+                logger.warning(f"[{algorithm}] Max connections reached, rejecting new connection")
                 try:
                     writer.close()
                     await writer.wait_closed()
@@ -217,12 +247,16 @@ class StratumProxyServer:
                     pass  # Connection already broken
                 return
 
+        # Get the router for this algorithm
+        router = self._routers[algorithm]
+
         # Create session (each session creates its own upstream connection)
         session = MinerSession(
             reader=reader,
             writer=writer,
-            router=self.router,
+            router=router,
             config=self.config,
+            algorithm=algorithm,
         )
 
         # Record miner connection
@@ -323,26 +357,29 @@ class StratumProxyServer:
                 f"evicted {len(oldest_entries)} oldest entries (excess={excess}, margin={margin})"
             )
 
-    async def _on_server_switch(self, new_server: str) -> None:
+    async def _on_server_switch(self, algorithm: str, new_server: str) -> None:
         """
         Handle server switch notification from router.
 
         Each session manages its own upstream connection, so we just tell
-        all sessions to switch.
+        sessions for this algorithm to switch.
 
         Args:
+            algorithm: The algorithm for which the switch is happening.
             new_server: Name of the new server.
         """
-        logger.info(f"Server switch triggered: switching to {new_server}")
+        logger.info(f"[{algorithm}] Server switch triggered: switching to {new_server}")
 
-        # Switch all active sessions (each session will create its own new connection)
+        # Switch only sessions for this algorithm
         async with self._session_lock:
-            sessions = list(self._sessions.values())
+            sessions = [
+                s for s in self._sessions.values()
+                if s.is_active and s.algorithm == algorithm
+            ]
 
         switch_tasks = [
             session.handle_server_switch(new_server)
             for session in sessions
-            if session.is_active
         ]
 
         if switch_tasks:
@@ -352,43 +389,49 @@ class StratumProxyServer:
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     failed_count += 1
-                    logger.error(f"Session switch failed: {result}")
+                    logger.error(f"[{algorithm}] Session switch failed: {result}")
 
             successful_count = len(switch_tasks) - failed_count
             if failed_count > 0:
                 logger.warning(
-                    f"Server switch to {new_server}: {successful_count} succeeded, "
+                    f"[{algorithm}] Server switch to {new_server}: {successful_count} succeeded, "
                     f"{failed_count} failed"
                 )
             else:
-                logger.info(f"Switched {len(switch_tasks)} sessions to {new_server}")
+                logger.info(f"[{algorithm}] Switched {len(switch_tasks)} sessions to {new_server}")
 
     def _init_stats_server_configs(self) -> None:
         """Initialize ProxyStats with server configuration info."""
-        # Build a map of server name -> schedule entry
-        schedule_map: Dict[str, tuple] = {}
-        for entry in self.config.schedule:
-            # Format times as HH:MM strings
-            start_str = entry.start.strftime("%H:%M")
-            # Handle end-of-day sentinel (23:59:59 -> "24:00")
-            if entry.end.hour == 23 and entry.end.minute == 59:
-                end_str = "24:00"
-            else:
-                end_str = entry.end.strftime("%H:%M")
-            schedule_map[entry.server] = (start_str, end_str)
+        from crypto_stratum_proxy.config.models import END_OF_DAY
 
-        # Build ServerConfigInfo for each server
         configs = []
-        for server in self.config.servers:
-            schedule_start, schedule_end = schedule_map.get(server.name, ("--:--", "--:--"))
-            configs.append(ServerConfigInfo(
-                name=server.name,
-                host=server.host,
-                port=server.port,
-                username=server.username,
-                schedule_start=schedule_start,
-                schedule_end=schedule_end,
-            ))
+
+        for algo in self._enabled_algorithms:
+            # Build ServerConfigInfo for each server in this algorithm
+            for server in self.config.servers.get(algo, []):
+                if not server.enabled:
+                    continue
+
+                # Get schedule times from server
+                if server.has_schedule:
+                    start_str = server.start.strftime("%H:%M")
+                    # Handle end-of-day sentinel (23:59:59 -> "24:00")
+                    if server.end == END_OF_DAY:
+                        end_str = "24:00"
+                    else:
+                        end_str = server.end.strftime("%H:%M")
+                else:
+                    start_str = "--:--"
+                    end_str = "--:--"
+
+                configs.append(ServerConfigInfo(
+                    name=f"{server.name} ({algo})",
+                    host=server.host,
+                    port=server.port,
+                    username=server.username,
+                    schedule_start=start_str,
+                    schedule_end=end_str,
+                ))
 
         stats = ProxyStats.get_instance()
         stats.set_server_configs(configs)
@@ -398,10 +441,11 @@ class StratumProxyServer:
         """Get count of active miner sessions."""
         return len(self._sessions)
 
-    @property
-    def current_server(self) -> str:
-        """Get the current active server name."""
-        return self.router.get_current_server()
+    def get_current_server(self, algorithm: str) -> str:
+        """Get the current active server name for an algorithm."""
+        if algorithm in self._routers:
+            return self._routers[algorithm].get_current_server()
+        raise RuntimeError(f"No router for algorithm: {algorithm}")
 
 
 async def run_proxy(config: Config, stop_event: Optional[asyncio.Event] = None) -> None:

@@ -1,7 +1,7 @@
 @echo off
-REM Start btc-bch-proxy
+REM Start crypto-stratum-proxy
 
-echo Starting BTC-BCH Proxy...
+echo Starting Crypto Stratum Proxy...
 
 REM Check if venv exists
 if not exist venv\Scripts\activate.bat (
@@ -17,5 +17,5 @@ if not exist config.yaml (
 
 REM Activate virtual environment and start proxy
 call venv\Scripts\activate.bat
-btc-bch-proxy start -c config.yaml %*
+crypto-stratum-proxy start -c config.yaml %*
 call deactivate

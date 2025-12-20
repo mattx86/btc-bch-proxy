@@ -12,20 +12,22 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 
-from btc_bch_proxy.stratum.messages import (
+from crypto_stratum_proxy.config.models import get_difficulty_buffer
+from crypto_stratum_proxy.stratum.messages import (
     StratumMessage,
     StratumMethods,
     StratumNotification,
     StratumRequest,
     StratumResponse,
 )
-from btc_bch_proxy.stratum.protocol import StratumProtocol, StratumProtocolError
-from btc_bch_proxy.proxy.upstream import UpstreamConnection
-from btc_bch_proxy.proxy.stats import ProxyStats
-from btc_bch_proxy.proxy.validation import ShareValidator
-from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
-from btc_bch_proxy.proxy.utils import fire_and_forget
-from btc_bch_proxy.proxy.constants import (
+from crypto_stratum_proxy.stratum.protocol import StratumProtocol, StratumProtocolError
+from crypto_stratum_proxy.proxy.upstream import UpstreamConnection
+from crypto_stratum_proxy.proxy.stats import ProxyStats
+from crypto_stratum_proxy.proxy.validation import ShareValidator
+from crypto_stratum_proxy.proxy.keepalive import enable_tcp_keepalive
+from crypto_stratum_proxy.proxy.utils import fire_and_forget
+from crypto_stratum_proxy.proxy.circuit_breaker import CircuitBreakerManager
+from crypto_stratum_proxy.proxy.constants import (
     GRACE_PERIOD_EXTENSION,
     MAX_ERROR_MESSAGE_LENGTH,
     MAX_MINER_STRING_LENGTH,
@@ -127,8 +129,8 @@ def _is_valid_hex(value: str, max_length: int = 64) -> bool:
 
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import Config
-    from btc_bch_proxy.proxy.router import TimeBasedRouter
+    from crypto_stratum_proxy.config.models import Config
+    from crypto_stratum_proxy.proxy.router import TimeBasedRouter
 
 
 class MessagePriority(Enum):
@@ -187,6 +189,7 @@ class MinerSession:
         writer: asyncio.StreamWriter,
         router: TimeBasedRouter,
         config: Config,
+        algorithm: str,
     ):
         """
         Initialize a miner session.
@@ -196,11 +199,13 @@ class MinerSession:
             writer: Async stream writer for miner connection.
             router: Time-based router for server selection.
             config: Application configuration.
+            algorithm: The algorithm this session handles (sha256, randomx, zksnark).
         """
         self.reader = reader
         self.writer = writer
         self.router = router
         self.config = config
+        self.algorithm = algorithm
 
         # Use SESSION_ID_LENGTH hex chars for session ID to reduce collision probability
         # With 48 bits (12 chars), collision probability is ~1 in 1000 at 17 million sessions
@@ -248,6 +253,25 @@ class MinerSession:
         self._miner_difficulty: Optional[float] = None  # Difficulty sent to miner (may be overridden)
         self._max_pool_difficulty: Optional[float] = None  # Highest pool difficulty seen (for top-dynamic mode)
 
+        # Difficulty smoothing state
+        self._difficulty_config = config.proxy.difficulty  # Reference to difficulty config
+        self._last_difficulty_change_time: float = 0.0  # For cooldown between changes
+        self._last_decay_check_time: float = 0.0  # For time-based decay
+
+        # Share rate monitoring state
+        self._share_timestamps: list[float] = []  # For share rate calculation
+        self._baseline_share_rate: Optional[float] = None  # Learned baseline rate (shares/min)
+        self._last_share_rate_check: float = 0.0  # Last time we checked share rate
+
+        # Adaptive buffer state
+        self._adaptive_buffer: float = config.proxy.difficulty.buffer_start  # Current buffer
+        self._last_low_diff_rejection: float = 0.0  # Time of last low-diff rejection
+
+        # Per-server difficulty overrides (set when connecting to server)
+        self._server_buffer_percent: Optional[float] = None
+        self._server_min_difficulty: Optional[float] = None
+        self._server_max_difficulty: Optional[float] = None
+
         # Queued notifications before authorization OR after pool switch (jobs and difficulty)
         # We buffer these until we know the worker's username so we can apply difficulty override,
         # OR until we receive the first difficulty from a new pool after switching
@@ -265,7 +289,7 @@ class MinerSession:
             self.client_addr = "unknown"
 
         # Share validator
-        self._validator = ShareValidator(self.session_id, config.validation)
+        self._validator = ShareValidator(self.session_id, config.proxy.validation)
 
         # Async queue for miner-bound messages (decouples read from write)
         # Using PriorityQueue to ensure high-priority messages (share responses) are sent first
@@ -285,7 +309,7 @@ class MinerSession:
         self._queue_drain_lock = asyncio.Lock()  # Protects _queue_drained flag
 
         # Enable TCP keepalive on miner connection
-        enable_tcp_keepalive(writer, config.proxy, f"miner:{self.session_id}")
+        enable_tcp_keepalive(writer, config.proxy.global_, f"miner:{self.session_id}")
 
         # Protocol error tracking (for DoS protection)
         self._consecutive_protocol_errors = 0
@@ -389,15 +413,16 @@ class MinerSession:
 
         Server Switch Protocol:
             1. Validate server config exists
-            2. Retry connecting to new server for up to 20 minutes
+            2. Check circuit breaker (skip if pool is in open state)
+            3. Retry connecting to new server for up to 20 minutes
                (old server stays connected and handles shares during this time)
-            3. Once new server is fully connected:
+            4. Once new server is fully connected:
                - Enter switching state (new shares rejected briefly)
                - Drain pending shares on old upstream
                - Disconnect old upstream
                - Activate new upstream
                - Exit switching state
-            4. If new server never connects after 20 min, keep old server
+            5. If new server never connects after 20 min, keep old server
 
         Concurrency Note:
             While in switching state, _handle_submit() rejects new shares with
@@ -408,6 +433,15 @@ class MinerSession:
         server_config = self.router.get_server_config(server_name)
         if not server_config:
             logger.error(f"[{self.session_id}] Unknown server: {server_name}")
+            return False
+
+        # Check circuit breaker before attempting connection
+        circuit_breaker = CircuitBreakerManager.get_instance(self.config.proxy.circuit_breaker)
+        can_connect, block_reason = circuit_breaker.can_connect(server_name)
+        if not can_connect:
+            logger.info(
+                f"[{self.session_id}] Skipping {server_name}: {block_reason}"
+            )
             return False
 
         # Keep reference to old upstream
@@ -421,10 +455,10 @@ class MinerSession:
                 f"(old server stays active during connection attempts)"
             )
 
-        # Retry connecting to new server for up to retry_timeout_minutes
+        # Retry connecting to new server for up to server_switch_timeout
         # Old server stays connected and handles shares during this time
         retry_interval = server_config.retry_interval
-        retry_timeout = self.config.failover.retry_timeout_minutes * 60
+        retry_timeout = self.config.proxy.global_.server_switch_timeout
         start_time = time.time()
         new_upstream = None
         attempt = 0
@@ -438,7 +472,7 @@ class MinerSession:
                 return False
 
             # Create a NEW upstream connection for this attempt
-            new_upstream = UpstreamConnection(server_config, self.config.proxy)
+            new_upstream = UpstreamConnection(server_config, self.config.proxy.global_)
 
             # Attempt full handshake: connect -> configure -> subscribe -> authorize
             connected = await new_upstream.connect()
@@ -466,6 +500,8 @@ class MinerSession:
                     f"[{self.session_id}] Failed to connect to {server_name} after "
                     f"{int(elapsed)}s ({attempt} attempts) - keeping old server"
                 )
+                # Record failure for circuit breaker
+                circuit_breaker.record_failure(server_name)
                 return False
 
             # Log progress every ~1 minute (12 attempts at 5s interval)
@@ -494,7 +530,7 @@ class MinerSession:
                     f"[{self.session_id}] Draining {initial_pending} pending shares..."
                 )
                 drain_start = time.time()
-                timeout = float(self.config.proxy.pending_shares_timeout)
+                timeout = float(self.config.proxy.global_.pending_shares_timeout)
                 while old_upstream.has_pending_shares:
                     if time.time() - drain_start > timeout:
                         remaining = old_upstream.pending_share_count
@@ -546,11 +582,24 @@ class MinerSession:
             self._upstream = new_upstream
             self._current_server = server_name
 
+            # Load per-server difficulty overrides
+            self._server_buffer_percent = server_config.buffer_percent
+            self._server_min_difficulty = server_config.min_difficulty
+            self._server_max_difficulty = server_config.max_difficulty
+            if self._server_buffer_percent is not None:
+                logger.info(
+                    f"[{self.session_id}] Server {server_name} uses custom buffer: "
+                    f"{self._server_buffer_percent:.1%}"
+                )
+
             elapsed = time.time() - start_time
             logger.info(
                 f"[{self.session_id}] Connected to upstream {server_name} "
-                f"(after {int(elapsed)}s)"
+                f"(algorithm={self.algorithm}, after {int(elapsed)}s)"
             )
+
+            # Record success for circuit breaker
+            circuit_breaker.record_success(server_name)
             return True
 
         finally:
@@ -606,7 +655,7 @@ class MinerSession:
                 # which can be infrequent depending on difficulty
                 data = await asyncio.wait_for(
                     self.reader.read(SOCKET_READ_BUFFER_SIZE),
-                    timeout=float(self.config.proxy.miner_read_timeout),
+                    timeout=float(self.config.proxy.global_.miner_read_timeout),
                 )
 
                 if not data:
@@ -633,7 +682,7 @@ class MinerSession:
 
             except asyncio.TimeoutError:
                 # Long timeout without any data from miner - likely dead connection
-                timeout_mins = self.config.proxy.miner_read_timeout // 60
+                timeout_mins = self.config.proxy.global_.miner_read_timeout // 60
                 logger.warning(f"[{self.session_id}] Miner connection timeout ({timeout_mins} min no data)")
                 break
             except asyncio.CancelledError:
@@ -1006,22 +1055,32 @@ class MinerSession:
 
     async def _send_difficulty_to_miner(self, pool_difficulty: float) -> None:
         """
-        Send difficulty to miner with +1000 buffer and highest-seen tracking.
+        Send difficulty to miner with buffer, highest-seen tracking, and smoothing.
 
-        The proxy always sends (pool_difficulty + 1000) to the miner, but only
-        if that value is higher than the highest difficulty we've sent so far.
-        This prevents vardiff from lowering the miner's difficulty.
-
-        Floor-reset: If the pool difficulty drops to less than 50% of our current
-        miner difficulty, we reset to 75% of miner difficulty (25% reduction) as
-        long as that's still > pool_difficulty + 1000. This prevents our difficulty
-        from drifting too far above what the pool expects while using a gentler
-        adjustment than a full 50% reset.
+        Features:
+        - Configurable buffer percentage added to pool difficulty
+        - Per-server buffer overrides
+        - Adaptive buffer sizing based on rejection patterns
+        - Min/max difficulty constraints per server
+        - Highest-seen tracking (difficulty only increases normally)
+        - Progressive floor-reset when pool drops significantly
+        - Time-based decay toward pool difficulty
+        - Cooldown between changes to prevent oscillation
 
         Args:
             pool_difficulty: The difficulty set by the pool.
         """
         server_name = self._current_server or "unknown"
+        now = time.time()
+        cfg = self._difficulty_config
+
+        # Get effective buffer (considers per-server override and adaptive buffer)
+        effective_buffer_percent = self._get_effective_buffer_percent()
+
+        # Get difficulty buffer using effective percentage
+        diff_buffer = get_difficulty_buffer(
+            pool_difficulty, effective_buffer_percent
+        )
 
         # Log pool difficulty changes
         pool_diff_changed = self._pool_difficulty != pool_difficulty
@@ -1032,27 +1091,41 @@ class MinerSession:
             )
         self._pool_difficulty = pool_difficulty
 
-        # Floor-reset: If pool difficulty has dropped significantly (< 50% of miner diff),
-        # reset our tracking to prevent excessive divergence from pool expectations.
-        # We reduce by 25% (to 75% of current) rather than 50% for a gentler adjustment.
+        # Progressive floor-reset: If pool difficulty has dropped significantly,
+        # reset our tracking to prevent excessive divergence from pool expectations
         if self._miner_difficulty is not None and self._max_pool_difficulty is not None:
-            if pool_difficulty < (self._miner_difficulty * 0.5):
-                floor_reset = self._miner_difficulty * 0.75
-                # Only apply floor-reset if it still maintains the +1000 buffer
-                if floor_reset > pool_difficulty + 1000:
+            trigger_threshold = self._miner_difficulty * cfg.floor_trigger_ratio
+            if pool_difficulty < trigger_threshold:
+                floor_reset = self._miner_difficulty * cfg.floor_reset_ratio
+                # Only apply floor-reset if it still maintains the buffer
+                if floor_reset > pool_difficulty + diff_buffer:
                     logger.info(
                         f"[{self.session_id}] Floor-reset: pool dropped to {pool_difficulty} "
-                        f"(< 50% of miner {self._miner_difficulty}), resetting to {floor_reset}"
+                        f"(< {cfg.floor_trigger_ratio:.0%} of miner {self._miner_difficulty}), "
+                        f"resetting to {floor_reset:.2f}"
                     )
                     self._max_pool_difficulty = floor_reset
-                else:
-                    logger.info(
-                        f"[{self.session_id}] Floor-reset skipped: floor {floor_reset} "
-                        f"<= pool {pool_difficulty} + 1000"
-                    )
 
-        # Calculate target difficulty: pool + 1000
-        target_difficulty = pool_difficulty + 1000
+        # Time-based decay: If we're above pool+buffer, gradually decay toward it
+        if cfg.decay_enabled and self._max_pool_difficulty is not None:
+            target_difficulty = pool_difficulty + diff_buffer
+            if self._max_pool_difficulty > target_difficulty:
+                # Check if decay interval has passed
+                if now - self._last_decay_check_time >= cfg.decay_interval:
+                    self._last_decay_check_time = now
+                    # Calculate decay amount
+                    decay_amount = self._max_pool_difficulty * cfg.decay_percent
+                    new_max = self._max_pool_difficulty - decay_amount
+                    # Don't decay below target
+                    if new_max > target_difficulty:
+                        logger.info(
+                            f"[{self.session_id}] Decay: {self._max_pool_difficulty:.2f} -> "
+                            f"{new_max:.2f} (target: {target_difficulty:.2f})"
+                        )
+                        self._max_pool_difficulty = new_max
+
+        # Calculate target difficulty: pool + buffer
+        target_difficulty = pool_difficulty + diff_buffer
 
         # Track highest difficulty (only increases, never decreases)
         if self._max_pool_difficulty is None or target_difficulty > self._max_pool_difficulty:
@@ -1061,14 +1134,40 @@ class MinerSession:
         # Use highest seen (prevents vardiff from lowering difficulty)
         miner_difficulty = self._max_pool_difficulty
 
+        # Apply per-server min/max difficulty constraints
+        if self._server_min_difficulty is not None:
+            if miner_difficulty < self._server_min_difficulty:
+                logger.debug(
+                    f"[{self.session_id}] Difficulty {miner_difficulty:.2f} below server min, "
+                    f"using {self._server_min_difficulty:.2f}"
+                )
+                miner_difficulty = self._server_min_difficulty
+        if self._server_max_difficulty is not None:
+            if miner_difficulty > self._server_max_difficulty:
+                logger.debug(
+                    f"[{self.session_id}] Difficulty {miner_difficulty:.2f} above server max, "
+                    f"using {self._server_max_difficulty:.2f}"
+                )
+                miner_difficulty = self._server_max_difficulty
+
         # Don't send if miner difficulty hasn't changed
         if self._miner_difficulty is not None and miner_difficulty == self._miner_difficulty:
             if pool_diff_changed:
-                logger.info(
+                logger.debug(
                     f"[{self.session_id}] Miner difficulty unchanged at {miner_difficulty} "
                     f"(pool: {pool_difficulty}, highest-seen)"
                 )
             return
+
+        # Check cooldown: don't change difficulty too frequently
+        if self._miner_difficulty is not None:
+            time_since_last_change = now - self._last_difficulty_change_time
+            if time_since_last_change < cfg.change_cooldown:
+                logger.debug(
+                    f"[{self.session_id}] Difficulty change cooldown: {time_since_last_change:.1f}s "
+                    f"< {cfg.change_cooldown}s"
+                )
+                return
 
         # Send difficulty to miner
         diff_msg = StratumNotification(
@@ -1081,17 +1180,20 @@ class MinerSession:
         # Track miner's effective difficulty for validation
         self._validator.set_difficulty(miner_difficulty)
 
+        # Update timing
+        self._last_difficulty_change_time = now
+
         # Log difficulty
         if self._miner_difficulty is None:
             logger.info(
-                f"[{self.session_id}] Difficulty for {server_name}: {miner_difficulty} "
-                f"(pool: {pool_difficulty})"
+                f"[{self.session_id}] Difficulty for {server_name}: {miner_difficulty:.2f} "
+                f"(pool: {pool_difficulty:.2f})"
             )
         else:
             logger.info(
                 f"[{self.session_id}] Difficulty for {server_name}: "
-                f"{self._miner_difficulty} -> {miner_difficulty} "
-                f"(pool: {pool_difficulty})"
+                f"{self._miner_difficulty:.2f} -> {miner_difficulty:.2f} "
+                f"(pool: {pool_difficulty:.2f})"
             )
         self._miner_difficulty = miner_difficulty
 
@@ -1100,8 +1202,8 @@ class MinerSession:
         Handle a difficulty-based share rejection by raising difficulty.
 
         When a pool rejects a share as "low difficulty" (or similar), we set
-        the difficulty to (rejection_difficulty + 1000) if that's higher than
-        our current highest-seen value.
+        the difficulty to (rejection_difficulty + buffer) if that's higher than
+        our current highest-seen value. The buffer is coin-type specific.
 
         Args:
             reason: The rejection reason string, e.g. "low difficulty share (19188.02)"
@@ -1133,8 +1235,19 @@ class MinerSession:
         except ValueError:
             return
 
-        # Calculate new target: rejection difficulty + 1000
-        new_target = rejected_diff + 1000
+        # Update adaptive buffer (increase on rejection)
+        self._update_adaptive_buffer(increase=True)
+
+        # Get effective buffer (considers per-server override and adaptive buffer)
+        effective_buffer_percent = self._get_effective_buffer_percent()
+
+        # Get difficulty buffer using effective percentage
+        diff_buffer = get_difficulty_buffer(
+            rejected_diff, effective_buffer_percent
+        )
+
+        # Calculate new target: rejection difficulty + buffer
+        new_target = rejected_diff + diff_buffer
 
         # Only update if this is higher than our current max
         if self._max_pool_difficulty is not None and new_target <= self._max_pool_difficulty:
@@ -1147,12 +1260,15 @@ class MinerSession:
         old_max = self._max_pool_difficulty
         self._max_pool_difficulty = new_target
 
+        old_max_str = f"{old_max:.2f}" if old_max else "None"
         logger.info(
             f"[{self.session_id}] Raising difficulty due to low-diff rejection: "
-            f"{old_max} -> {new_target} (rejected at {rejected_diff})"
+            f"{old_max_str} -> {new_target:.2f} (rejected at {rejected_diff:.2f})"
         )
 
         # Send new difficulty to miner
+        # Note: Low-diff rejections bypass cooldown because we need to act
+        # immediately to prevent continued share rejections
         diff_msg = StratumNotification(
             method=StratumMethods.MINING_SET_DIFFICULTY,
             params=[new_target]
@@ -1163,50 +1279,148 @@ class MinerSession:
         # Update tracking
         self._validator.set_difficulty(new_target)
         self._miner_difficulty = new_target
+        self._last_difficulty_change_time = time.time()
 
-    async def _handle_stale_share_rejection(self, reason: str) -> None:
+    def _get_effective_buffer_percent(self) -> float:
         """
-        Handle a stale/timing-based share rejection by lowering difficulty.
+        Get the effective buffer percentage.
 
-        When a pool rejects a share as stale or job not found, it suggests the
-        miner is taking too long to find shares at the current difficulty.
-        We lower the difficulty by 1000 to help the miner find shares faster,
-        as long as the new difficulty is still above the pool's difficulty.
+        Priority order:
+        1. Per-server override (if set)
+        2. Adaptive buffer (learned from rejection patterns)
 
-        Args:
-            reason: The rejection reason string, e.g. "stale", "job not found"
+        Returns:
+            Buffer percentage to use.
         """
-        # Check for timing-based rejections that suggest difficulty is too high
-        reason_lower = reason.lower()
-        is_timing_rejection = any(phrase in reason_lower for phrase in [
-            "stale",
-            "job not found",
-        ])
+        # Per-server override takes highest priority
+        if self._server_buffer_percent is not None:
+            return self._server_buffer_percent
 
-        if not is_timing_rejection:
+        # Use adaptive buffer
+        return self._adaptive_buffer
+
+    def _record_share_for_rate_monitoring(self) -> None:
+        """Record a share submission for rate monitoring."""
+        now = time.time()
+        cfg = self._difficulty_config
+
+        self._share_timestamps.append(now)
+
+        # Clean up old timestamps outside the window
+        cutoff = now - cfg.share_rate_window
+        self._share_timestamps = [t for t in self._share_timestamps if t > cutoff]
+
+    async def _check_share_rate_and_adjust(self) -> None:
+        """
+        Check share rate and adjust difficulty if needed.
+
+        This learns a baseline share rate and lowers difficulty if the rate
+        drops significantly below baseline (indicating difficulty is too high).
+        """
+        cfg = self._difficulty_config
+        now = time.time()
+
+        # Don't check too frequently (at least 60 seconds between checks)
+        if now - self._last_share_rate_check < 60:
             return
 
-        # Can't lower if we don't have a current difficulty set
+        # Need minimum shares and time elapsed
+        if len(self._share_timestamps) < cfg.share_rate_min_shares:
+            return
+
         if self._miner_difficulty is None or self._pool_difficulty is None:
             return
 
-        # Calculate new target: current difficulty minus 1000
-        new_target = self._miner_difficulty - 1000
+        self._last_share_rate_check = now
 
-        # Only lower if (miner_difficulty - 1000) > pool_difficulty
+        # Calculate actual share rate (shares per minute)
+        window_duration = now - self._share_timestamps[0]
+        if window_duration < 60:  # Need at least 60 seconds of data
+            return
+
+        actual_rate = len(self._share_timestamps) / (window_duration / 60.0)
+
+        logger.debug(
+            f"[{self.session_id}] Share rate: {actual_rate:.2f}/min "
+            f"(window: {window_duration:.0f}s, shares: {len(self._share_timestamps)}, "
+            f"baseline: {self._baseline_share_rate:.2f}/min)"
+            if self._baseline_share_rate else
+            f"[{self.session_id}] Share rate: {actual_rate:.2f}/min "
+            f"(window: {window_duration:.0f}s, shares: {len(self._share_timestamps)}, "
+            f"learning baseline...)"
+        )
+
+        # Learn baseline if we don't have one yet
+        if self._baseline_share_rate is None:
+            # Need at least 2 minutes of data to establish baseline
+            if window_duration >= 120 and len(self._share_timestamps) >= cfg.share_rate_min_shares:
+                self._baseline_share_rate = actual_rate
+                logger.info(
+                    f"[{self.session_id}] Share rate baseline established: "
+                    f"{self._baseline_share_rate:.2f}/min"
+                )
+            return
+
+        # Update baseline with exponential moving average (slowly adapt to changes)
+        alpha = 0.1  # Weight for new observation
+        self._baseline_share_rate = (
+            alpha * actual_rate + (1 - alpha) * self._baseline_share_rate
+        )
+
+        # Check if rate has dropped significantly below baseline
+        rate_ratio = actual_rate / self._baseline_share_rate if self._baseline_share_rate > 0 else 1.0
+
+        if rate_ratio < cfg.share_rate_low_multiplier:
+            # Share rate is too low - difficulty might be too high
+            # Lower difficulty by reducing the buffer
+            await self._lower_difficulty_due_to_low_rate(actual_rate, self._baseline_share_rate)
+
+    async def _lower_difficulty_due_to_low_rate(
+        self, actual_rate: float, baseline_rate: float
+    ) -> None:
+        """
+        Lower difficulty when share rate has dropped significantly.
+
+        Args:
+            actual_rate: Current share rate (shares/min).
+            baseline_rate: Baseline share rate (shares/min).
+        """
+        cfg = self._difficulty_config
+        now = time.time()
+
+        # Respect cooldown
+        if now - self._last_difficulty_change_time < cfg.change_cooldown:
+            return
+
+        # Can't lower if we don't have current difficulty
+        if self._miner_difficulty is None or self._pool_difficulty is None:
+            return
+
+        # Get effective buffer and calculate reduction
+        effective_buffer = self._get_effective_buffer_percent()
+        diff_buffer = get_difficulty_buffer(
+            self._pool_difficulty, effective_buffer
+        )
+
+        # Calculate new target: current difficulty minus buffer
+        new_target = self._miner_difficulty - diff_buffer
+
+        # Don't go below pool difficulty
         if new_target <= self._pool_difficulty:
-            logger.info(
-                f"[{self.session_id}] Stale share but can't lower difficulty: "
-                f"new_target={new_target} <= pool_difficulty={self._pool_difficulty}"
+            logger.debug(
+                f"[{self.session_id}] Can't lower difficulty further: "
+                f"new_target {new_target:.2f} <= pool {self._pool_difficulty:.2f}"
             )
             return
 
+        # Also reset the max tracking so it can drift down
         old_difficulty = self._miner_difficulty
         self._max_pool_difficulty = new_target
 
-        logger.info(
-            f"[{self.session_id}] Lowering difficulty due to stale share: "
-            f"{old_difficulty} -> {new_target} (reason: {reason})"
+        logger.warning(
+            f"[{self.session_id}] Lowering difficulty due to low share rate "
+            f"({actual_rate:.2f}/min vs baseline {baseline_rate:.2f}/min): "
+            f"{old_difficulty:.2f} -> {new_target:.2f}"
         )
 
         # Send new difficulty to miner
@@ -1220,6 +1434,52 @@ class MinerSession:
         # Update tracking
         self._validator.set_difficulty(new_target)
         self._miner_difficulty = new_target
+        self._last_difficulty_change_time = now
+
+        # Reset baseline so we learn a new one at the lower difficulty
+        self._baseline_share_rate = None
+        self._share_timestamps.clear()
+
+    def _update_adaptive_buffer(self, increase: bool) -> None:
+        """
+        Update the adaptive buffer based on rejection patterns.
+
+        Args:
+            increase: If True, increase buffer (after low-diff rejection).
+                     If False, decrease buffer (after period without rejections).
+        """
+        cfg = self._difficulty_config
+        now = time.time()
+
+        if increase:
+            # Increase buffer after low-diff rejection
+            old_buffer = self._adaptive_buffer
+            self._adaptive_buffer = min(
+                self._adaptive_buffer + cfg.buffer_increase_step,
+                cfg.buffer_max
+            )
+            if self._adaptive_buffer != old_buffer:
+                logger.info(
+                    f"[{self.session_id}] Adaptive buffer increased: "
+                    f"{old_buffer:.1%} -> {self._adaptive_buffer:.1%}"
+                )
+            self._last_low_diff_rejection = now
+        else:
+            # Decrease buffer if no rejections for a while
+            time_since_rejection = now - self._last_low_diff_rejection
+            if time_since_rejection > cfg.buffer_decrease_interval:
+                old_buffer = self._adaptive_buffer
+                self._adaptive_buffer = max(
+                    self._adaptive_buffer - cfg.buffer_increase_step,
+                    cfg.buffer_min
+                )
+                if self._adaptive_buffer != old_buffer:
+                    logger.info(
+                        f"[{self.session_id}] Adaptive buffer decreased: "
+                        f"{old_buffer:.1%} -> {self._adaptive_buffer:.1%}"
+                    )
+                # Reset timer so we don't keep decreasing
+                self._last_low_diff_rejection = now
 
     async def _handle_submit(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner."""
@@ -1431,7 +1691,6 @@ class MinerSession:
             extranonce2=extranonce2,
             ntime=ntime,
             nonce=nonce,
-            extranonce1=upstream.extranonce1,
             version_bits=version_bits,
         )
 
@@ -1449,7 +1708,7 @@ class MinerSession:
             return
 
         # Submit to upstream with retry logic for transient failures
-        max_retries = self.config.proxy.share_submit_retries
+        max_retries = self.config.proxy.global_.share_submit_retries
         retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
         start_time = time.time()
         accepted = False
@@ -1537,6 +1796,11 @@ class MinerSession:
 
         # Record stats and cache share appropriately
         stats = ProxyStats.get_instance()
+
+        # Record share for rate monitoring (both accepted and rejected count)
+        self._record_share_for_rate_monitoring()
+        await self._check_share_rate_and_adjust()
+
         if accepted:
             logger.info(
                 f"[{self.session_id}] Share accepted: job={job_id}, "
@@ -1547,6 +1811,8 @@ class MinerSession:
             self._validator.record_accepted_share(
                 job_id, extranonce2, ntime, nonce, version_bits
             )
+            # Check if we should decrease adaptive buffer (no rejections for a while)
+            self._update_adaptive_buffer(increase=False)
         else:
             # Extract rejection reason from error (handles both list and dict formats)
             reason = _get_error_message(error)
@@ -1556,9 +1822,6 @@ class MinerSession:
             # Auto-adjust difficulty for "highest-seen" mode when pool rejects as low difficulty
             # This handles pools that silently increase difficulty without sending mining.set_difficulty
             await self._handle_low_difficulty_rejection(reason)
-
-            # Lower difficulty on stale shares to help miner find shares faster
-            await self._handle_stale_share_rejection(reason)
 
             # If pool says "duplicate", cache it locally to prevent re-submission.
             # This is CORRECT behavior because:
@@ -1766,7 +2029,7 @@ class MinerSession:
             self.writer.write(data)
             await asyncio.wait_for(
                 self.writer.drain(),
-                timeout=float(self.config.proxy.send_timeout)
+                timeout=float(self.config.proxy.global_.miner_write_timeout)
             )
             # Reset failure counter on successful send
             self._consecutive_send_failures = 0

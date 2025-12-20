@@ -10,7 +10,7 @@ from loguru import logger
 
 if TYPE_CHECKING:
     import asyncio
-    from btc_bch_proxy.config.models import ProxyConfig
+    from crypto_stratum_proxy.config.models import GlobalProxyConfig
 
 # IP ToS value for low-delay traffic (DSCP EF / Expedited Forwarding)
 IPTOS_LOWDELAY = 0x10
@@ -18,7 +18,7 @@ IPTOS_LOWDELAY = 0x10
 
 def enable_tcp_keepalive(
     writer: asyncio.StreamWriter,
-    config: ProxyConfig,
+    config: GlobalProxyConfig,
     connection_name: str = "connection",
 ) -> bool:
     """
@@ -31,7 +31,7 @@ def enable_tcp_keepalive(
 
     Args:
         writer: The asyncio StreamWriter (contains the socket).
-        config: Proxy configuration with keepalive settings.
+        config: Global proxy configuration with keepalive settings.
         connection_name: Name for logging purposes.
 
     Returns:

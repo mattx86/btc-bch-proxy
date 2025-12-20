@@ -1,7 +1,7 @@
 #!/bin/bash
-# Stop btc-bch-proxy
+# Stop crypto-stratum-proxy
 
-echo "Stopping BTC-BCH Proxy..."
+echo "Stopping Crypto Stratum Proxy..."
 
 # Check if venv exists
 if [ ! -f "venv/bin/activate" ]; then
@@ -11,5 +11,5 @@ fi
 
 # Activate virtual environment and stop proxy
 source venv/bin/activate
-btc-bch-proxy stop
+crypto-stratum-proxy stop
 deactivate

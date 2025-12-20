@@ -1,73 +1,190 @@
-# Bitcoin/Bitcoin Cash Stratum Proxy Configuration
+# Multi-Coin Stratum Proxy Configuration
+# Supported algorithms: sha256 (BTC/BCH), randomx (XMR), zksnark (ALEO)
 
 proxy:
-  bind_host: "0.0.0.0"           # Listen on all interfaces
-  bind_port: 3333                 # Port for miners to connect
-  max_connections: 100            # Maximum concurrent miner connections
-  connection_timeout: 60          # Miner connection timeout (seconds)
-  miner_read_timeout: 600         # Miner read timeout in seconds (10 minutes)
-  send_timeout: 30                # Send to miner timeout (seconds)
-  pending_shares_timeout: 10      # Timeout waiting for pending shares (seconds)
-  tcp_keepalive: true             # Enable TCP keepalive on connections
-  keepalive_idle: 60              # Seconds before sending keepalive probes
-  keepalive_interval: 10          # Seconds between keepalive probes
-  keepalive_count: 3              # Failed probes before connection is dead
-  share_submit_retries: 3         # Retries for failed share submissions
-  upstream_health_timeout: 300    # Seconds without upstream messages before reconnecting
+  # Global settings shared by all algorithms
+  global:
+    # Connection limits
+    max_connections: 1024           # Maximum concurrent miner connections
 
+    # Miner connection timeouts
+    miner_read_timeout: 180         # Miner read timeout (seconds, 3 min)
+    miner_write_timeout: 30         # Miner write timeout (seconds)
+
+    # Upstream settings
+    upstream_idle_timeout: 300      # Seconds without upstream messages before reconnecting (5 min)
+    server_switch_timeout: 900      # Seconds to retry connecting to new server during switch (15 min)
+
+    # TCP keepalive settings
+    tcp_keepalive: true             # Enable TCP keepalive on connections
+    keepalive_idle: 60              # Seconds before sending keepalive probes
+    keepalive_interval: 10          # Seconds between keepalive probes
+    keepalive_count: 3              # Failed probes before connection is dead
+
+    # Retry and shutdown settings
+    share_submit_retries: 3         # Retries for failed share submissions
+    pending_shares_timeout: 10      # Timeout waiting for pending shares (seconds)
+
+  # Share validation settings
+  validation:
+    reject_duplicates: true         # Reject duplicate share submissions
+    reject_stale: true              # Reject shares for stale/unknown jobs
+    share_cache_size: 1000          # Max recent shares to track per session
+    share_cache_ttl: 300            # Share cache TTL in seconds
+    job_cache_size: 10              # Max jobs to track per session
+
+  # Difficulty management settings
+  difficulty:
+    change_cooldown: 30             # Minimum seconds between difficulty changes
+    # Time-based decay toward pool difficulty
+    decay_enabled: true             # Enable gradual decay toward pool difficulty
+    decay_interval: 300             # Seconds between decay checks (5 min)
+    decay_percent: 0.05             # Decay percentage per interval (5%)
+    # Floor-reset when pool difficulty drops significantly
+    floor_trigger_ratio: 0.50       # Trigger floor-reset when pool < 50% of miner difficulty
+    floor_reset_ratio: 0.75         # Reset to 75% of current miner difficulty
+    # Share rate monitoring - detects and adjusts for difficulty issues
+    share_rate_window: 300          # Window in seconds to track share rate
+    share_rate_min_shares: 3        # Minimum shares needed before analyzing rate
+    share_rate_low_multiplier: 0.5  # Lower difficulty if rate drops to this fraction of baseline
+    # Adaptive buffer - learns optimal buffer from rejection patterns
+    buffer_start: 0.05              # Starting buffer percentage (5%)
+    buffer_min: 0.02                # Minimum buffer percentage (2%)
+    buffer_max: 0.20                # Maximum buffer percentage (20%)
+    buffer_increase_step: 0.01      # Buffer increase step on rejection (1%)
+    buffer_decrease_interval: 3600  # Seconds without rejection before decreasing buffer
+
+  # Circuit breaker - stop trying failed pools temporarily
+  circuit_breaker:
+    enabled: true                   # Enable circuit breaker pattern
+    failure_threshold: 5            # Failures before opening circuit
+    recovery_timeout: 60            # Seconds to wait before retry
+    success_threshold: 2            # Successes needed to close circuit
+
+  # SHA-256 proxy (Bitcoin, Bitcoin Cash, DigiByte)
+  sha256:
+    enabled: true
+    bind_host: "0.0.0.0"
+    bind_port: 3333
+
+  # RandomX proxy (Monero)
+  randomx:
+    enabled: false
+    bind_host: "0.0.0.0"
+    bind_port: 3334
+
+  # zkSNARK proxy (ALEO)
+  zksnark:
+    enabled: false
+    bind_host: "0.0.0.0"
+    bind_port: 3335
+
+# Servers organized by algorithm (each server includes its schedule times)
 servers:
-  - name: "stratum1"
-    host: "pool1.example.com"
-    port: 3333
-    username: "wallet_address.worker1"
-    password: "x"
-    ssl: false
-    timeout: 30
-    retry_interval: 5
+  sha256:
+    # stratum1 for morning/night hours (00:00 to 11:59)
+    - name: "stratum1"
+      enabled: true
+      host: "pool1.example.com"
+      port: 3333
+      username: "wallet_address.worker1"
+      password: "x"
+      ssl: false
+      connect_timeout: 30
+      retry_interval: 5
+      start: "00:00"                # Schedule start time (HH:MM)
+      end: "12:00"                  # Schedule end time (HH:MM, use 24:00 for midnight)
+      # Per-server difficulty overrides (optional)
+      # buffer_percent: 0.10        # Override global buffer (e.g., 10% for this pool)
+      # min_difficulty: 1000        # Minimum difficulty for this pool
+      # max_difficulty: 1000000     # Maximum difficulty for this pool
 
-  - name: "stratum2"
-    host: "pool2.example.com"
-    port: 3333
-    username: "wallet_address.worker2"
-    password: "x"
-    ssl: false
-    timeout: 30
-    retry_interval: 5
+    # stratum2 for afternoon/evening hours (12:00 to 23:59)
+    - name: "stratum2"
+      enabled: true
+      host: "pool2.example.com"
+      port: 3333
+      username: "wallet_address.worker2"
+      password: "x"
+      ssl: false
+      connect_timeout: 30
+      retry_interval: 5
+      start: "12:00"
+      end: "24:00"
 
-schedule:
-  # stratum1 for morning/night hours (00:00 to 11:59)
-  - start: "00:00"
-    end: "12:00"
-    server: "stratum1"
+  # RandomX servers (Monero) - enable proxy.randomx to use
+  # randomx:
+  #   # xmr1 for morning/night hours (00:00 to 11:59)
+  #   - name: "xmr1"
+  #     enabled: true
+  #     host: "xmr-pool1.example.com"
+  #     port: 3333
+  #     username: "wallet_address.worker1"
+  #     password: "x"
+  #     ssl: false
+  #     connect_timeout: 30
+  #     retry_interval: 5
+  #     start: "00:00"
+  #     end: "12:00"
+  #
+  #   # xmr2 for afternoon/evening hours (12:00 to 23:59)
+  #   - name: "xmr2"
+  #     enabled: true
+  #     host: "xmr-pool2.example.com"
+  #     port: 3333
+  #     username: "wallet_address.worker2"
+  #     password: "x"
+  #     ssl: false
+  #     connect_timeout: 30
+  #     retry_interval: 5
+  #     start: "12:00"
+  #     end: "24:00"
 
-  # stratum2 for afternoon/evening hours (12:00 to 23:59)
-  - start: "12:00"
-    end: "24:00"
-    server: "stratum2"
+  # zkSNARK servers (ALEO) - enable proxy.zksnark to use
+  # zksnark:
+  #   # zksnark1 for morning/night hours (00:00 to 11:59)
+  #   - name: "zksnark1"
+  #     enabled: true
+  #     host: "aleo-pool1.example.com"
+  #     port: 3335
+  #     username: "wallet_address.worker1"
+  #     password: "x"
+  #     ssl: false
+  #     connect_timeout: 30
+  #     retry_interval: 5
+  #     start: "00:00"
+  #     end: "12:00"
+  #
+  #   # zksnark2 for afternoon/evening hours (12:00 to 23:59)
+  #   - name: "zksnark2"
+  #     enabled: true
+  #     host: "aleo-pool2.example.com"
+  #     port: 3335
+  #     username: "wallet_address.worker2"
+  #     password: "x"
+  #     ssl: false
+  #     connect_timeout: 30
+  #     retry_interval: 5
+  #     start: "12:00"
+  #     end: "24:00"
 
 logging:
-  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR, CRITICAL
   file: null                      # Log file path (null for console only)
   rotation: "50 MB"               # Log rotation size
   retention: 10                   # Keep N rotated files
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"
 
-# Failover settings
-failover:
-  retry_timeout_minutes: 20       # Retry primary server for this long before failover
-
-# Share validation settings
-validation:
-  reject_duplicates: true         # Reject duplicate share submissions
-  reject_stale: true              # Reject shares for stale/unknown jobs
-  validate_difficulty: false      # Validate share hash meets difficulty (CPU intensive)
-  share_cache_size: 1000          # Max recent shares to track per session
-  share_cache_ttl: 300            # Share cache TTL in seconds
-  job_cache_size: 10              # Max jobs to track per session
-
-# Automatic difficulty management (no configuration required):
-# - Proxy sends (pool_difficulty + 1000) to miner to prevent vardiff duplicates
-# - Difficulty only increases, never decreases (highest-seen tracking)
-# - Miner mining.suggest_difficulty requests are forwarded to pool unchanged
-# - On low-difficulty rejection: raises to (rejected_diff + 1000) if higher
-# - On stale share rejection: lowers by 1000 (if still above pool difficulty)
+# Difficulty management features:
+# - Buffer: Adds configurable % to pool difficulty (prevents vardiff duplicates)
+# - Highest-seen tracking: Difficulty only increases normally (never decreases)
+# - Cooldown: Minimum time between difficulty changes (prevents oscillation)
+# - Time-based decay: Gradually lowers toward pool difficulty when above target
+# - Floor-reset: Resets when pool drops significantly below miner difficulty
+# - Low-diff rejection: Raises to rejected difficulty + buffer if higher
+# - Share rate monitoring: Detect if difficulty is too high (low share rate) or too low
+# - Adaptive buffer: Learn optimal buffer from observed rejection patterns
+# - Per-server overrides: Configure different buffer/min/max per pool
+#
+# Connection resilience features:
+# - Circuit breaker: Temporarily stop trying failed pools to reduce log spam

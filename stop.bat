@@ -1,7 +1,7 @@
 @echo off
-REM Stop btc-bch-proxy
+REM Stop crypto-stratum-proxy
 
-echo Stopping BTC-BCH Proxy...
+echo Stopping Crypto Stratum Proxy...
 
 REM Check if venv exists
 if not exist venv\Scripts\activate.bat (
@@ -11,5 +11,5 @@ if not exist venv\Scripts\activate.bat (
 
 REM Activate virtual environment and stop proxy
 call venv\Scripts\activate.bat
-btc-bch-proxy stop
+crypto-stratum-proxy stop
 call deactivate

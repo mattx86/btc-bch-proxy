@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import LoggingConfig
+    from crypto_stratum_proxy.config.models import LoggingConfig
 
 
 def setup_logging(config: LoggingConfig) -> None:

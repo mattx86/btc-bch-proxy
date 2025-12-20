@@ -1,13 +1,17 @@
-# BTC/BCH Stratum Proxy
+# Crypto Stratum Proxy
 
-> **Beta Software**: This project is currently in beta and under active development. Use with caution in production environments. Please report any issues on GitHub.
+> **Alpha Software**: This project is currently in alpha and undergoing active development. Use with caution in production environments. Please report any issues on GitHub.
 
-A cross-platform SHA-256 stratum proxy with time-based server routing. Automatically switches between mining pools based on a configurable daily schedule.
+A cross-platform cryptocurrency stratum proxy with time-based server routing. Automatically switches between mining pools based on a configurable daily schedule.
 
-**Supported Coins:** Bitcoin (BTC), Bitcoin Cash (BCH), DigiByte (DGB), and other SHA-256 based cryptocurrencies.
+**Supported Algorithms:**
+- **SHA-256**: Bitcoin (BTC), Bitcoin Cash (BCH), DigiByte (DGB), and other SHA-256 coins
+- **RandomX**: Monero (XMR) and other RandomX coins
+- **zkSNARK**: ALEO
 
 ## Features
 
+- **Multi-coin support**: SHA-256 (BTC/BCH), RandomX (XMR), and ALEO with per-server coin type configuration
 - **Time-based routing**: Automatically switch between stratum servers on a schedule
 - **Multiple miners**: Support for concurrent miner connections
 - **Failover**: Configurable retry period (default 20 min) before failing over to backup server
@@ -19,7 +23,7 @@ A cross-platform SHA-256 stratum proxy with time-based server routing. Automatic
 - **Version-rolling**: Supports ASICBoost/version-rolling negotiation with pools
 - **Share validation**: Rejects duplicate shares and stale jobs before forwarding to pool
 - **Connection health**: TCP keepalives and automatic reconnection on connection failures
-- **Automatic difficulty management**: Prevents vardiff-induced duplicate shares with +1000 buffer and highest-seen tracking
+- **Automatic difficulty management**: Coin-specific difficulty buffers with highest-seen tracking
 - **Loguru logging**: Structured logging with file rotation
 
 ## Installation
@@ -27,8 +31,8 @@ A cross-platform SHA-256 stratum proxy with time-based server routing. Automatic
 ### Quick Start (Recommended)
 
 ```bash
-git clone https://github.com/mattx86/btc-bch-proxy.git
-cd btc-bch-proxy
+git clone https://github.com/mattx86/crypto-stratum-proxy.git
+cd crypto-stratum-proxy
 
 # Initialize proxy -- Windows
 init.bat
@@ -73,36 +77,44 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
 
    ```yaml
    proxy:
-     bind_host: "0.0.0.0"
-     bind_port: 3333
+     global:
+       max_connections: 100
+     sha256:
+       enabled: true
+       bind_host: "0.0.0.0"
+       bind_port: 3333
 
    servers:
-     - name: "btc"
-       host: "stratum.pool1.com"
-       port: 3333
-       username: "your_wallet.worker1"
-       password: "x"
+     sha256:
+       - name: "btc"
+         enabled: true
+         host: "stratum.pool1.com"
+         port: 3333
+         username: "your_wallet.worker1"
+         password: "x"
 
-     - name: "bch"
-       host: "stratum.pool2.com"
-       port: 3333
-       username: "your_wallet.worker1"
-       password: "x"
+       - name: "bch"
+         enabled: true
+         host: "stratum.pool2.com"
+         port: 3333
+         username: "your_wallet.worker1"
+         password: "x"
 
    schedule:
-     - start: "00:00"
-       end: "12:00"
-       server: "btc"
+     sha256:
+       - server: "btc"
+         start: "00:00"
+         end: "12:00"
 
-     - start: "12:00"
-       end: "24:00"
-       server: "bch"
+       - server: "bch"
+         start: "12:00"
+         end: "24:00"
    ```
 
 3. **Validate the configuration:**
 
    ```bash
-   btc-bch-proxy validate config.yaml
+   crypto-stratum-proxy validate config.yaml
    ```
 
 4. **Start the proxy:**
@@ -143,16 +155,16 @@ This creates a virtual environment, upgrades pip, installs dependencies, and gen
 
 | Command | Description |
 |---------|-------------|
-| `btc-bch-proxy init` | Create sample configuration file |
-| `btc-bch-proxy start` | Start the proxy |
-| `btc-bch-proxy stop` | Stop the running proxy |
-| `btc-bch-proxy status` | Check if proxy is running |
-| `btc-bch-proxy validate <config>` | Validate a configuration file |
+| `crypto-stratum-proxy init` | Create sample configuration file |
+| `crypto-stratum-proxy start` | Start the proxy |
+| `crypto-stratum-proxy stop` | Stop the running proxy |
+| `crypto-stratum-proxy status` | Check if proxy is running |
+| `crypto-stratum-proxy validate <config>` | Validate a configuration file |
 
 ### Start Options
 
 ```bash
-btc-bch-proxy start [OPTIONS]
+crypto-stratum-proxy start [OPTIONS]
 
 Options:
   -c, --config PATH      Path to configuration file
@@ -166,19 +178,45 @@ Options:
 
 ```yaml
 proxy:
-  bind_host: "0.0.0.0"        # Address to listen on
-  bind_port: 3333             # Port to listen on
-  max_connections: 100        # Maximum concurrent miner connections
-  connection_timeout: 60      # Miner connection timeout (seconds)
-  miner_read_timeout: 600     # Miner read timeout (seconds, default 10 min)
-  send_timeout: 30            # Send to miner timeout (seconds)
-  pending_shares_timeout: 10  # Wait for pending shares during switch (seconds)
-  tcp_keepalive: true         # Enable TCP keepalive on connections
-  keepalive_idle: 60          # Seconds before sending keepalive probes
-  keepalive_interval: 10      # Seconds between keepalive probes
-  keepalive_count: 3          # Failed probes before connection is dead
-  share_submit_retries: 3     # Retries for failed share submissions
-  upstream_health_timeout: 300  # Seconds without upstream messages before reconnecting
+  # Global settings shared by all algorithms
+  global:
+    max_connections: 100        # Maximum concurrent miner connections
+    connection_timeout: 60      # Miner connection timeout (seconds)
+    miner_read_timeout: 600     # Miner read timeout (seconds, default 10 min)
+    send_timeout: 30            # Send to miner timeout (seconds)
+    pending_shares_timeout: 10  # Wait for pending shares during switch (seconds)
+    tcp_keepalive: true         # Enable TCP keepalive on connections
+    keepalive_idle: 60          # Seconds before sending keepalive probes
+    keepalive_interval: 10      # Seconds between keepalive probes
+    keepalive_count: 3          # Failed probes before connection is dead
+    share_submit_retries: 3     # Retries for failed share submissions
+    upstream_health_timeout: 300  # Seconds without upstream messages before reconnecting
+
+  # Failover settings
+  failover:
+    retry_timeout_minutes: 20   # Retry primary server for this long before failover
+
+  # Share validation settings
+  validation:
+    reject_duplicates: true     # Reject duplicate share submissions
+    reject_stale: true          # Reject shares for stale/unknown jobs
+    validate_difficulty: false  # Validate share hash meets difficulty (CPU intensive)
+
+  # Per-algorithm settings (each algorithm runs on its own port)
+  sha256:
+    enabled: true               # Enable SHA-256 proxy
+    bind_host: "0.0.0.0"        # Address to listen on
+    bind_port: 3333             # Port for SHA-256 miners
+
+  randomx:
+    enabled: false              # Enable RandomX proxy
+    bind_host: "0.0.0.0"
+    bind_port: 3334             # Port for RandomX miners
+
+  aleo:
+    enabled: false              # Enable ALEO proxy
+    bind_host: "0.0.0.0"
+    bind_port: 3335             # Port for ALEO miners
 ```
 
 **Keepalive Settings:**
@@ -197,32 +235,61 @@ The proxy monitors connection health by tracking when the last message was recei
 
 ### Server Settings
 
+Servers are organized by algorithm:
+
 ```yaml
 servers:
-  - name: "unique_name"     # Unique identifier for this server
-    host: "pool.example.com"
-    port: 3333
-    username: "wallet.worker"
-    password: "x"
-    ssl: false              # Use SSL/TLS connection
-    timeout: 30             # Connection timeout (seconds)
-    retry_interval: 5       # Seconds between reconnection attempts
+  sha256:
+    - name: "unique_name"     # Unique identifier for this server
+      enabled: true           # Enable/disable this server
+      host: "pool.example.com"
+      port: 3333
+      username: "wallet.worker"
+      password: "x"
+      ssl: false              # Use SSL/TLS connection
+      timeout: 30             # Connection timeout (seconds)
+      retry_interval: 5       # Seconds between reconnection attempts
+
+  randomx:
+    - name: "xmr_pool"
+      enabled: true
+      host: "xmr.pool.com"
+      port: 3333
+      username: "wallet_address"
+      password: "x"
 ```
+
+**Algorithm Types:**
+| Algorithm | Coins | Difficulty Buffer |
+|-----------|-------|-------------------|
+| `sha256` | Bitcoin, Bitcoin Cash, DigiByte | Fixed +1000 |
+| `randomx` | Monero (XMR) | 5% of pool difficulty |
+| `aleo` | ALEO | 5% of pool difficulty |
+
+**Note:** Hash validation (`validate_difficulty`) is only supported for SHA-256 coins. For other algorithms, this setting is automatically disabled.
 
 ### Schedule Settings
 
+Schedules are organized by algorithm:
+
 ```yaml
 schedule:
-  - start: "00:00"          # Start time (HH:MM)
-    end: "12:00"            # End time (HH:MM, use 24:00 for midnight)
-    server: "server_name"   # Server to use during this period
+  sha256:
+    - server: "server_name"   # Server to use during this period
+      start: "00:00"          # Start time (HH:MM)
+      end: "12:00"            # End time (HH:MM, use 24:00 for midnight)
+
+  randomx:
+    - server: "xmr_pool"
+      start: "00:00"
+      end: "24:00"            # Run 24/7 on this pool
 ```
 
 **Notes:**
 - Times are in 24-hour format (local time)
 - Use `24:00` to represent end of day
-- Timeframes must not overlap
-- All servers referenced in schedule must be defined in `servers`
+- Timeframes must not overlap within each algorithm
+- All servers referenced in schedule must be defined in the same algorithm's `servers` section
 
 ### Logging Settings
 
@@ -235,48 +302,23 @@ logging:
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}"  # Log format
 ```
 
-### Failover Settings
-
-```yaml
-failover:
-  retry_timeout_minutes: 20  # Retry primary server for this long before failover
-```
-
-### Share Validation Settings
-
-The proxy can validate shares locally before forwarding to the upstream pool, reducing unnecessary network traffic and improving pool acceptance rates.
-
-```yaml
-validation:
-  reject_duplicates: true     # Reject duplicate share submissions
-  reject_stale: true          # Reject shares for expired/unknown jobs
-  validate_difficulty: false  # Validate share hash meets difficulty (CPU intensive)
-  share_cache_size: 1000      # Max recent shares to track per session
-  share_cache_ttl: 300        # Share cache TTL in seconds
-  job_cache_size: 10          # Max jobs to track per session
-```
-
-**Options:**
-- `reject_duplicates`: Prevents submitting the same share twice (reduces "duplicate share" rejections)
-- `reject_stale`: Prevents submitting shares for jobs that are no longer valid (reduces "stale job" rejections)
-- `validate_difficulty`: Validates that the share hash actually meets the difficulty target before submitting (CPU intensive, disabled by default)
-
 ### Automatic Difficulty Management
 
 The proxy automatically manages difficulty to combat vardiff-induced duplicate share rejections. No configuration is required.
 
 **Behavior:**
-- When pool sets difficulty, proxy sends `(pool_difficulty + 1000)` to miner
+- When pool sets difficulty, proxy sends `(pool_difficulty + buffer)` to miner
+- Buffer is algorithm-specific: +1000 for SHA-256, +5% for RandomX/ALEO
 - Difficulty only increases, never decreases (highest-seen tracking)
 - Miner `mining.suggest_difficulty` requests are forwarded to pool unchanged
 - Difficulty resets on pool switch (new session with new pool)
 
 **Auto-adjustment:**
-- **Low difficulty rejection**: If pool rejects share as "low difficulty" (or similar), proxy raises difficulty to `(rejected_difficulty + 1000)` if that's higher than current
-- **Stale share rejection**: If pool rejects share as "stale" or "job not found", proxy lowers difficulty by 1000 (if still above pool difficulty)
-- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 75% of miner difficulty (25% reduction) if still > pool difficulty + 1000. This prevents excessive divergence from pool expectations.
+- **Low difficulty rejection**: If pool rejects share as "low difficulty" (or similar), proxy raises difficulty to `(rejected_difficulty + buffer)` if that's higher than current
+- **Stale share rejection**: If pool rejects share as "stale" or "job not found", proxy lowers difficulty by buffer (if still above pool difficulty)
+- **Floor-reset**: If pool difficulty drops to less than 50% of miner difficulty, proxy resets to 75% of miner difficulty (25% reduction) if still > pool difficulty + buffer. This prevents excessive divergence from pool expectations.
 
-**Note:** This automatic +1000 buffer prevents most vardiff-induced duplicate rejections while keeping the miner working at a difficulty close to what the pool expects.
+**Note:** The automatic difficulty buffer prevents most vardiff-induced duplicate rejections while keeping the miner working at a difficulty close to what the pool expects.
 
 ## Statistics
 

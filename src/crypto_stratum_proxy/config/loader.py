@@ -8,7 +8,7 @@ from typing import Union
 import yaml
 from pydantic import ValidationError
 
-from btc_bch_proxy.config.models import Config
+from crypto_stratum_proxy.config.models import Config
 
 
 class ConfigError(Exception):
@@ -78,11 +78,12 @@ def validate_config(path: Union[str, Path]) -> tuple[bool, str]:
     """
     try:
         config = load_config(path)
-        server_count = len(config.servers)
-        schedule_count = len(config.schedule)
+        # Count servers across all algorithms
+        total_servers = sum(len(servers) for servers in config.servers.values())
+        algo_count = len(config.proxy.get_enabled_algorithms())
         return (
             True,
-            f"Configuration valid: {server_count} servers, {schedule_count} schedule entries",
+            f"Configuration valid: {total_servers} servers, {algo_count} algorithms enabled",
         )
     except ConfigError as e:
         return False, str(e)

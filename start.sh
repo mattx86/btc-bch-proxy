@@ -1,7 +1,7 @@
 #!/bin/bash
-# Start btc-bch-proxy
+# Start crypto-stratum-proxy
 
-echo "Starting BTC-BCH Proxy..."
+echo "Starting Crypto Stratum Proxy..."
 
 # Check if venv exists
 if [ ! -f "venv/bin/activate" ]; then
@@ -17,5 +17,5 @@ fi
 
 # Activate virtual environment and start proxy
 source venv/bin/activate
-btc-bch-proxy start -c config.yaml "$@"
+crypto-stratum-proxy start -c config.yaml "$@"
 deactivate

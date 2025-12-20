@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from loguru import logger
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import Config
+    from crypto_stratum_proxy.config.models import Config
 
 
 class DaemonError(Exception):
@@ -177,11 +177,11 @@ class DaemonManager:
         elif sys.platform == "win32":
             self._pid_path = os.path.join(
                 os.environ.get("LOCALAPPDATA", "C:\\ProgramData"),
-                "btc-bch-proxy",
+                "crypto-stratum-proxy",
                 "proxy.pid",
             )
         else:
-            self._pid_path = "/var/run/btc-bch-proxy/proxy.pid"
+            self._pid_path = "/var/run/crypto-stratum-proxy/proxy.pid"
 
         self._pid_file = PidFile(self._pid_path)
         self._stop_event = asyncio.Event()
@@ -284,7 +284,7 @@ class DaemonManager:
         args = [
             python,
             "-m",
-            "btc_bch_proxy",
+            "crypto_stratum_proxy",
             "start",
             "--foreground",
         ]
@@ -492,8 +492,8 @@ class DaemonManager:
 
     async def _run_main_loop(self) -> None:
         """Main application loop."""
-        from btc_bch_proxy.logging.setup import setup_logging
-        from btc_bch_proxy.proxy.server import run_proxy
+        from crypto_stratum_proxy.logging.setup import setup_logging
+        from crypto_stratum_proxy.proxy.server import run_proxy
 
         # Setup signal handlers (must be done inside async context)
         self._setup_signals()
@@ -501,8 +501,13 @@ class DaemonManager:
         # Setup logging
         setup_logging(self.config.logging)
 
-        logger.info("Starting BTC/BCH Stratum Proxy")
-        logger.info(f"Configured servers: {', '.join(self.config.get_server_names())}")
+        logger.info("Starting Multi-Coin Stratum Proxy")
+        enabled_algos = self.config.proxy.get_enabled_algorithms()
+        logger.info(f"Enabled algorithms: {', '.join(enabled_algos)}")
+        for algo in enabled_algos:
+            server_names = self.config.get_server_names(algo)
+            algo_config = getattr(self.config.proxy, algo)
+            logger.info(f"[{algo}] Port {algo_config.bind_port}, servers: {', '.join(server_names)}")
 
         # Run the proxy
         await run_proxy(self.config, self._stop_event)

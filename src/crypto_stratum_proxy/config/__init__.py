@@ -1,22 +1,20 @@
 """Configuration module for stratum proxy."""
 
-from btc_bch_proxy.config.models import (
+from crypto_stratum_proxy.config.models import (
     Config,
     LoggingConfig,
     ProxyConfig,
     StratumServerConfig,
-    TimeFrame,
-    FailoverConfig,
+    END_OF_DAY,
 )
-from btc_bch_proxy.config.loader import load_config, validate_config
+from crypto_stratum_proxy.config.loader import load_config, validate_config
 
 __all__ = [
     "Config",
     "LoggingConfig",
     "ProxyConfig",
     "StratumServerConfig",
-    "TimeFrame",
-    "FailoverConfig",
+    "END_OF_DAY",
     "load_config",
     "validate_config",
 ]

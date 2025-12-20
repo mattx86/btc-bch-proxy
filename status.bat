@@ -1,5 +1,5 @@
 @echo off
-REM Check btc-bch-proxy status
+REM Check crypto-stratum-proxy status
 
 REM Check if venv exists
 if not exist venv\Scripts\activate.bat (
@@ -9,5 +9,5 @@ if not exist venv\Scripts\activate.bat (
 
 REM Activate virtual environment and check status
 call venv\Scripts\activate.bat
-btc-bch-proxy status
+crypto-stratum-proxy status
 call deactivate

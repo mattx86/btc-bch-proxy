@@ -1,7 +1,7 @@
 """Stratum protocol handling module."""
 
-from btc_bch_proxy.stratum.protocol import StratumProtocol
-from btc_bch_proxy.stratum.messages import (
+from crypto_stratum_proxy.stratum.protocol import StratumProtocol
+from crypto_stratum_proxy.stratum.messages import (
     StratumMessage,
     StratumRequest,
     StratumResponse,

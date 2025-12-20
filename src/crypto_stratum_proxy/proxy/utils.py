@@ -7,7 +7,7 @@ from typing import Coroutine, Any, Optional
 
 from loguru import logger
 
-from btc_bch_proxy.proxy.constants import MAX_BACKGROUND_ERROR_LENGTH
+from crypto_stratum_proxy.proxy.constants import MAX_BACKGROUND_ERROR_LENGTH
 
 
 def fire_and_forget(coro: Coroutine[Any, Any, Any]) -> Optional[asyncio.Task]:

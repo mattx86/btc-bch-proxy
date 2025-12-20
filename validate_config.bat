@@ -1,5 +1,5 @@
 @echo off
-REM Validate btc-bch-proxy configuration
+REM Validate crypto-stratum-proxy configuration
 
 REM Check if venv exists
 if not exist venv\Scripts\activate.bat (
@@ -15,5 +15,5 @@ if not exist config.yaml (
 
 REM Activate virtual environment and validate config
 call venv\Scripts\activate.bat
-btc-bch-proxy validate config.yaml
+crypto-stratum-proxy validate config.yaml
 call deactivate

@@ -1,8 +1,8 @@
 @echo off
-REM Initialize btc-bch-proxy: create venv, install dependencies, create config
+REM Initialize crypto-stratum-proxy: create venv, install dependencies, create config
 
 echo ========================================
-echo  BTC-BCH Proxy Initialization
+echo  Crypto Stratum Proxy Initialization
 echo ========================================
 echo.
 
@@ -53,7 +53,7 @@ if exist config.yaml (
     echo config.yaml already exists, skipping...
 ) else (
     echo Creating config.yaml...
-    btc-bch-proxy init
+    crypto-stratum-proxy init
 )
 
 REM Deactivate virtual environment

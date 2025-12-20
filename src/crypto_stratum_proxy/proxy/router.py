@@ -8,16 +8,19 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 
 from loguru import logger
 
-from btc_bch_proxy.proxy.stats import ProxyStats
-from btc_bch_proxy.proxy.constants import SCHEDULER_CHECK_INTERVAL
+from crypto_stratum_proxy.config.models import END_OF_DAY
+from crypto_stratum_proxy.proxy.stats import ProxyStats
+from crypto_stratum_proxy.proxy.constants import SCHEDULER_CHECK_INTERVAL
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import Config, StratumServerConfig, TimeFrame
+    from crypto_stratum_proxy.config.models import Config, StratumServerConfig
 
 
 class TimeBasedRouter:
     """
     Determines which upstream stratum server to use based on the current time.
+
+    Each router instance handles a single algorithm (sha256, randomx, zksnark).
 
     Handles:
     - Time-based server selection from schedule
@@ -26,14 +29,16 @@ class TimeBasedRouter:
     - Failover to alternate servers when primary is unavailable
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, algorithm: str):
         """
-        Initialize the router.
+        Initialize the router for a specific algorithm.
 
         Args:
             config: Main configuration object.
+            algorithm: The algorithm this router handles (sha256, randomx, zksnark).
         """
         self.config = config
+        self.algorithm = algorithm
         self._switch_callbacks: List[Callable[[str], Awaitable[Any]]] = []
         self._callbacks_lock = asyncio.Lock()  # Lock for callback list modifications
         self._current_server: Optional[str] = None
@@ -41,6 +46,11 @@ class TimeBasedRouter:
         # Format: (is_active: bool, server_name: Optional[str])
         self._failover_state: tuple[bool, Optional[str]] = (False, None)
         self._failover_lock = asyncio.Lock()  # Lock for failover state modifications
+
+    @property
+    def scheduled_servers(self) -> List["StratumServerConfig"]:
+        """Get the scheduled servers for this router's algorithm."""
+        return self.config.get_scheduled_servers(self.algorithm)
 
     async def get_current_server_async(self) -> str:
         """
@@ -59,19 +69,21 @@ class TimeBasedRouter:
                 return server
 
         # Check for empty schedule first
-        if not self.config.schedule:
+        servers = self.scheduled_servers
+        if not servers:
             raise RuntimeError(
-                "No schedule configured. Add schedule entries to your configuration."
+                f"No servers with schedules configured for {self.algorithm}. "
+                f"Add start/end times to your servers."
             )
 
         now = datetime.now().time()
-        for frame in self.config.schedule:
-            if frame.contains(now):
-                return frame.server
+        for server in servers:
+            if server.contains_time(now):
+                return server.name
 
         raise RuntimeError(
-            f"No server configured for current time {now}. "
-            f"Check your schedule configuration covers all hours."
+            f"No server configured for {self.algorithm} at time {now}. "
+            f"Check your server schedules cover all hours."
         )
 
     def get_current_server(self) -> str:
@@ -94,19 +106,21 @@ class TimeBasedRouter:
             return server
 
         # Check for empty schedule first
-        if not self.config.schedule:
+        servers = self.scheduled_servers
+        if not servers:
             raise RuntimeError(
-                "No schedule configured. Add schedule entries to your configuration."
+                f"No servers with schedules configured for {self.algorithm}. "
+                f"Add start/end times to your servers."
             )
 
         now = datetime.now().time()
-        for frame in self.config.schedule:
-            if frame.contains(now):
-                return frame.server
+        for server in servers:
+            if server.contains_time(now):
+                return server.name
 
         raise RuntimeError(
-            f"No server configured for current time {now}. "
-            f"Check your schedule configuration covers all hours."
+            f"No server configured for {self.algorithm} at time {now}. "
+            f"Check your server schedules cover all hours."
         )
 
     def get_scheduled_server(self) -> str:
@@ -117,22 +131,22 @@ class TimeBasedRouter:
             Name of the scheduled server.
         """
         now = datetime.now().time()
-        for frame in self.config.schedule:
-            if frame.contains(now):
-                return frame.server
-        raise RuntimeError(f"No server configured for current time {now}")
+        for server in self.scheduled_servers:
+            if server.contains_time(now):
+                return server.name
+        raise RuntimeError(f"No server configured for {self.algorithm} at time {now}")
 
-    def get_current_timeframe(self) -> Optional[TimeFrame]:
+    def get_current_scheduled_server(self) -> Optional["StratumServerConfig"]:
         """
-        Get the current active timeframe.
+        Get the current active scheduled server.
 
         Returns:
-            Current TimeFrame or None.
+            Current scheduled server or None.
         """
         now = datetime.now().time()
-        for frame in self.config.schedule:
-            if frame.contains(now):
-                return frame
+        for server in self.scheduled_servers:
+            if server.contains_time(now):
+                return server
         return None
 
     def get_next_switch_time(self) -> datetime:
@@ -145,17 +159,17 @@ class TimeBasedRouter:
         now = datetime.now()
         current_time = now.time()
 
-        # Find the current timeframe
-        current_frame = self.get_current_timeframe()
-        if not current_frame:
+        # Find the current scheduled server
+        current_server = self.get_current_scheduled_server()
+        if not current_server:
             # Shouldn't happen if config is valid
             return now + timedelta(hours=1)
 
-        # The next switch is at the end of the current timeframe
-        end_time = current_frame.end
+        # The next switch is at the end of the current server's schedule
+        end_time = current_server.end
 
         # Calculate datetime for the end time
-        if end_time == time(23, 59, 59):
+        if end_time == END_OF_DAY:
             # End of day - next switch is at midnight
             next_switch = datetime.combine(now.date(), time(0, 0, 0)) + timedelta(days=1)
         elif end_time > current_time:
@@ -181,19 +195,19 @@ class TimeBasedRouter:
         next_time = self.get_next_switch_time() + timedelta(seconds=1)
         test_time = next_time.time()
 
-        for frame in self.config.schedule:
-            if frame.contains(test_time):
-                return frame.server
+        for server in self.scheduled_servers:
+            if server.contains_time(test_time):
+                return server.name
 
         # This should be unreachable if config validation ensures 24-hour coverage
         raise RuntimeError(
-            f"No server configured for time {test_time}. "
+            f"No server configured for {self.algorithm} at time {test_time}. "
             f"This indicates a bug in schedule validation."
         )
 
     def get_server_config(self, server_name: str) -> Optional[StratumServerConfig]:
         """
-        Get the configuration for a server by name.
+        Get the configuration for a server by name within this algorithm.
 
         Args:
             server_name: Name of the server.
@@ -201,7 +215,7 @@ class TimeBasedRouter:
         Returns:
             Server configuration or None.
         """
-        return self.config.get_server_by_name(server_name)
+        return self.config.get_server_by_name(self.algorithm, server_name)
 
     def get_failover_server(self, current_server: str) -> Optional[str]:
         """
@@ -215,7 +229,7 @@ class TimeBasedRouter:
         Returns:
             Name of a failover server or None if none available.
         """
-        server_names = self.config.get_server_names()
+        server_names = self.config.get_server_names(self.algorithm)
 
         # Find the index of the current server
         try:
@@ -308,7 +322,7 @@ class TimeBasedRouter:
         Args:
             stop_event: Event to signal shutdown.
         """
-        logger.info("Starting time-based scheduler")
+        logger.info(f"Starting time-based scheduler for {self.algorithm}")
 
         def get_server_addr(server_name: str) -> Optional[str]:
             """Get server address as host:port."""
@@ -323,9 +337,9 @@ class TimeBasedRouter:
             self._current_server = initial_server
             stats = ProxyStats.get_instance()
             await stats.set_active_server(initial_server, get_server_addr(initial_server))
-            logger.info(f"Initial active server: {initial_server}")
+            logger.info(f"[{self.algorithm}] Initial active server: {initial_server}")
         except RuntimeError as e:
-            logger.error(f"Failed to determine initial server: {e}")
+            logger.error(f"[{self.algorithm}] Failed to determine initial server: {e}")
 
         while not stop_event.is_set():
             try:
@@ -341,7 +355,7 @@ class TimeBasedRouter:
 
                 # Check if server changed
                 if self._current_server != current_server:
-                    logger.info(f"Server switch: {self._current_server} -> {current_server}")
+                    logger.info(f"[{self.algorithm}] Server switch: {self._current_server} -> {current_server}")
                     self._current_server = current_server
                     # Update stats with active server
                     stats = ProxyStats.get_instance()
@@ -366,7 +380,7 @@ class TimeBasedRouter:
                     pass  # Normal timeout, continue loop
 
             except Exception as e:
-                logger.error(f"Scheduler error: {e}")
+                logger.error(f"[{self.algorithm}] Scheduler error: {e}")
                 await asyncio.sleep(5)
 
-        logger.info("Time-based scheduler stopped")
+        logger.info(f"[{self.algorithm}] Time-based scheduler stopped")

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import struct
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -11,10 +9,10 @@ from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
-from btc_bch_proxy.proxy.constants import JOB_SOURCE_TTL, MAX_MERKLE_BRANCHES
+from crypto_stratum_proxy.proxy.constants import JOB_SOURCE_TTL, MAX_MERKLE_BRANCHES
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import ValidationConfig
+    from crypto_stratum_proxy.config.models import ValidationConfig
 
 
 @dataclass
@@ -66,8 +64,7 @@ class ShareValidator:
     Features:
     - Duplicate share detection
     - Stale job detection
-    - Difficulty validation
-    - Optional share hash validation
+    - Difficulty tracking (for stats)
 
     Thread Safety:
         This class is NOT thread-safe. It is designed to be used from a single
@@ -93,7 +90,6 @@ class ShareValidator:
         # Configuration (use defaults if not provided)
         self._reject_duplicates = config.reject_duplicates if config else True
         self._reject_stale = config.reject_stale if config else True
-        self._validate_difficulty = config.validate_difficulty if config else False
         self._max_share_cache = config.share_cache_size if config else 1000
         self._share_cache_ttl = config.share_cache_ttl if config else 300
         self._max_job_cache = config.job_cache_size if config else 10
@@ -125,7 +121,6 @@ class ShareValidator:
         # Statistics
         self.duplicates_rejected: int = 0
         self.stale_rejected: int = 0
-        self.over_target_rejected: int = 0
         self.invalid_format_rejected: int = 0
 
         # Cache cleanup throttling (cleanup at most once per 60 seconds)
@@ -306,7 +301,6 @@ class ShareValidator:
         extranonce2: str,
         ntime: str,
         nonce: str,
-        extranonce1: Optional[str] = None,
         version_bits: Optional[str] = None,
     ) -> tuple[bool, Optional[str]]:
         """
@@ -317,7 +311,6 @@ class ShareValidator:
             extranonce2: Extranonce2 value.
             ntime: Block time.
             nonce: Block nonce.
-            extranonce1: Extranonce1 from pool (for hash validation).
             version_bits: Version bits for version-rolling.
 
         Returns:
@@ -350,16 +343,6 @@ class ShareValidator:
         if self._reject_stale and self._jobs and job_id not in self._jobs:
             self.stale_rejected += 1
             return False, f"Stale job (job={job_id})"
-
-        # Optionally validate share hash meets difficulty
-        if self._validate_difficulty and extranonce1:
-            job = self._jobs.get(job_id)
-            if job:
-                valid, reason = self._validate_share_hash(
-                    job, extranonce1, extranonce2, ntime, nonce, version_bits
-                )
-                if not valid:
-                    return False, reason
 
         # Share passes local validation
         # NOTE: Do NOT add to cache here - only cache after pool accepts
@@ -433,196 +416,13 @@ class ShareValidator:
                 f"(shares={old_share_count}, jobs={old_job_count})"
             )
 
-    # Maximum values for 32-bit hex fields
-    MAX_UINT32 = 0xFFFFFFFF
-
-    def _validate_share_hash(
-        self,
-        job: JobInfo,
-        extranonce1: str,
-        extranonce2: str,
-        ntime: str,
-        nonce: str,
-        version_bits: Optional[str] = None,
-    ) -> tuple[bool, Optional[str]]:
-        """
-        Validate that the share hash meets the difficulty target.
-
-        Args:
-            job: Job information.
-            extranonce1: Extranonce1 from pool.
-            extranonce2: Extranonce2 from miner.
-            ntime: Block time from miner.
-            nonce: Nonce from miner.
-            version_bits: Version bits for version-rolling.
-
-        Returns:
-            Tuple of (valid, error_reason).
-        """
-        try:
-            # Validate hex string lengths to prevent overflow
-            # These should all be 8-character hex strings (32-bit values)
-            for name, value in [
-                ("ntime", ntime),
-                ("nonce", nonce),
-                ("version", job.version),
-                ("nbits", job.nbits),
-            ]:
-                if len(value) > 8:
-                    return False, f"Invalid {name}: too long (max 8 hex chars)"
-
-            # Calculate coinbase
-            coinbase = bytes.fromhex(job.coinbase1 + extranonce1 + extranonce2 + job.coinbase2)
-            coinbase_hash = sha256d(coinbase)
-
-            # Calculate merkle root
-            merkle_root = coinbase_hash
-            for branch in job.merkle_branches:
-                merkle_root = sha256d(merkle_root + bytes.fromhex(branch))
-
-            # Build block header - parse and validate 32-bit values
-            version = int(job.version, 16)
-            if version > self.MAX_UINT32:
-                return False, f"Invalid version: {job.version} exceeds uint32"
-
-            if version_bits:
-                # Apply version-rolling bits with bounds check
-                if len(version_bits) > 8:
-                    return False, f"Invalid version_bits: too long (max 8 hex chars)"
-                version_mask = int(version_bits, 16)
-                if version_mask > self.MAX_UINT32:
-                    return False, f"Invalid version_bits: exceeds uint32"
-                version = (version & 0xe0000000) | (version_mask & 0x1fffffff)
-
-            # Stratum prevhash is 8x4-byte words, each word byte-swapped
-            # Convert back to normal byte order for block header
-            prevhash_bytes = swap_endian_words(bytes.fromhex(job.prevhash))
-
-            # Parse and validate ntime and nonce
-            ntime_int = int(ntime, 16)
-            nonce_int = int(nonce, 16)
-            nbits_int = int(job.nbits, 16)
-
-            if ntime_int > self.MAX_UINT32:
-                return False, f"Invalid ntime: {ntime} exceeds uint32"
-            if nonce_int > self.MAX_UINT32:
-                return False, f"Invalid nonce: {nonce} exceeds uint32"
-            if nbits_int > self.MAX_UINT32:
-                return False, f"Invalid nbits: {job.nbits} exceeds uint32"
-
-            header = struct.pack("<I", version)  # Version (little-endian)
-            header += prevhash_bytes  # Previous block hash (already in correct order)
-            header += merkle_root  # Merkle root (already in correct order)
-            header += struct.pack("<I", ntime_int)  # Timestamp
-            header += struct.pack("<I", nbits_int)  # Bits (difficulty)
-            header += struct.pack("<I", nonce_int)  # Nonce
-
-            # Calculate block hash
-            block_hash = sha256d(header)
-            hash_int = int.from_bytes(block_hash, byteorder="little")
-
-            # Calculate target from difficulty
-            target = difficulty_to_target(self._difficulty)
-
-            if hash_int > target:
-                self.over_target_rejected += 1
-                logger.warning(
-                    f"[{self.session_id}] Share over target: "
-                    f"hash={block_hash.hex()}, diff={self._difficulty}"
-                )
-                return False, "Share does not meet difficulty target"
-
-            return True, None
-
-        except ValueError as e:
-            # Invalid hex/int conversion - data format issue
-            # Fail-closed: reject malformed shares to prevent DoS/invalid submissions
-            self.invalid_format_rejected += 1
-            logger.warning(
-                f"[{self.session_id}] Hash validation format error (rejecting share): {e}"
-            )
-            return False, f"Invalid share format: {e}"
-        except struct.error as e:
-            # Struct packing error - data size issue
-            self.invalid_format_rejected += 1
-            logger.warning(
-                f"[{self.session_id}] Hash validation struct error (rejecting share): {e}"
-            )
-            return False, f"Invalid share data size: {e}"
-        except (TypeError, KeyError, IndexError) as e:
-            # Unexpected data type or missing data
-            self.invalid_format_rejected += 1
-            logger.warning(
-                f"[{self.session_id}] Hash validation data error (rejecting share): "
-                f"{type(e).__name__}: {e}"
-            )
-            return False, f"Invalid share data: {type(e).__name__}"
-
     def get_stats(self) -> dict:
         """Get validation statistics."""
         return {
             "duplicates_rejected": self.duplicates_rejected,
             "stale_rejected": self.stale_rejected,
-            "over_target_rejected": self.over_target_rejected,
             "invalid_format_rejected": self.invalid_format_rejected,
             "cached_shares": len(self._recent_shares),
             "tracked_jobs": len(self._jobs),
             "current_difficulty": self._difficulty,
         }
-
-
-# SHA-256 difficulty 1 target (used for difficulty <-> target conversion)
-# This is the standard target used by Bitcoin, Bitcoin Cash, DigiByte, and
-# other SHA-256 based cryptocurrencies for stratum mining difficulty calculation.
-MAX_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
-
-
-def sha256d(data: bytes) -> bytes:
-    """Double SHA256 hash."""
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
-
-
-def swap_endian_words(data: bytes, word_size: int = 4) -> bytes:
-    """
-    Swap byte order within each word of the data.
-
-    Stratum sends prevhash as 8x4-byte words with bytes swapped within each word.
-    This function reverses that transformation.
-
-    Args:
-        data: Input bytes.
-        word_size: Size of each word (default 4 bytes).
-
-    Returns:
-        Data with byte order swapped within each word.
-    """
-    result = b""
-    for i in range(0, len(data), word_size):
-        word = data[i:i + word_size]
-        result += word[::-1]
-    return result
-
-
-def difficulty_to_target(difficulty: float) -> int:
-    """
-    Convert difficulty to target value.
-
-    The target is the maximum hash value that a share must be below.
-
-    Args:
-        difficulty: Mining difficulty (must be positive).
-
-    Returns:
-        Target value as integer.
-
-    Raises:
-        ValueError: If difficulty is zero or negative.
-    """
-    if difficulty <= 0:
-        raise ValueError(f"Difficulty must be positive, got {difficulty}")
-    return int(MAX_TARGET / difficulty)
-
-
-def target_to_difficulty(target: int) -> float:
-    """Convert target to difficulty."""
-    return MAX_TARGET / target if target > 0 else float("inf")

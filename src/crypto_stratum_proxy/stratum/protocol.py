@@ -7,7 +7,7 @@ from typing import Any, Optional, Union
 
 from loguru import logger
 
-from btc_bch_proxy.stratum.messages import (
+from crypto_stratum_proxy.stratum.messages import (
     StratumMessage,
     StratumNotification,
     StratumRequest,

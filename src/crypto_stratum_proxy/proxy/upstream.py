@@ -10,16 +10,16 @@ from typing import TYPE_CHECKING, Dict, Optional, Set
 
 from loguru import logger
 
-from btc_bch_proxy import __version__
-from btc_bch_proxy.stratum.messages import (
+from crypto_stratum_proxy import __version__
+from crypto_stratum_proxy.stratum.messages import (
     StratumMessage,
     StratumMethods,
     StratumNotification,
     StratumResponse,
 )
-from btc_bch_proxy.stratum.protocol import StratumProtocol
-from btc_bch_proxy.proxy.stats import ProxyStats
-from btc_bch_proxy.proxy.constants import (
+from crypto_stratum_proxy.stratum.protocol import StratumProtocol
+from crypto_stratum_proxy.proxy.stats import ProxyStats
+from crypto_stratum_proxy.proxy.constants import (
     DEFAULT_PENDING_SHARES_WAIT_TIMEOUT,
     DEFAULT_UPSTREAM_HEALTH_TIMEOUT,
     MAX_EXTRANONCE1_HEX_LENGTH,
@@ -30,10 +30,10 @@ from btc_bch_proxy.proxy.constants import (
     SOCKET_READ_BUFFER_SIZE,
     UPSTREAM_DISCONNECT_TIMEOUT,
 )
-from btc_bch_proxy.proxy.utils import fire_and_forget
+from crypto_stratum_proxy.proxy.utils import fire_and_forget
 
 if TYPE_CHECKING:
-    from btc_bch_proxy.config.models import ProxyConfig, StratumServerConfig
+    from crypto_stratum_proxy.config.models import GlobalProxyConfig, StratumServerConfig
 
 
 class UpstreamConnectionError(Exception):
@@ -76,16 +76,16 @@ class UpstreamConnection:
         fresh notifications after reconnection.
     """
 
-    def __init__(self, config: StratumServerConfig, proxy_config: Optional[ProxyConfig] = None):
+    def __init__(self, config: StratumServerConfig, global_config: Optional[GlobalProxyConfig] = None):
         """
         Initialize upstream connection.
 
         Args:
             config: Server configuration.
-            proxy_config: Proxy configuration (for keepalive settings).
+            global_config: Global proxy configuration (for keepalive settings).
         """
         self.config = config
-        self.proxy_config = proxy_config
+        self.global_config = global_config
         self.name = config.name
 
         self._reader: Optional[asyncio.StreamReader] = None
@@ -130,7 +130,7 @@ class UpstreamConnection:
         self._connection_start_time: float = 0.0
         # Health timeout from config or 5-minute default
         self._connection_health_timeout: float = float(
-            proxy_config.upstream_health_timeout if proxy_config else DEFAULT_UPSTREAM_HEALTH_TIMEOUT
+            global_config.upstream_idle_timeout if global_config else DEFAULT_UPSTREAM_HEALTH_TIMEOUT
         )
         # Track whether we've logged the unhealthy state (to avoid log spam)
         self._unhealthy_logged: bool = False
@@ -300,7 +300,7 @@ class UpstreamConnection:
                     ssl=ssl_context,
                     server_hostname=server_hostname,
                 ),
-                timeout=self.config.timeout,
+                timeout=self.config.connect_timeout,
             )
 
             self._connected = True
@@ -314,9 +314,9 @@ class UpstreamConnection:
             self._unhealthy_logged = False  # Reset unhealthy log flag on new connection
 
             # Enable TCP keepalive
-            if self.proxy_config and self._writer:
-                from btc_bch_proxy.proxy.keepalive import enable_tcp_keepalive
-                enable_tcp_keepalive(self._writer, self.proxy_config, f"upstream:{self.name}")
+            if self.global_config and self._writer:
+                from crypto_stratum_proxy.proxy.keepalive import enable_tcp_keepalive
+                enable_tcp_keepalive(self._writer, self.global_config, f"upstream:{self.name}")
 
             # Record connection stats
             stats = ProxyStats.get_instance()
@@ -516,7 +516,7 @@ class UpstreamConnection:
             return False
 
         if user_agent is None:
-            user_agent = f"btc-bch-proxy/{__version__}"
+            user_agent = f"crypto-stratum-proxy/{__version__}"
 
         req_id = await self._next_id()
         params = [user_agent]
@@ -797,7 +797,7 @@ class UpstreamConnection:
 
         try:
             # Read from socket while waiting for the response (with lock to prevent concurrent reads)
-            deadline = time_module.time() + self.config.timeout
+            deadline = time_module.time() + self.config.connect_timeout
             while not future.done():
                 remaining = deadline - time_module.time()
                 if remaining <= 0:
@@ -896,7 +896,7 @@ class UpstreamConnection:
             raise UpstreamConnectionError("Not connected")
         try:
             self._writer.write(data)
-            await asyncio.wait_for(self._writer.drain(), timeout=self.config.timeout)
+            await asyncio.wait_for(self._writer.drain(), timeout=self.config.connect_timeout)
         except asyncio.TimeoutError:
             logger.warning(f"Send timeout to {self.name}")
             raise UpstreamConnectionError(f"Send timeout to {self.name}")
