@@ -20,16 +20,24 @@ class JobInfo:
     """Information about a mining job from mining.notify."""
 
     job_id: str
-    prevhash: str
-    coinbase1: str
-    coinbase2: str
-    merkle_branches: list[str]
-    version: str
-    nbits: str
-    ntime: str
     clean_jobs: bool
     received_at: float = field(default_factory=time.time)
     source_server: Optional[str] = None  # Which pool issued this job (for grace period routing)
+
+    # SHA-256 specific fields (optional for other algorithms)
+    prevhash: Optional[str] = None
+    coinbase1: Optional[str] = None
+    coinbase2: Optional[str] = None
+    merkle_branches: Optional[list[str]] = None
+    version: Optional[str] = None
+    nbits: Optional[str] = None
+    ntime: Optional[str] = None
+
+    # zkSNARK/ALEO specific fields (optional)
+    height: Optional[int] = None
+    target: Optional[int] = None
+    block_header_root: Optional[str] = None
+    hashed_beacons_root: Optional[str] = None
 
 
 @dataclass
@@ -77,15 +85,22 @@ class ShareValidator:
         If you need thread-safe validation, add asyncio.Lock protection.
     """
 
-    def __init__(self, session_id: str, config: Optional[ValidationConfig] = None):
+    def __init__(
+        self,
+        session_id: str,
+        config: Optional[ValidationConfig] = None,
+        algorithm: str = "sha256",
+    ):
         """
         Initialize the share validator.
 
         Args:
             session_id: Session identifier for logging.
             config: Validation configuration.
+            algorithm: Mining algorithm (sha256, randomx, zksnark).
         """
         self.session_id = session_id
+        self._algorithm = algorithm
 
         # Configuration (use defaults if not provided)
         self._reject_duplicates = config.reject_duplicates if config else True
@@ -223,8 +238,20 @@ class ShareValidator:
             params: mining.notify parameters.
             source_server: Optional server name that issued this job (for grace period routing).
         """
+        if self._algorithm == "sha256":
+            self._add_sha256_job(params, source_server)
+        elif self._algorithm == "zksnark":
+            self._add_zksnark_job(params, source_server)
+        elif self._algorithm == "randomx":
+            self._add_randomx_job(params, source_server)
+        else:
+            # Fallback: try to extract at least job_id and clean_jobs
+            self._add_generic_job(params, source_server)
+
+    def _add_sha256_job(self, params: list, source_server: Optional[str] = None) -> None:
+        """Parse SHA-256 (Bitcoin-style) mining.notify params."""
         if len(params) < 9:
-            logger.warning(f"[{self.session_id}] Invalid mining.notify params: {params}")
+            logger.warning(f"[{self.session_id}] Invalid SHA-256 mining.notify params: {params}")
             return
 
         # Parse merkle branches with DoS protection
@@ -241,6 +268,7 @@ class ShareValidator:
 
         job_info = JobInfo(
             job_id=str(params[0]),
+            clean_jobs=bool(params[8]),
             prevhash=str(params[1]),
             coinbase1=str(params[2]),
             coinbase2=str(params[3]),
@@ -248,7 +276,60 @@ class ShareValidator:
             version=str(params[5]),
             nbits=str(params[6]),
             ntime=str(params[7]),
-            clean_jobs=bool(params[8]),  # len(params) >= 9 guaranteed by check above
+        )
+        self.add_job(job_info, source_server)
+
+    def _add_zksnark_job(self, params: list, source_server: Optional[str] = None) -> None:
+        """
+        Parse zkSNARK/ALEO mining.notify params.
+
+        ALEO stratum format: [job_id, height, target, block_header_root, hashed_beacons_root, clean_jobs]
+        """
+        if len(params) < 6:
+            logger.warning(f"[{self.session_id}] Invalid zkSNARK mining.notify params: {params}")
+            return
+
+        try:
+            job_info = JobInfo(
+                job_id=str(params[0]),
+                clean_jobs=bool(params[5]),
+                height=int(params[1]) if params[1] is not None else None,
+                target=int(params[2]) if params[2] is not None else None,
+                block_header_root=str(params[3]) if params[3] else None,
+                hashed_beacons_root=str(params[4]) if params[4] else None,
+            )
+            self.add_job(job_info, source_server)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[{self.session_id}] Error parsing zkSNARK job params: {e}")
+
+    def _add_randomx_job(self, params: list, source_server: Optional[str] = None) -> None:
+        """
+        Parse RandomX (Monero-style) mining.notify params.
+
+        RandomX/Monero stratum is similar to Bitcoin but may have variations.
+        For now, use generic parsing - can be enhanced if needed.
+        """
+        self._add_generic_job(params, source_server)
+
+    def _add_generic_job(self, params: list, source_server: Optional[str] = None) -> None:
+        """
+        Parse generic mining.notify params when algorithm is unknown or unsupported.
+
+        Extracts job_id (first param) and clean_jobs (last param if boolean).
+        """
+        if len(params) < 2:
+            logger.warning(f"[{self.session_id}] Invalid mining.notify params (too few): {params}")
+            return
+
+        # First param is always job_id
+        job_id = str(params[0])
+
+        # Last param is usually clean_jobs (boolean)
+        clean_jobs = bool(params[-1]) if isinstance(params[-1], bool) else False
+
+        job_info = JobInfo(
+            job_id=job_id,
+            clean_jobs=clean_jobs,
         )
         self.add_job(job_info, source_server)
 

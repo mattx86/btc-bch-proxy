@@ -288,8 +288,8 @@ class MinerSession:
         else:
             self.client_addr = "unknown"
 
-        # Share validator
-        self._validator = ShareValidator(self.session_id, config.proxy.validation)
+        # Share validator (algorithm-aware for different stratum formats)
+        self._validator = ShareValidator(self.session_id, config.proxy.validation, algorithm)
 
         # Async queue for miner-bound messages (decouples read from write)
         # Using PriorityQueue to ensure high-priority messages (share responses) are sent first
