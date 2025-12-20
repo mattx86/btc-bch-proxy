@@ -327,13 +327,28 @@ class ShareValidator:
             return
 
         try:
+            # Parse clean_jobs carefully - could be bool, int, or string
+            clean_jobs_raw = params[5]
+            if isinstance(clean_jobs_raw, bool):
+                clean_jobs = clean_jobs_raw
+            elif isinstance(clean_jobs_raw, int):
+                clean_jobs = clean_jobs_raw != 0
+            elif isinstance(clean_jobs_raw, str):
+                clean_jobs = clean_jobs_raw.lower() in ("true", "1", "yes")
+            else:
+                clean_jobs = bool(clean_jobs_raw)
+
             job_info = JobInfo(
                 job_id=str(params[0]),
-                clean_jobs=bool(params[5]),
+                clean_jobs=clean_jobs,
                 height=int(params[1]) if params[1] is not None else None,
                 target=int(params[2]) if params[2] is not None else None,
                 block_header_root=str(params[3]) if params[3] else None,
                 hashed_beacons_root=str(params[4]) if params[4] else None,
+            )
+            logger.info(
+                f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, "
+                f"clean={clean_jobs} (raw={clean_jobs_raw!r}), tracked_jobs={len(self._jobs) + 1}"
             )
             self.add_job(job_info, source_server)
         except (ValueError, TypeError) as e:
@@ -571,6 +586,11 @@ class ShareValidator:
         # Check for stale job (only if we have received at least one job)
         if self._reject_stale and self._jobs and job_id not in self._jobs:
             self.stale_rejected += 1
+            cached_jobs = list(self._jobs.keys())
+            logger.info(
+                f"[{self.session_id}] Stale zkSNARK share: job={job_id} not in cache. "
+                f"Cached jobs ({len(cached_jobs)}): {cached_jobs}"
+            )
             return False, f"Stale job (job={job_id})"
 
         # Share passes local validation
