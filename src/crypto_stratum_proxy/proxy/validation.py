@@ -482,6 +482,19 @@ class ShareValidator:
             return None
         return server
 
+    def get_current_job_id(self) -> Optional[str]:
+        """
+        Get the current/most recent pool job ID.
+
+        Used for zkSNARK/ALEO where miners use their own internal job IDs
+        that differ from pool job IDs. When forwarding shares, we replace
+        the miner's job ID with the pool's job ID.
+
+        Returns:
+            The current pool job ID, or None if no jobs received yet.
+        """
+        return self._current_job_id
+
     def validate_share(
         self,
         job_id: str,

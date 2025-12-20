@@ -2026,10 +2026,15 @@ class MinerSession:
 
         # Route to old pool if job was issued by old pool and we're in grace period
         if in_grace_period and job_source == self._old_upstream_server_name:
+            # For grace period routing, we need the old pool's job_id
+            # Since the miner uses internal IDs, use the job_id from our tracked source
+            # The job_source lookup already validated this is a known job
             logger.info(
                 f"[{self.session_id}] Routing zkSNARK share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
+            # Note: For grace period, the job_id mapping should still work since we're
+            # sending to the pool that issued the job
             accepted, error = await self._old_upstream.submit_share_raw(msg.params)
             stats = ProxyStats.get_instance()
             if accepted:
@@ -2075,6 +2080,26 @@ class MinerSession:
             )
             return
 
+        # ALEO miners use internal job IDs that differ from pool job IDs.
+        # Replace the miner's job_id with the current pool job_id before forwarding.
+        pool_job_id = self._validator.get_current_job_id()
+        if pool_job_id and pool_job_id != job_id:
+            logger.debug(
+                f"[{self.session_id}] zkSNARK job_id mapping: "
+                f"miner={job_id} -> pool={pool_job_id}"
+            )
+            # Create modified params with pool's job_id
+            modified_params = list(msg.params)
+            modified_params[1] = pool_job_id
+            submit_params = modified_params
+        else:
+            # No mapping needed or no current job
+            submit_params = msg.params
+            if not pool_job_id:
+                logger.warning(
+                    f"[{self.session_id}] No current pool job_id, forwarding miner job_id as-is"
+                )
+
         # Submit to upstream with retry logic for transient failures
         max_retries = self.config.proxy.global_.share_submit_retries
         retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
@@ -2111,7 +2136,7 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error = await current_upstream.submit_share_raw(msg.params)
+            accepted, error = await current_upstream.submit_share_raw(submit_params)
 
             if accepted:
                 break  # Success!
