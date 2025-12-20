@@ -372,7 +372,7 @@ class ShareValidator:
             )
             logger.info(
                 f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, height={height_val}, "
-                f"clean={clean_jobs}, tracked_jobs={len(self._jobs) + 1}"
+                f"target={job_info.target}, clean={clean_jobs}"
             )
             self.add_job(job_info, source_server)
         except (ValueError, TypeError) as e:

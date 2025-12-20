@@ -349,6 +349,22 @@ class MinerSession:
         """
         return self._miner_send_queue.qsize()
 
+    @property
+    def _log_prefix(self) -> str:
+        """
+        Build consistent log prefix: [session_id] [algorithm] [server] [worker].
+
+        Components are omitted if not yet available (e.g., before authorization).
+        """
+        parts = [f"[{self.session_id}]"]
+        if self.algorithm:
+            parts.append(f"[{self.algorithm}]")
+        if self._current_server:
+            parts.append(f"[{self._current_server}]")
+        if self.worker_name:
+            parts.append(f"[{self.worker_name}]")
+        return " ".join(parts)
+
     async def run(self) -> None:
         """Main session loop - handle the miner connection lifecycle."""
         self._running = True
@@ -592,10 +608,7 @@ class MinerSession:
                 )
 
             elapsed = time.time() - start_time
-            logger.info(
-                f"[{self.session_id}] Connected to upstream {server_name} "
-                f"(algorithm={self.algorithm}, after {int(elapsed)}s)"
-            )
+            logger.info(f"{self._log_prefix} Connected to upstream (after {int(elapsed)}s)")
 
             # Record success for circuit breaker
             circuit_breaker.record_success(server_name)
@@ -639,7 +652,7 @@ class MinerSession:
 
             # Reconnect (calls _connect_upstream_internal since we already hold lock)
             if await self._connect_upstream_internal(self._current_server):
-                logger.info(f"[{self.session_id}] Reconnected to {self._current_server}")
+                logger.info(f"{self._log_prefix} Reconnected to upstream")
 
                 # Send set_extranonce to miner with new values
                 if self._upstream and self._upstream.subscribed:
@@ -971,7 +984,7 @@ class MinerSession:
                 self._protocol.build_response(msg.id, result)
             )
             self._subscribed = True
-            logger.info(f"[{self.session_id}] Miner subscribed")
+            logger.info(f"{self._log_prefix} Miner subscribed")
 
             # Forward any notifications received during upstream handshake
             # These must be sent AFTER the subscribe response
@@ -998,7 +1011,7 @@ class MinerSession:
                 str(msg.params[0]), max_length=MAX_WORKER_USERNAME_LENGTH
             )
 
-        logger.info(f"[{self.session_id}] Miner authorized as {self.worker_name}")
+        logger.info(f"{self._log_prefix} Miner authorized")
 
         # Always accept authorization (we use our own credentials for upstream)
         await self._send_to_miner(
@@ -1153,7 +1166,7 @@ class MinerSession:
                     # Don't decay below target
                     if new_max > target_difficulty:
                         logger.info(
-                            f"[{self.session_id}] Decay: {self._max_pool_difficulty:.2f} -> "
+                            f"{self._log_prefix} Decay: {self._max_pool_difficulty:.2f} -> "
                             f"{new_max:.2f} (target: {target_difficulty:.2f})"
                         )
                         self._max_pool_difficulty = new_max
@@ -1220,12 +1233,12 @@ class MinerSession:
         # Log difficulty
         if self._miner_difficulty is None:
             logger.info(
-                f"[{self.session_id}] Difficulty for {server_name}: {miner_difficulty:.2f} "
+                f"{self._log_prefix} Difficulty: {miner_difficulty:.2f} "
                 f"(pool: {pool_difficulty:.2f})"
             )
         else:
             logger.info(
-                f"[{self.session_id}] Difficulty for {server_name}: "
+                f"{self._log_prefix} Difficulty: "
                 f"{self._miner_difficulty:.2f} -> {miner_difficulty:.2f} "
                 f"(pool: {pool_difficulty:.2f})"
             )
@@ -1260,8 +1273,9 @@ class MinerSession:
         # Extract difficulty from rejection message: "low difficulty share (19188.02)"
         match = re.search(r"\((\d+(?:\.\d+)?)\)", reason)
         if not match:
-            logger.info(
-                f"[{self.session_id}] Low-diff rejection but no difficulty value found: {reason}"
+            # For ALEO pools, this is expected - they don't include difficulty in rejection
+            logger.debug(
+                f"{self._log_prefix} Low-diff rejection, no difficulty value in message: {reason}"
             )
             return
 
@@ -1297,7 +1311,7 @@ class MinerSession:
 
         old_max_str = f"{old_max:.2f}" if old_max else "None"
         logger.info(
-            f"[{self.session_id}] Raising difficulty due to low-diff rejection: "
+            f"{self._log_prefix} Raising difficulty due to low-diff rejection: "
             f"{old_max_str} -> {new_target:.2f} (rejected at {rejected_diff:.2f})"
         )
 
@@ -1495,7 +1509,7 @@ class MinerSession:
             )
             if self._adaptive_buffer != old_buffer:
                 logger.info(
-                    f"[{self.session_id}] Adaptive buffer increased: "
+                    f"{self._log_prefix} Adaptive buffer increased: "
                     f"{old_buffer:.1%} -> {self._adaptive_buffer:.1%}"
                 )
             self._last_low_diff_rejection = now
@@ -1510,18 +1524,131 @@ class MinerSession:
                 )
                 if self._adaptive_buffer != old_buffer:
                     logger.info(
-                        f"[{self.session_id}] Adaptive buffer decreased: "
+                        f"{self._log_prefix} Adaptive buffer decreased: "
                         f"{old_buffer:.1%} -> {self._adaptive_buffer:.1%}"
                     )
                 # Reset timer so we don't keep decreasing
                 self._last_low_diff_rejection = now
 
+    # =========================================================================
+    # Share submission helpers (consolidated checks used by all algorithms)
+    # =========================================================================
+
+    async def _reject_share_if_closing(self, msg_id: int) -> bool:
+        """
+        Reject share if session is closing.
+
+        Returns True if share was rejected (caller should return early).
+        """
+        if not self._closing:
+            return False
+
+        error = [25, "Session closing", None]
+        logger.debug(f"{self._log_prefix} Share rejected: session closing")
+        await self._send_to_miner(
+            self._protocol.build_response(msg_id, False, error),
+            priority=MessagePriority.HIGH,
+        )
+        return True
+
+    async def _reject_share_if_switching(self, msg_id: int) -> bool:
+        """
+        Reject share if server switch is in progress.
+
+        Returns True if share was rejected (caller should return early).
+        """
+        if not self._switching_servers:
+            return False
+
+        error = [25, "Server switch in progress", None]
+        logger.info(
+            f"{self._log_prefix} Share rejected: server switch in progress "
+            f"(switching to {self._switch_target_server})"
+        )
+        stats = ProxyStats.get_instance()
+        fire_and_forget(stats.record_share_rejected(
+            self._switch_target_server or self._current_server, "server switch"
+        ))
+        await self._send_to_miner(
+            self._protocol.build_response(msg_id, False, error),
+            priority=MessagePriority.HIGH,
+        )
+        return True
+
+    async def _cleanup_expired_grace_period(self) -> None:
+        """Clean up old upstream if grace period has expired."""
+        if (
+            self._old_upstream is not None
+            and self._grace_period_end_time > 0
+            and time.time() >= self._grace_period_end_time
+        ):
+            logger.info(
+                f"{self._log_prefix} Grace period expired, disconnecting old upstream "
+                f"({self._old_upstream_server_name})"
+            )
+            try:
+                await self._old_upstream.disconnect()
+            except Exception as e:
+                logger.debug(f"{self._log_prefix} Error disconnecting old upstream: {e}")
+            self._old_upstream = None
+            self._old_upstream_server_name = None
+            self._grace_period_end_time = 0.0
+
+    async def _reject_share_if_not_connected(self, msg_id: int) -> bool:
+        """
+        Reject share if upstream is not connected/authorized.
+
+        Returns True if share was rejected (caller should return early).
+        """
+        if self._upstream and self._upstream.authorized:
+            return False
+
+        error = [24, "Not authorized", None]
+        logger.warning(f"{self._log_prefix} Share rejected: upstream not connected/authorized")
+        stats = ProxyStats.get_instance()
+        fire_and_forget(stats.record_share_rejected(self._current_server, "not connected"))
+        await self._send_to_miner(
+            self._protocol.build_response(msg_id, False, error),
+            priority=MessagePriority.HIGH,
+        )
+        return True
+
+    async def _reject_share_with_error(
+        self, msg_id: int, error: list, reason: str, log_level: str = "warning"
+    ) -> None:
+        """
+        Reject share with a given error and log it.
+
+        Args:
+            msg_id: The message ID to respond to.
+            error: The error list [code, message, traceback].
+            reason: The reason for stats tracking.
+            log_level: Log level to use (debug, info, warning, error).
+        """
+        log_func = getattr(logger, log_level)
+        log_func(f"{self._log_prefix} Share rejected: {error[1]}")
+        stats = ProxyStats.get_instance()
+        fire_and_forget(stats.record_share_rejected(self._current_server, reason))
+        await self._send_to_miner(
+            self._protocol.build_response(msg_id, False, error),
+            priority=MessagePriority.HIGH,
+        )
+
     async def _handle_submit_sha256(self, msg: StratumRequest) -> None:
         """Handle mining.submit (share submission) from miner for SHA-256 algorithm."""
-        # Reject shares if session is closing
-        if self._closing:
-            error = [25, "Session closing", None]
-            logger.debug(f"[{self.session_id}] Share rejected: session closing")
+        # Common precondition checks
+        if await self._reject_share_if_closing(msg.id):
+            return
+        if await self._reject_share_if_switching(msg.id):
+            return
+        await self._cleanup_expired_grace_period()
+        if await self._reject_share_if_not_connected(msg.id):
+            return
+
+        # Validate params is a list/tuple
+        if not isinstance(msg.params, (list, tuple)):
+            error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
+            logger.error(f"{self._log_prefix} {error[1]}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -1659,7 +1786,7 @@ class MinerSession:
                 return
 
         logger.debug(
-            f"[{self.session_id}] Share submit: job={job_id}, "
+            f"{self._log_prefix} Share submit: job={job_id}, "
             f"nonce={nonce}, version_bits={version_bits}"
         )
 
@@ -1676,7 +1803,7 @@ class MinerSession:
         # Route to old pool if job was issued by old pool and we're in grace period
         if in_grace_period and job_source == self._old_upstream_server_name:
             logger.info(
-                f"[{self.session_id}] Routing share to source pool "
+                f"{self._log_prefix} Routing share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
             accepted, error = await self._old_upstream.submit_share(
@@ -1685,14 +1812,14 @@ class MinerSession:
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
-                    f"[{self.session_id}] Share accepted by source pool "
+                    f"{self._log_prefix} Share accepted by source pool "
                     f"({self._old_upstream_server_name}): job={job_id}"
                 )
                 fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
             else:
                 reason = _get_error_message(error)
                 logger.info(
-                    f"[{self.session_id}] Share rejected by source pool "
+                    f"{self._log_prefix} Share rejected by source pool "
                     f"({self._old_upstream_server_name}): {reason}"
                 )
                 fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
@@ -1701,7 +1828,7 @@ class MinerSession:
             # This allows more time for any remaining in-flight work to complete
             self._grace_period_end_time = time.time() + GRACE_PERIOD_EXTENSION
             logger.debug(
-                f"[{self.session_id}] Extended grace period by {GRACE_PERIOD_EXTENSION}s"
+                f"{self._log_prefix} Extended grace period by {GRACE_PERIOD_EXTENSION}s"
             )
 
             await self._send_to_miner(
@@ -1732,7 +1859,7 @@ class MinerSession:
 
         if not valid:
             # Share rejected locally - can't forward to current pool
-            logger.warning(f"[{self.session_id}] Share rejected locally: {reject_reason}")
+            logger.warning(f"{self._log_prefix} Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason))
 
@@ -1839,7 +1966,7 @@ class MinerSession:
 
         if accepted:
             logger.info(
-                f"[{self.session_id}] Share accepted: job={job_id}, "
+                f"{self._log_prefix} Share accepted: job={job_id}, "
                 f"nonce={nonce}, version_bits={version_bits}"
             )
             fire_and_forget(stats.record_share_accepted(self._current_server))
@@ -1852,7 +1979,7 @@ class MinerSession:
         else:
             # Extract rejection reason from error (handles both list and dict formats)
             reason = _get_error_message(error)
-            logger.warning(f"[{self.session_id}] Share rejected: {reason}")
+            logger.warning(f"{self._log_prefix} Share rejected: {reason}")
             fire_and_forget(stats.record_share_rejected(self._current_server, reason))
 
             # Auto-adjust difficulty for "highest-seen" mode when pool rejects as low difficulty
@@ -1959,64 +2086,13 @@ class MinerSession:
 
         ALEO submit format: [worker_name, job_id, nonce, commitment, solution]
         """
-        # Reject shares if session is closing
-        if self._closing:
-            error = [25, "Session closing", None]
-            logger.debug(f"[{self.session_id}] Share rejected: session closing")
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        # Common precondition checks
+        if await self._reject_share_if_closing(msg.id):
             return
-
-        # Reject shares during server switchover
-        if self._switching_servers:
-            error = [25, "Server switch in progress", None]
-            logger.info(
-                f"[{self.session_id}] Share rejected: server switch in progress "
-                f"(switching to {self._switch_target_server})"
-            )
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(
-                self._switch_target_server or self._current_server, "server switch"
-            ))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        if await self._reject_share_if_switching(msg.id):
             return
-
-        # Clean up old upstream if grace period has expired
-        if (
-            self._old_upstream is not None
-            and self._grace_period_end_time > 0
-            and time.time() >= self._grace_period_end_time
-        ):
-            logger.info(
-                f"[{self.session_id}] Grace period expired, disconnecting old upstream "
-                f"({self._old_upstream_server_name})"
-            )
-            try:
-                await self._old_upstream.disconnect()
-            except Exception as e:
-                logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
-            self._old_upstream = None
-            self._old_upstream_server_name = None
-            self._grace_period_end_time = 0.0
-
-        # Check upstream connection
-        if not self._upstream or not self._upstream.authorized:
-            error = [24, "Not authorized", None]
-            logger.warning(
-                f"[{self.session_id}] Share rejected: upstream not connected/authorized "
-                f"(current_server={self._current_server})"
-            )
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(self._current_server, "not connected"))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        await self._cleanup_expired_grace_period()
+        if await self._reject_share_if_not_connected(msg.id):
             return
 
         # Validate params is a list/tuple
@@ -2117,7 +2193,7 @@ class MinerSession:
         # Route to old pool if job was issued by old pool and we're in grace period
         if in_grace_period and job_source == self._old_upstream_server_name:
             logger.info(
-                f"[{self.session_id}] Routing zkSNARK share to source pool "
+                f"{self._log_prefix} Routing share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
             # ALEO stratum: forward params as-is (no worker_name prefix)
@@ -2129,14 +2205,14 @@ class MinerSession:
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
-                    f"[{self.session_id}] Share accepted by source pool "
+                    f"{self._log_prefix} Share accepted by source pool "
                     f"({self._old_upstream_server_name}): job={job_id}"
                 )
                 fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
             else:
                 reason = _get_error_message(error)
                 logger.info(
-                    f"[{self.session_id}] Share rejected by source pool "
+                    f"{self._log_prefix} Share rejected by source pool "
                     f"({self._old_upstream_server_name}): {reason}"
                 )
                 fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
@@ -2144,7 +2220,7 @@ class MinerSession:
             # Extend grace period after routing share to old pool
             self._grace_period_end_time = time.time() + GRACE_PERIOD_EXTENSION
             logger.debug(
-                f"[{self.session_id}] Extended grace period by {GRACE_PERIOD_EXTENSION}s"
+                f"{self._log_prefix} Extended grace period by {GRACE_PERIOD_EXTENSION}s"
             )
 
             await self._send_to_miner(
@@ -2161,7 +2237,7 @@ class MinerSession:
         valid, reject_reason = self._validator.validate_zksnark_share(job_id, nonce)
         if not valid:
             error = [20, reject_reason, None]
-            logger.debug(f"[{self.session_id}] Share rejected locally (zksnark): {reject_reason}")
+            logger.debug(f"{self._log_prefix} Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason or "validation failed"))
             await self._send_to_miner(
@@ -2177,8 +2253,8 @@ class MinerSession:
         pool_params = list(msg.params)
 
         logger.info(
-            f"[{self.session_id}] Submitting zkSNARK share: job_id={miner_job_id}, "
-            f"pool_params={pool_params}"
+            f"{self._log_prefix} Submitting share: job={miner_job_id}, "
+            f"counter={miner_counter}, nonce={miner_nonce}"
         )
 
         # Submit to upstream with retry logic for transient failures
@@ -2257,7 +2333,7 @@ class MinerSession:
         # Record stats
         stats = ProxyStats.get_instance()
         if accepted:
-            logger.info(f"[{self.session_id}] Share accepted (zksnark): job={job_id}")
+            logger.info(f"{self._log_prefix} Share accepted: job={job_id}, nonce={nonce}")
             fire_and_forget(stats.record_share_accepted(self._current_server))
             # Record accepted share to prevent duplicate submissions
             self._validator.record_accepted_zksnark_share(job_id, nonce)
@@ -2265,7 +2341,7 @@ class MinerSession:
             self._update_adaptive_buffer(increase=False)
         else:
             reason = _get_error_message(error)
-            logger.warning(f"[{self.session_id}] Share rejected (zksnark): {reason}")
+            logger.warning(f"{self._log_prefix} Share rejected: {reason}")
             fire_and_forget(stats.record_share_rejected(self._current_server, reason))
 
             # Handle low difficulty rejection (if applicable to this pool)
@@ -2295,64 +2371,13 @@ class MinerSession:
         - nonce: Found nonce (hex, 8 chars / 4 bytes)
         - result: PoW hash result (hex, 64 chars / 32 bytes)
         """
-        # Reject shares if session is closing
-        if self._closing:
-            error = [25, "Session closing", None]
-            logger.debug(f"[{self.session_id}] Share rejected: session closing")
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        # Common precondition checks
+        if await self._reject_share_if_closing(msg.id):
             return
-
-        # Reject shares during server switchover
-        if self._switching_servers:
-            error = [25, "Server switch in progress", None]
-            logger.info(
-                f"[{self.session_id}] Share rejected: server switch in progress "
-                f"(switching to {self._switch_target_server})"
-            )
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(
-                self._switch_target_server or self._current_server, "server switch"
-            ))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        if await self._reject_share_if_switching(msg.id):
             return
-
-        # Clean up old upstream if grace period has expired
-        if (
-            self._old_upstream is not None
-            and self._grace_period_end_time > 0
-            and time.time() >= self._grace_period_end_time
-        ):
-            logger.info(
-                f"[{self.session_id}] Grace period expired, disconnecting old upstream "
-                f"({self._old_upstream_server_name})"
-            )
-            try:
-                await self._old_upstream.disconnect()
-            except Exception as e:
-                logger.debug(f"[{self.session_id}] Error disconnecting old upstream: {e}")
-            self._old_upstream = None
-            self._old_upstream_server_name = None
-            self._grace_period_end_time = 0.0
-
-        # Check upstream connection
-        if not self._upstream or not self._upstream.authorized:
-            error = [24, "Not authorized", None]
-            logger.warning(
-                f"[{self.session_id}] Share rejected: upstream not connected/authorized "
-                f"(current_server={self._current_server})"
-            )
-            stats = ProxyStats.get_instance()
-            fire_and_forget(stats.record_share_rejected(self._current_server, "not connected"))
-            await self._send_to_miner(
-                self._protocol.build_response(msg.id, False, error),
-                priority=MessagePriority.HIGH,
-            )
+        await self._cleanup_expired_grace_period()
+        if await self._reject_share_if_not_connected(msg.id):
             return
 
         # Validate params is a list/tuple
@@ -2396,7 +2421,7 @@ class MinerSession:
         # Route to old pool if job was issued by old pool and we're in grace period
         if in_grace_period and job_source == self._old_upstream_server_name:
             logger.info(
-                f"[{self.session_id}] Routing RandomX share to source pool "
+                f"{self._log_prefix} Routing share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
             accepted, error, _ = await self._old_upstream.submit_share_raw(msg.params)
@@ -2404,14 +2429,14 @@ class MinerSession:
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
-                    f"[{self.session_id}] Share accepted by source pool "
+                    f"{self._log_prefix} Share accepted by source pool "
                     f"({self._old_upstream_server_name}): job={job_id}"
                 )
                 fire_and_forget(stats.record_share_accepted(self._old_upstream_server_name))
             else:
                 reason = _get_error_message(error)
                 logger.info(
-                    f"[{self.session_id}] Share rejected by source pool "
+                    f"{self._log_prefix} Share rejected by source pool "
                     f"({self._old_upstream_server_name}): {reason}"
                 )
                 fire_and_forget(stats.record_share_rejected(self._old_upstream_server_name, reason))
@@ -2419,7 +2444,7 @@ class MinerSession:
             # Extend grace period after routing share to old pool
             self._grace_period_end_time = time.time() + GRACE_PERIOD_EXTENSION
             logger.debug(
-                f"[{self.session_id}] Extended grace period by {GRACE_PERIOD_EXTENSION}s"
+                f"{self._log_prefix} Extended grace period by {GRACE_PERIOD_EXTENSION}s"
             )
 
             await self._send_to_miner(
@@ -2436,7 +2461,7 @@ class MinerSession:
         valid, reject_reason = self._validator.validate_randomx_share(job_id, nonce)
         if not valid:
             error = [20, reject_reason, None]
-            logger.debug(f"[{self.session_id}] Share rejected locally (randomx): {reject_reason}")
+            logger.debug(f"{self._log_prefix} Share rejected locally: {reject_reason}")
             stats = ProxyStats.get_instance()
             fire_and_forget(stats.record_share_rejected(self._current_server, reject_reason or "validation failed"))
             await self._send_to_miner(
@@ -2530,7 +2555,7 @@ class MinerSession:
         # Record stats
         stats = ProxyStats.get_instance()
         if accepted:
-            logger.info(f"[{self.session_id}] Share accepted (randomx): job={job_id}")
+            logger.info(f"{self._log_prefix} Share accepted: job={job_id}, nonce={nonce}")
             fire_and_forget(stats.record_share_accepted(self._current_server))
             # Record accepted share to prevent duplicate submissions
             self._validator.record_accepted_randomx_share(job_id, nonce)
@@ -2538,7 +2563,7 @@ class MinerSession:
             self._update_adaptive_buffer(increase=False)
         else:
             reason = _get_error_message(error)
-            logger.warning(f"[{self.session_id}] Share rejected (randomx): {reason}")
+            logger.warning(f"{self._log_prefix} Share rejected: {reason}")
             fire_and_forget(stats.record_share_rejected(self._current_server, reason))
 
             # Handle low difficulty rejection (if applicable to this pool)
@@ -2829,7 +2854,7 @@ class MinerSession:
             self._closing = True
             self._running = False  # Must be inside lock to prevent race condition
 
-        logger.info(f"[{self.session_id}] Closing session")
+        logger.info(f"{self._log_prefix} Closing session")
 
         # Capture references to avoid TOCTOU issues
         writer = self.writer
