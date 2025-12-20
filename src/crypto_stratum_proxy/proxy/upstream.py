@@ -767,24 +767,31 @@ class UpstreamConnection:
     async def submit_share_raw(
         self,
         params: list,
-    ) -> tuple[bool, Optional[list]]:
+    ) -> tuple[bool, Optional[list], list]:
         """
         Submit a share to the pool with raw parameters.
 
         Used for non-SHA256 algorithms that have different submit formats.
         The first parameter is replaced with the pool's configured username.
 
+        IMPORTANT: This method also returns any notifications (like mining.notify)
+        that were received bundled with the share response. The caller MUST process
+        these notifications immediately to ensure the miner receives new jobs.
+
         Args:
             params: Raw mining.submit parameters from the miner.
 
         Returns:
-            Tuple of (accepted, error).
+            Tuple of (accepted, error, notifications).
+            - accepted: True if share was accepted
+            - error: Error details if rejected, None otherwise
+            - notifications: List of notifications received with the response
         """
         if not self._connected or not self._authorized:
-            return False, [20, "Not connected or authorized", None]
+            return False, [20, "Not connected or authorized", None], []
 
         if not params:
-            return False, [20, "Empty params", None]
+            return False, [20, "Empty params", None], []
 
         req_id = await self._next_id()
 
@@ -799,20 +806,24 @@ class UpstreamConnection:
                 req_id, StratumMethods.MINING_SUBMIT, submit_params
             )
 
+            # Drain any notifications that were bundled with the response
+            # This is critical for ALEO pools that send new jobs with rejections
+            notifications = await self.get_pending_notifications()
+
             if response.is_error:
-                return False, response.error
+                return False, response.error, notifications
             if response.is_rejected:
                 if response.reject_reason:
-                    return False, [20, response.reject_reason, None]
-                return False, [20, "Rejected by pool", None]
-            return response.result is True, None
+                    return False, [20, response.reject_reason, None], notifications
+                return False, [20, "Rejected by pool", None], notifications
+            return response.result is True, None, notifications
 
         except asyncio.TimeoutError:
             logger.warning(f"Share submit (raw) timeout for {self.name}")
-            return False, [20, "Timeout", None]
+            return False, [20, "Timeout", None], []
         except Exception as e:
             logger.error(f"Share submit (raw) error for {self.name}: {e}")
-            return False, [20, str(e), None]
+            return False, [20, str(e), None], []
         finally:
             async with self._pending_shares_lock:
                 self._pending_shares.discard(req_id)
@@ -961,11 +972,27 @@ class UpstreamConnection:
         """
         Read and parse available messages from the upstream server.
 
+        Also drains any pending notifications that were queued during send_request
+        operations (e.g., share submissions). This ensures notifications are not
+        lost when they arrive during request/response exchanges.
+
         Returns:
-            List of parsed messages.
+            List of parsed messages (including any pending notifications).
         """
+        # First, drain any pending notifications that were queued during send_request
+        # This ensures notifications received during share submission are forwarded
+        pending: list[StratumMessage] = []
+        async with self._pending_notifications_lock:
+            if self._pending_notifications:
+                pending = self._pending_notifications
+                self._pending_notifications = []
+                if pending:
+                    logger.debug(
+                        f"Draining {len(pending)} pending notifications from queue"
+                    )
+
         if not self._reader:
-            return []
+            return pending  # Return pending even if reader is gone
 
         # Use lock to prevent concurrent socket reads
         async with self._read_lock:
@@ -978,10 +1005,10 @@ class UpstreamConnection:
                     # Connection closed
                     logger.warning(f"Connection closed by {self.name}")
                     await self.disconnect()
-                    return []
+                    return pending  # Return pending even on disconnect
 
                 messages = self._protocol.feed_data(data)
-                if messages:
+                if messages or pending:
                     self._last_message_time = time_module.time()
 
                 # Process responses to pending requests (protected by lock)
@@ -996,7 +1023,9 @@ class UpstreamConnection:
                                     # Future was cancelled/completed between check and set
                                     pass
 
-                return messages
+                # Combine pending notifications with new messages
+                # Pending first since they arrived earlier
+                return pending + messages
 
             except asyncio.TimeoutError:
                 # Check connection health during timeout (log only once per unhealthy period)
@@ -1006,11 +1035,11 @@ class UpstreamConnection:
                         f"(no messages for {self.seconds_since_last_message:.0f}s)"
                     )
                     self._unhealthy_logged = True
-                return []
+                return pending  # Return pending even on timeout
             except Exception as e:
                 logger.error(f"Error reading from {self.name}: {e}")
                 await self.disconnect()
-                return []
+                return pending  # Return pending even on error
 
 class UpstreamManager:
     """

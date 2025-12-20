@@ -168,6 +168,10 @@ class ShareValidator:
         # Used to correlate miner shares with pool jobs
         self._zksnark_height_to_job: dict[int, str] = {}
 
+        # Jobs known to be stale (rejected by pool with "unknown-work")
+        # Used to reject subsequent shares locally without forwarding to pool
+        self._stale_jobs: set[str] = set()
+
         # Current difficulty
         self._difficulty: float = 1.0
 
@@ -277,6 +281,12 @@ class ShareValidator:
             # Limit job cache size
             while len(self._jobs) > self._max_job_cache:
                 self._jobs.popitem(last=False)
+
+        # Clear stale job markers when we receive a new job
+        # This is important for zkSNARK where jobs cycle rapidly - once we have
+        # a new job, old "stale" markers are no longer relevant
+        if self._stale_jobs:
+            self._stale_jobs.clear()
 
         logger.debug(
             f"[{self.session_id}] New job {job_info.job_id} from {source_server or 'unknown'} "
@@ -664,11 +674,26 @@ class ShareValidator:
                 self.duplicates_rejected += 1
                 return False, f"Duplicate share (job={job_id})"
 
+        # Check if this job was already rejected as stale/unknown-work
+        # This prevents flooding the pool with shares for jobs it no longer recognizes
+        if job_id in self._stale_jobs:
+            self.stale_rejected += 1
+            return False, f"Stale job (already rejected by pool)"
+
         # NOTE: Stale job detection is DISABLED for zkSNARK/ALEO because:
         # - ALEO miners use their own internal job ID format (e.g., '1a1f0117189253c0')
         # - Pool job IDs are different format (e.g., 'TjF58R3skI')
         # - No reliable way to map between them
         # - Let the pool handle stale share rejection
+
+        # Record share BEFORE submission to prevent duplicate submissions in same batch
+        # This is critical for high-speed miners that may send many shares at once
+        if self._reject_duplicates:
+            share_key = ZkSnarkShareKey(job_id, nonce)
+            self._recent_shares[share_key] = time.time()
+            # Maintain cache size
+            while len(self._recent_shares) > self._max_share_cache:
+                self._recent_shares.popitem(last=False)
 
         # Share passes local validation
         return True, None
@@ -694,6 +719,40 @@ class ShareValidator:
         # Maintain cache size
         while len(self._recent_shares) > self._max_share_cache:
             self._recent_shares.popitem(last=False)
+
+    def mark_job_stale(self, job_id: str) -> None:
+        """
+        Mark a job as stale (rejected by pool with unknown-work).
+
+        Subsequent shares for this job will be rejected locally without
+        forwarding to the pool. This prevents flooding the pool with
+        shares for jobs it no longer recognizes.
+
+        Args:
+            job_id: Job ID that was rejected as unknown-work.
+        """
+        self._stale_jobs.add(job_id)
+        # Limit stale job set size to prevent unbounded growth
+        # Keep only the most recent 100 stale jobs
+        while len(self._stale_jobs) > 100:
+            # Remove an arbitrary element (set doesn't have order)
+            self._stale_jobs.pop()
+        logger.debug(
+            f"[{self.session_id}] Marked job {job_id} as stale "
+            f"(total stale jobs: {len(self._stale_jobs)})"
+        )
+
+    def clear_stale_jobs(self) -> None:
+        """
+        Clear all stale job markers.
+
+        Called when a new job notification is received, as the stale
+        markers are no longer relevant.
+        """
+        if self._stale_jobs:
+            count = len(self._stale_jobs)
+            self._stale_jobs.clear()
+            logger.debug(f"[{self.session_id}] Cleared {count} stale job markers")
 
     def validate_randomx_share(
         self,

@@ -611,11 +611,22 @@ class MinerSession:
         Reconnect to the current upstream server.
 
         Protected by _upstream_lock to prevent races with handle_server_switch.
+        If already connected (e.g., another caller reconnected while we waited
+        for the lock), skip the reconnect.
         """
         if not self._current_server:
             return
 
         async with self._upstream_lock:
+            # Check if already connected (another caller may have reconnected
+            # while we were waiting for the lock)
+            if self._upstream and self._upstream.connected and self._upstream.authorized:
+                logger.debug(
+                    f"[{self.session_id}] Skipping reconnect - already connected to "
+                    f"{self._current_server}"
+                )
+                return
+
             logger.info(f"[{self.session_id}] Attempting to reconnect to {self._current_server}")
 
             # Disconnect current connection and clear reference
@@ -641,6 +652,16 @@ class MinerSession:
                         params=[self._upstream.extranonce1, self._upstream.extranonce2_size],
                     )
                     await self._send_to_miner(StratumProtocol.encode_message(notification))
+
+                    # Forward any notifications received during upstream handshake
+                    # This includes job notifications that were queued during subscribe/authorize
+                    pending = await self._upstream.get_pending_notifications()
+                    if pending:
+                        logger.info(
+                            f"[{self.session_id}] Forwarding {len(pending)} notifications after reconnect"
+                        )
+                        for pending_notification in pending:
+                            await self._handle_upstream_message(pending_notification)
             else:
                 logger.error(f"[{self.session_id}] Failed to reconnect to {self._current_server}")
                 # Ensure upstream is None on failure (defensive)
@@ -1905,7 +1926,12 @@ class MinerSession:
 
         # Submit to upstream and wait for response
         # Use the upstream's submit_share_raw method for non-standard formats
-        accepted, error = await self._upstream.submit_share_raw(msg.params)
+        accepted, error, bundled_notifications = await self._upstream.submit_share_raw(msg.params)
+
+        # Process any notifications bundled with the response
+        if bundled_notifications:
+            for notification in bundled_notifications:
+                await self._handle_upstream_message(notification)
 
         # Record stats
         stats = ProxyStats.get_instance()
@@ -2054,7 +2080,8 @@ class MinerSession:
             )
             # Transform to pool format: [worker_name] + miner_params
             grace_pool_params = [worker_name] + list(msg.params)
-            accepted, error = await self._old_upstream.submit_share_raw(grace_pool_params)
+            accepted, error, _ = await self._old_upstream.submit_share_raw(grace_pool_params)
+            # Note: We ignore notifications from old pool - they're not relevant for the new pool
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
@@ -2148,7 +2175,17 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error = await current_upstream.submit_share_raw(pool_params)
+            accepted, error, bundled_notifications = await current_upstream.submit_share_raw(pool_params)
+
+            # Process any notifications bundled with the response IMMEDIATELY
+            # This is critical for ALEO pools that send new jobs with share responses
+            if bundled_notifications:
+                logger.info(
+                    f"[{self.session_id}] Processing {len(bundled_notifications)} "
+                    f"notifications bundled with share response"
+                )
+                for notification in bundled_notifications:
+                    await self._handle_upstream_message(notification)
 
             if accepted:
                 break  # Success!
@@ -2191,6 +2228,11 @@ class MinerSession:
             # If pool says duplicate, record it to prevent re-submission
             if reason and "duplicate" in reason.lower():
                 self._validator.record_accepted_zksnark_share(job_id, nonce)
+
+            # On unknown-work rejection, mark the job as stale
+            # Notifications are already processed above from bundled_notifications
+            if reason and "unknown" in reason.lower():
+                self._validator.mark_job_stale(job_id)
 
         await self._send_to_miner(
             self._protocol.build_response(msg.id, accepted, error),
@@ -2311,7 +2353,8 @@ class MinerSession:
                 f"[{self.session_id}] Routing RandomX share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            accepted, error = await self._old_upstream.submit_share_raw(msg.params)
+            accepted, error, _ = await self._old_upstream.submit_share_raw(msg.params)
+            # Note: We ignore notifications from old pool - they're not relevant for the new pool
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
@@ -2392,7 +2435,12 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error = await current_upstream.submit_share_raw(msg.params)
+            accepted, error, bundled_notifications = await current_upstream.submit_share_raw(msg.params)
+
+            # Process any notifications bundled with the response
+            if bundled_notifications:
+                for notification in bundled_notifications:
+                    await self._handle_upstream_message(notification)
 
             if accepted:
                 break  # Success!
