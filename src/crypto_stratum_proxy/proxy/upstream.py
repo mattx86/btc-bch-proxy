@@ -767,12 +767,12 @@ class UpstreamConnection:
     async def submit_share_raw(
         self,
         params: list,
+        replace_first_param: bool = True,
     ) -> tuple[bool, Optional[list], list]:
         """
         Submit a share to the pool with raw parameters.
 
         Used for non-SHA256 algorithms that have different submit formats.
-        The first parameter is replaced with the pool's configured username.
 
         IMPORTANT: This method also returns any notifications (like mining.notify)
         that were received bundled with the share response. The caller MUST process
@@ -780,6 +780,8 @@ class UpstreamConnection:
 
         Args:
             params: Raw mining.submit parameters from the miner.
+            replace_first_param: If True, replace first param with pool username.
+                Set to False for ALEO which doesn't include worker name in submit.
 
         Returns:
             Tuple of (accepted, error, notifications).
@@ -795,8 +797,12 @@ class UpstreamConnection:
 
         req_id = await self._next_id()
 
-        # Replace worker_name (first param) with pool's configured username
-        submit_params = [self.config.username] + list(params[1:])
+        # For most algorithms: replace worker_name (first param) with pool's username
+        # For ALEO: send params as-is (no worker name in submit format)
+        if replace_first_param:
+            submit_params = [self.config.username] + list(params[1:])
+        else:
+            submit_params = list(params)
 
         async with self._pending_shares_lock:
             self._pending_shares.add(req_id)

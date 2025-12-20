@@ -2080,7 +2080,9 @@ class MinerSession:
             )
             # ALEO stratum: forward params as-is (no worker_name prefix)
             grace_pool_params = list(msg.params)
-            accepted, error, _ = await self._old_upstream.submit_share_raw(grace_pool_params)
+            accepted, error, _ = await self._old_upstream.submit_share_raw(
+                grace_pool_params, replace_first_param=False
+            )
             # Note: We ignore notifications from old pool - they're not relevant for the new pool
             stats = ProxyStats.get_instance()
             if accepted:
@@ -2175,7 +2177,9 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            accepted, error, bundled_notifications = await current_upstream.submit_share_raw(pool_params)
+            accepted, error, bundled_notifications = await current_upstream.submit_share_raw(
+                pool_params, replace_first_param=False
+            )
 
             # Process any notifications bundled with the response IMMEDIATELY
             # This is critical for ALEO pools that send new jobs with share responses
