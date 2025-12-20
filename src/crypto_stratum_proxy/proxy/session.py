@@ -1996,10 +1996,16 @@ class MinerSession:
             )
             return
 
-        # ALEO submit params: [worker_name, job_id, nonce, commitment, solution]
-        # Require at least worker_name, job_id, and nonce
-        if len(msg.params) < 3:
-            error = [20, "Invalid submit parameters: need worker, job_id, and nonce", None]
+        # IceRiver ALEO miner format: [job_id, counter, proof, nonce]
+        # - params[0] = job_id (the pool's job_id, NOT worker_name!)
+        # - params[1] = counter/extra nonce
+        # - params[2] = proof (long commitment string)
+        # - params[3] = nonce (short)
+        #
+        # Pool expects: [worker_name, job_id, nonce, proof]
+        # We need to transform the miner's format to the pool's format.
+        if len(msg.params) < 4:
+            error = [20, "Invalid submit parameters: need job_id, counter, proof, and nonce", None]
             logger.warning(f"[{self.session_id}] {error[1]}: {msg.params}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
@@ -2007,13 +2013,23 @@ class MinerSession:
             )
             return
 
-        worker_name = msg.params[0]
-        job_id = str(msg.params[1])
-        nonce = str(msg.params[2])
+        # Parse miner's format
+        miner_job_id = str(msg.params[0])  # Pool's job_id
+        miner_counter = str(msg.params[1])  # Extra nonce/counter (not used by pool)
+        miner_proof = str(msg.params[2])    # Proof/commitment
+        miner_nonce = str(msg.params[3])    # Nonce
+
+        # Use the authorized worker name, not from params
+        worker_name = self._worker_name or "unknown"
 
         logger.debug(
-            f"[{self.session_id}] zkSNARK share submit: job={job_id}, params_count={len(msg.params)}"
+            f"[{self.session_id}] zkSNARK share submit: pool_job={miner_job_id}, "
+            f"counter={miner_counter}, nonce={miner_nonce}"
         )
+
+        # For local validation and logging, use the miner's job_id
+        job_id = miner_job_id
+        nonce = miner_nonce
 
         # Check job source to determine which pool should receive this share
         job_source = self._validator.get_job_source(job_id)
@@ -2026,16 +2042,13 @@ class MinerSession:
 
         # Route to old pool if job was issued by old pool and we're in grace period
         if in_grace_period and job_source == self._old_upstream_server_name:
-            # For grace period routing, we need the old pool's job_id
-            # Since the miner uses internal IDs, use the job_id from our tracked source
-            # The job_source lookup already validated this is a known job
             logger.info(
                 f"[{self.session_id}] Routing zkSNARK share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            # Note: For grace period, the job_id mapping should still work since we're
-            # sending to the pool that issued the job
-            accepted, error = await self._old_upstream.submit_share_raw(msg.params)
+            # Transform to pool format: [worker_name, job_id, nonce, proof]
+            grace_pool_params = [worker_name, miner_job_id, miner_nonce, miner_proof]
+            accepted, error = await self._old_upstream.submit_share_raw(grace_pool_params)
             stats = ProxyStats.get_instance()
             if accepted:
                 logger.info(
@@ -2080,29 +2093,24 @@ class MinerSession:
             )
             return
 
-        # ALEO miners use internal job IDs that differ from pool job IDs.
-        # The pool cycles through job IDs quickly, so the miner may be working on
-        # an older job. We'll try recent job IDs until one succeeds.
-        recent_job_ids = self._validator.get_recent_job_ids(count=5)
-        if not recent_job_ids:
-            logger.warning(
-                f"[{self.session_id}] No pool job_ids available, forwarding miner job_id as-is"
-            )
-            recent_job_ids = [job_id]  # Fall back to miner's job_id
-        else:
-            logger.info(
-                f"[{self.session_id}] zkSNARK job_id mapping: miner={job_id}, "
-                f"will try pool jobs: {recent_job_ids}"
-            )
+        # Transform miner format to pool format:
+        # Miner: [job_id, counter, proof, nonce]
+        # Pool:  [worker_name, job_id, nonce, proof]
+        pool_params = [worker_name, miner_job_id, miner_nonce, miner_proof]
 
-        # Try each job ID in order (newest first, then older)
+        logger.info(
+            f"[{self.session_id}] Submitting zkSNARK share: job_id={miner_job_id}, "
+            f"nonce={miner_nonce}"
+        )
+
+        # Submit to upstream with retry logic for transient failures
         max_retries = self.config.proxy.global_.share_submit_retries
+        retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
         start_time = time.time()
         accepted = False
         error = None
-        last_tried_job_id = None
 
-        for pool_job_id in recent_job_ids:
+        for attempt in range(max_retries):
             # Check overall timeout
             elapsed = time.time() - start_time
             if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
@@ -2113,72 +2121,48 @@ class MinerSession:
                 error = [20, "Share submit timeout", None]
                 break
 
-            # Create params with this pool job_id
-            modified_params = list(msg.params)
-            modified_params[1] = pool_job_id
-            last_tried_job_id = pool_job_id
+            # Re-capture upstream reference
+            current_upstream = self._upstream
 
-            # Retry loop for connection issues with this job_id
-            retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
-            for attempt in range(max_retries):
-                # Re-capture upstream reference
-                current_upstream = self._upstream
-
-                # Check if upstream is still connected
-                if not current_upstream or not current_upstream.connected:
-                    if attempt < max_retries - 1:
-                        logger.warning(
-                            f"[{self.session_id}] Upstream not connected, reconnecting..."
-                        )
-                        await self._reconnect_upstream()
-                        current_upstream = self._upstream
-                        if not current_upstream or not current_upstream.connected:
-                            error = [20, "Upstream connection failed", None]
-                            await asyncio.sleep(retry_delay)
-                            retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
-                            continue
-                    else:
-                        error = [20, "Upstream not connected", None]
-                        break
-
-                logger.info(
-                    f"[{self.session_id}] Submitting zkSNARK share: job_id={pool_job_id}"
-                )
-                accepted, error = await current_upstream.submit_share_raw(modified_params)
-
-                if accepted:
-                    break  # Success!
-
-                # Check error type
-                error_msg = _get_error_message(error).lower()
-
-                # If "unknown-work", try the next job_id (don't retry this one)
-                if "unknown-work" in error_msg or "unknown work" in error_msg:
-                    logger.debug(
-                        f"[{self.session_id}] Job {pool_job_id} rejected (unknown-work), "
-                        f"trying older job..."
-                    )
-                    break  # Break inner loop, try next job_id
-
-                # Check if error is retryable (connection issues)
-                retryable = any(x in error_msg for x in [
-                    "timeout", "not connected", "connection", "timed out"
-                ])
-
-                if retryable and attempt < max_retries - 1:
+            # Check if upstream is still connected
+            if not current_upstream or not current_upstream.connected:
+                if attempt < max_retries - 1:
                     logger.warning(
-                        f"[{self.session_id}] Share submit failed ({error_msg}), "
-                        f"retrying ({attempt + 1}/{max_retries})..."
+                        f"[{self.session_id}] Upstream not connected, reconnecting..."
                     )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
-                    continue
+                    await self._reconnect_upstream()
+                    current_upstream = self._upstream
+                    if not current_upstream or not current_upstream.connected:
+                        error = [20, "Upstream connection failed", None]
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
+                        continue
+                else:
+                    error = [20, "Upstream not connected", None]
+                    break
 
-                # Non-retryable error
-                break
+            accepted, error = await current_upstream.submit_share_raw(pool_params)
 
             if accepted:
-                break  # Success, exit outer loop
+                break  # Success!
+
+            # Check if error is retryable (connection issues)
+            error_msg = _get_error_message(error).lower()
+            retryable = any(x in error_msg for x in [
+                "timeout", "not connected", "connection", "timed out"
+            ])
+
+            if retryable and attempt < max_retries - 1:
+                logger.warning(
+                    f"[{self.session_id}] Share submit failed ({error_msg}), "
+                    f"retrying ({attempt + 1}/{max_retries})..."
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
+                continue
+
+            # Non-retryable error
+            break
 
         # Record stats
         stats = ProxyStats.get_instance()

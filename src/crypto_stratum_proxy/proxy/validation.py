@@ -251,15 +251,27 @@ class ShareValidator:
         # If clean_jobs is true, clear old jobs AND share cache
         # New block found - all previous work is now stale
         if job_info.clean_jobs:
-            # Keep only the current job
-            self._jobs = OrderedDict([(job_info.job_id, job_info)])
-            # Clear share cache - old shares are worthless after new block
-            old_share_count = len(self._recent_shares)
-            self._recent_shares.clear()
-            if old_share_count > 0:
+            # For zkSNARK/ALEO: Keep recent jobs even with clean_jobs=True
+            # because the pool cycles jobs very rapidly and miners may still
+            # be working on older jobs. We need a buffer for retry attempts.
+            if self._algorithm == "zksnark":
+                # Keep last N jobs for retry purposes (limit to 10)
+                max_zksnark_jobs = 10
+                while len(self._jobs) > max_zksnark_jobs:
+                    self._jobs.popitem(last=False)
                 logger.debug(
-                    f"[{self.session_id}] Cleared {old_share_count} cached shares (new block)"
+                    f"[{self.session_id}] zkSNARK: kept {len(self._jobs)} jobs despite clean_jobs"
                 )
+            else:
+                # For other algorithms: keep only the current job
+                self._jobs = OrderedDict([(job_info.job_id, job_info)])
+                # Clear share cache - old shares are worthless after new block
+                old_share_count = len(self._recent_shares)
+                self._recent_shares.clear()
+                if old_share_count > 0:
+                    logger.debug(
+                        f"[{self.session_id}] Cleared {old_share_count} cached shares (new block)"
+                    )
             # NOTE: Do NOT clear _job_sources here - needed for grace period routing
         else:
             # Limit job cache size
