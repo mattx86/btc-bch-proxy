@@ -1248,6 +1248,7 @@ class MinerSession:
             "low difficulty",
             "above target",
             "high hash",
+            "high-hash",  # ALEO format (with hyphen)
             "share above target",
             "difficulty too low",
             "hash > target",
@@ -2274,9 +2275,9 @@ class MinerSession:
             if reason and "duplicate" in reason.lower():
                 self._validator.record_accepted_zksnark_share(job_id, nonce)
 
-            # On unknown-work rejection, mark the job as stale
+            # On stale/unknown-work rejection, mark the job as stale
             # Notifications are already processed above from bundled_notifications
-            if reason and "unknown" in reason.lower():
+            if reason and ("unknown" in reason.lower() or "stale" in reason.lower()):
                 self._validator.mark_job_stale(job_id)
 
         await self._send_to_miner(
