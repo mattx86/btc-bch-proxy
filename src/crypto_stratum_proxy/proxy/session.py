@@ -1011,6 +1011,9 @@ class MinerSession:
                 str(msg.params[0]), max_length=MAX_WORKER_USERNAME_LENGTH
             )
 
+        # Update validator's log prefix with full context
+        self._validator.set_log_prefix(self._log_prefix)
+
         logger.info(f"{self._log_prefix} Miner authorized")
 
         # Record worker for stats tracking
@@ -1425,7 +1428,7 @@ class MinerSession:
             if window_duration >= 120 and len(self._share_timestamps) >= cfg.share_rate_min_shares:
                 self._baseline_share_rate = actual_rate
                 logger.info(
-                    f"[{self.session_id}] Share rate baseline established: "
+                    f"{self._log_prefix} Share rate baseline established: "
                     f"{self._baseline_share_rate:.2f}/min"
                 )
             return
@@ -2564,8 +2567,8 @@ class MinerSession:
                 if msg.method == StratumMethods.MINING_NOTIFY:
                     # Log raw params for debugging (especially for zkSNARK)
                     if self.algorithm == "zksnark":
-                        logger.info(
-                            f"[{self.session_id}] Raw mining.notify params ({len(msg.params)}): "
+                        logger.debug(
+                            f"{self._log_prefix} Raw mining.notify params ({len(msg.params)}): "
                             f"{msg.params[:6] if len(msg.params) >= 6 else msg.params}"
                         )
                     # Queue job if:

@@ -177,6 +177,13 @@ class ShareValidator:
         self._last_cache_cleanup: float = 0.0
         self._cache_cleanup_interval: float = 60.0
 
+        # Log prefix (can be updated by session for full context)
+        self._log_prefix: str = f"[{session_id}]"
+
+    def set_log_prefix(self, prefix: str) -> None:
+        """Update the log prefix (called by session when context is available)."""
+        self._log_prefix = prefix
+
     def set_difficulty(self, difficulty: float) -> None:
         """
         Update the current difficulty.
@@ -376,19 +383,19 @@ class ShareValidator:
                         change = "decreased"
                         ratio = self._last_zksnark_target / new_target
                     logger.info(
-                        f"[{self.session_id}] zkSNARK target {change}: "
+                        f"{self._log_prefix} zkSNARK target {change}: "
                         f"{self._last_zksnark_target} -> {new_target} ({ratio:.1f}x)"
                     )
 
             self._last_zksnark_target = new_target
 
-            logger.info(
-                f"[{self.session_id}] zkSNARK job: id={job_info.job_id}, height={height_val}, "
+            logger.debug(
+                f"{self._log_prefix} zkSNARK job: id={job_info.job_id}, height={height_val}, "
                 f"target={job_info.target}, clean={clean_jobs}"
             )
             self.add_job(job_info, source_server)
         except (ValueError, TypeError) as e:
-            logger.warning(f"[{self.session_id}] Error parsing zkSNARK job params: {e}")
+            logger.warning(f"{self._log_prefix} Error parsing zkSNARK job params: {e}")
 
     def _add_randomx_job(self, params: list, source_server: Optional[str] = None) -> None:
         """
