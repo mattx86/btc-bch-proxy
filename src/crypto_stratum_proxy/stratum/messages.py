@@ -12,7 +12,8 @@ class StratumRequest:
 
     id: int
     method: str
-    params: List[Any] = field(default_factory=list)
+    # Params can be a list (standard stratum) or dict (Monero stratum)
+    params: Union[List[Any], dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -64,7 +65,8 @@ class StratumNotification:
     """A stratum JSON-RPC notification (no id, no response expected)."""
 
     method: str
-    params: List[Any] = field(default_factory=list)
+    # Params can be a list (standard stratum) or dict (Monero stratum)
+    params: Union[List[Any], dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""

@@ -954,6 +954,13 @@ class MinerSession:
                     self._protocol.build_response(msg.id, True)
                 )
                 logger.debug(f"{self._log_prefix} Acknowledged mining.extranonce.subscribe")
+            elif msg.method == "keepalived" and self.algorithm == "randomx":
+                # Monero keepalive - respond with status OK
+                result = {"status": "OK"}
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, result)
+                )
+                logger.debug(f"{self._log_prefix} Responded to keepalived")
             else:
                 # Forward other requests to upstream
                 await self._forward_to_upstream(msg)
@@ -2603,11 +2610,19 @@ class MinerSession:
         Args:
             msg: The login request from miner.
         """
+        logger.debug(
+            f"{self._log_prefix} Monero login params type={type(msg.params).__name__}, "
+            f"value={str(msg.params)[:200]}"
+        )
+
         params = msg.params
         if isinstance(params, list) and len(params) > 0:
             params = params[0]
 
         if not isinstance(params, dict):
+            logger.warning(
+                f"{self._log_prefix} Login params not a dict: {type(params).__name__}"
+            )
             error = {"code": -1, "message": "Invalid login params"}
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, None, error),
@@ -2793,6 +2808,11 @@ class MinerSession:
         Args:
             msg: The job notification message.
         """
+        logger.debug(
+            f"{self._log_prefix} Job notification params type={type(msg.params).__name__}, "
+            f"value={str(msg.params)[:200] if msg.params else 'None'}"
+        )
+
         if not msg.params:
             logger.warning(f"{self._log_prefix} Empty job notification")
             return
