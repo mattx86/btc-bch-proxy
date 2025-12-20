@@ -2081,34 +2081,29 @@ class MinerSession:
             return
 
         # ALEO miners use internal job IDs that differ from pool job IDs.
-        # Replace the miner's job_id with the current pool job_id before forwarding.
-        pool_job_id = self._validator.get_current_job_id()
-        if pool_job_id and pool_job_id != job_id:
-            logger.debug(
-                f"[{self.session_id}] zkSNARK job_id mapping: "
-                f"miner={job_id} -> pool={pool_job_id}"
+        # The pool cycles through job IDs quickly, so the miner may be working on
+        # an older job. We'll try recent job IDs until one succeeds.
+        recent_job_ids = self._validator.get_recent_job_ids(count=5)
+        if not recent_job_ids:
+            logger.warning(
+                f"[{self.session_id}] No pool job_ids available, forwarding miner job_id as-is"
             )
-            # Create modified params with pool's job_id
-            modified_params = list(msg.params)
-            modified_params[1] = pool_job_id
-            submit_params = modified_params
+            recent_job_ids = [job_id]  # Fall back to miner's job_id
         else:
-            # No mapping needed or no current job
-            submit_params = msg.params
-            if not pool_job_id:
-                logger.warning(
-                    f"[{self.session_id}] No current pool job_id, forwarding miner job_id as-is"
-                )
+            logger.info(
+                f"[{self.session_id}] zkSNARK job_id mapping: miner={job_id}, "
+                f"will try pool jobs: {recent_job_ids}"
+            )
 
-        # Submit to upstream with retry logic for transient failures
+        # Try each job ID in order (newest first, then older)
         max_retries = self.config.proxy.global_.share_submit_retries
-        retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
         start_time = time.time()
         accepted = False
         error = None
+        last_tried_job_id = None
 
-        for attempt in range(max_retries):
-            # Check overall timeout to prevent indefinite blocking
+        for pool_job_id in recent_job_ids:
+            # Check overall timeout
             elapsed = time.time() - start_time
             if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
                 logger.warning(
@@ -2118,64 +2113,72 @@ class MinerSession:
                 error = [20, "Share submit timeout", None]
                 break
 
-            # Re-capture upstream reference at start of each retry attempt
-            current_upstream = self._upstream
+            # Create params with this pool job_id
+            modified_params = list(msg.params)
+            modified_params[1] = pool_job_id
+            last_tried_job_id = pool_job_id
 
-            # Check if upstream is still connected
-            if not current_upstream or not current_upstream.connected:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"[{self.session_id}] Upstream not connected, reconnecting before retry..."
+            # Retry loop for connection issues with this job_id
+            retry_delay = SHARE_SUBMIT_INITIAL_RETRY_DELAY
+            for attempt in range(max_retries):
+                # Re-capture upstream reference
+                current_upstream = self._upstream
+
+                # Check if upstream is still connected
+                if not current_upstream or not current_upstream.connected:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"[{self.session_id}] Upstream not connected, reconnecting..."
+                        )
+                        await self._reconnect_upstream()
+                        current_upstream = self._upstream
+                        if not current_upstream or not current_upstream.connected:
+                            error = [20, "Upstream connection failed", None]
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
+                            continue
+                    else:
+                        error = [20, "Upstream not connected", None]
+                        break
+
+                logger.info(
+                    f"[{self.session_id}] Submitting zkSNARK share: job_id={pool_job_id}"
+                )
+                accepted, error = await current_upstream.submit_share_raw(modified_params)
+
+                if accepted:
+                    break  # Success!
+
+                # Check error type
+                error_msg = _get_error_message(error).lower()
+
+                # If "unknown-work", try the next job_id (don't retry this one)
+                if "unknown-work" in error_msg or "unknown work" in error_msg:
+                    logger.debug(
+                        f"[{self.session_id}] Job {pool_job_id} rejected (unknown-work), "
+                        f"trying older job..."
                     )
-                    await self._reconnect_upstream()
-                    current_upstream = self._upstream
-                    if not current_upstream or not current_upstream.connected:
-                        error = [20, "Upstream connection failed", None]
-                        continue
-                else:
-                    error = [20, "Upstream not connected", None]
-                    break
+                    break  # Break inner loop, try next job_id
 
-            accepted, error = await current_upstream.submit_share_raw(submit_params)
+                # Check if error is retryable (connection issues)
+                retryable = any(x in error_msg for x in [
+                    "timeout", "not connected", "connection", "timed out"
+                ])
+
+                if retryable and attempt < max_retries - 1:
+                    logger.warning(
+                        f"[{self.session_id}] Share submit failed ({error_msg}), "
+                        f"retrying ({attempt + 1}/{max_retries})..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
+                    continue
+
+                # Non-retryable error
+                break
 
             if accepted:
-                break  # Success!
-
-            # Check if error is retryable
-            retryable = False
-            error_code = None
-            if isinstance(error, (list, tuple)) and len(error) >= 1:
-                try:
-                    error_code = int(error[0])
-                except (ValueError, TypeError):
-                    pass
-            elif isinstance(error, dict):
-                error_code = error.get("code")
-
-            # Error code 20 is "unknown error" - often used for connection issues
-            if error_code == 20:
-                error_msg = _get_error_message(error).lower()
-                retryable = any(x in error_msg for x in [
-                    "timeout", "not connected", "connection", "timed out"
-                ])
-            elif error_code is None:
-                error_msg = _get_error_message(error).lower()
-                retryable = any(x in error_msg for x in [
-                    "timeout", "not connected", "connection", "timed out"
-                ])
-
-            if retryable and attempt < max_retries - 1:
-                retry_reason = _get_error_message(error)
-                logger.warning(
-                    f"[{self.session_id}] Share submit failed ({retry_reason}), "
-                    f"retrying ({attempt + 1}/{max_retries})..."
-                )
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, SHARE_SUBMIT_MAX_RETRY_DELAY)
-                continue
-
-            # Non-retryable error or last attempt
-            break
+                break  # Success, exit outer loop
 
         # Record stats
         stats = ProxyStats.get_instance()

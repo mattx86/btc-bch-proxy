@@ -495,6 +495,26 @@ class ShareValidator:
         """
         return self._current_job_id
 
+    def get_recent_job_ids(self, count: int = 3) -> list[str]:
+        """
+        Get recent pool job IDs in reverse chronological order (newest first).
+
+        Used for zkSNARK/ALEO where miners may be working on older jobs.
+        When a share is rejected with "unknown-work", we can retry with
+        previous job IDs.
+
+        Args:
+            count: Maximum number of job IDs to return.
+
+        Returns:
+            List of recent job IDs, newest first.
+        """
+        # _jobs is an OrderedDict ordered by insertion (oldest first)
+        # We want newest first, so reverse it
+        job_ids = list(self._jobs.keys())
+        job_ids.reverse()
+        return job_ids[:count]
+
     def validate_share(
         self,
         job_id: str,
