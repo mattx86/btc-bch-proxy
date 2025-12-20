@@ -2078,8 +2078,8 @@ class MinerSession:
                 f"[{self.session_id}] Routing zkSNARK share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            # Transform to pool format: [worker_name] + miner_params
-            grace_pool_params = [worker_name] + list(msg.params)
+            # ALEO stratum: forward params as-is (no worker_name prefix)
+            grace_pool_params = list(msg.params)
             accepted, error, _ = await self._old_upstream.submit_share_raw(grace_pool_params)
             # Note: We ignore notifications from old pool - they're not relevant for the new pool
             stats = ProxyStats.get_instance()
@@ -2126,11 +2126,11 @@ class MinerSession:
             )
             return
 
-        # Transform miner format to pool format:
-        # Miner sends: [job_id, counter, commitment, nonce]
-        # Pool expects: [worker_name, job_id, counter] (per ALEO stratum spec)
-        # But this pool might expect the full params, so try: [worker_name] + miner_params
-        pool_params = [worker_name] + list(msg.params)
+        # ALEO stratum submit format (confirmed via protocol capture):
+        # Miner sends: [job_id, counter, proof_address, nonce]
+        # Pool expects: [job_id, counter, proof_address, nonce] - SAME FORMAT, no worker name!
+        # This differs from Bitcoin stratum which prepends worker_name
+        pool_params = list(msg.params)
 
         logger.info(
             f"[{self.session_id}] Submitting zkSNARK share: job_id={miner_job_id}, "
