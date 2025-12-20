@@ -170,7 +170,8 @@ class ShareValidator:
 
         # Jobs known to be stale (rejected by pool with "unknown-work")
         # Used to reject subsequent shares locally without forwarding to pool
-        self._stale_jobs: set[str] = set()
+        # Dict for FIFO ordering (Python 3.7+) - value is timestamp
+        self._stale_jobs: dict[str, float] = {}
 
         # Current difficulty
         self._difficulty: float = 1.0
@@ -282,11 +283,11 @@ class ShareValidator:
             while len(self._jobs) > self._max_job_cache:
                 self._jobs.popitem(last=False)
 
-        # Clear stale job markers when we receive a new job
-        # This is important for zkSNARK where jobs cycle rapidly - once we have
-        # a new job, old "stale" markers are no longer relevant
-        if self._stale_jobs:
-            self._stale_jobs.clear()
+        # NOTE: We do NOT clear stale job markers here anymore.
+        # Previously we cleared them on new job arrival, but this was wrong because:
+        # - The miner may still have queued shares for old stale jobs
+        # - Clearing would cause those shares to be forwarded to pool (and rejected)
+        # - Stale markers now expire via FIFO eviction in mark_job_stale()
 
         logger.debug(
             f"[{self.session_id}] New job {job_info.job_id} from {source_server or 'unknown'} "
@@ -731,12 +732,13 @@ class ShareValidator:
         Args:
             job_id: Job ID that was rejected as unknown-work.
         """
-        self._stale_jobs.add(job_id)
-        # Limit stale job set size to prevent unbounded growth
-        # Keep only the most recent 100 stale jobs
+        # Add with timestamp (dict maintains insertion order in Python 3.7+)
+        self._stale_jobs[job_id] = time.time()
+        # FIFO eviction - keep only the most recent 100 stale jobs
         while len(self._stale_jobs) > 100:
-            # Remove an arbitrary element (set doesn't have order)
-            self._stale_jobs.pop()
+            # Remove oldest entry (first inserted)
+            oldest_job = next(iter(self._stale_jobs))
+            del self._stale_jobs[oldest_job]
         logger.debug(
             f"[{self.session_id}] Marked job {job_id} as stale "
             f"(total stale jobs: {len(self._stale_jobs)})"
@@ -746,8 +748,9 @@ class ShareValidator:
         """
         Clear all stale job markers.
 
-        Called when a new job notification is received, as the stale
-        markers are no longer relevant.
+        NOTE: This is no longer called automatically on new job arrival.
+        Stale markers now persist and expire via FIFO eviction to prevent
+        the miner from flooding the pool with shares for old stale jobs.
         """
         if self._stale_jobs:
             count = len(self._stale_jobs)
