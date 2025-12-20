@@ -22,6 +22,7 @@ class ServerConfigInfo:
     username: str
     schedule_start: str  # HH:MM format
     schedule_end: str  # HH:MM format
+    algorithm: str  # sha256, randomx, zksnark
 
     @property
     def address(self) -> str:
@@ -125,8 +126,7 @@ class ServerStats:
     """Statistics for a single upstream server."""
 
     name: str
-    connections: int = 0
-    reconnections: int = 0
+    active_connections: int = 0  # Currently connected sessions
     accepted_shares: int = 0
     rejected_shares: int = 0
     rejection_reasons: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
@@ -182,16 +182,21 @@ class ProxyStats:
         # This detects bugs where disconnect is called more than once for a session
         self._connected_sessions: Set[str] = set()
 
+        # Track active workers by session_id -> worker_name
+        self._active_workers: Dict[str, str] = {}
+
         # Per-server stats
         self._server_stats: Dict[str, ServerStats] = {}
 
-        # Currently active server (for display in stats)
+        # Currently active server and algorithm (for display in stats)
         self._active_server: Optional[str] = None
         self._active_server_addr: Optional[str] = None  # host:port
+        self._active_algorithm: Optional[str] = None
 
         # Previous server and last switch time (for display in stats)
         self._previous_server: Optional[str] = None
         self._previous_server_addr: Optional[str] = None  # host:port
+        self._previous_algorithm: Optional[str] = None
         self._last_switch_time: Optional[datetime] = None
 
         # Server configuration info (for display in stats)
@@ -294,6 +299,8 @@ class ProxyStats:
                 )
                 return
             self._connected_sessions.discard(session_id)
+            # Remove from active workers if present
+            self._active_workers.pop(session_id, None)
             # Defensive check: prevent counter from going negative
             # This should never happen if session tracking is correct, but guards
             # against edge cases where the counter gets out of sync
@@ -306,35 +313,59 @@ class ProxyStats:
                 )
             self.total_miner_disconnections += 1
 
-    async def set_active_server(self, server_name: str, server_addr: Optional[str] = None) -> None:
+    async def record_worker_authorized(self, session_id: str, worker_name: str) -> None:
+        """
+        Record a worker authorization (miner provided worker name).
+
+        Args:
+            session_id: Unique session identifier.
+            worker_name: The worker name provided by the miner.
+        """
+        async with self._get_lock():
+            self._active_workers[session_id] = worker_name
+
+    def get_unique_worker_count(self) -> int:
+        """Get count of unique worker names currently connected."""
+        return len(set(self._active_workers.values()))
+
+    async def set_active_server(
+        self,
+        server_name: str,
+        server_addr: Optional[str] = None,
+        algorithm: Optional[str] = None,
+    ) -> None:
         """
         Set the currently active server for routing.
 
         Args:
             server_name: Name of the server.
             server_addr: Server address as "host:port" (optional).
+            algorithm: Algorithm name (sha256, randomx, zksnark).
         """
         async with self._get_lock():
             # Track previous server and switch time when server changes
             if self._active_server is not None and self._active_server != server_name:
                 self._previous_server = self._active_server
                 self._previous_server_addr = self._active_server_addr
+                self._previous_algorithm = self._active_algorithm
                 # Store local time with timezone info for proper offset display
                 self._last_switch_time = datetime.now(timezone.utc).astimezone()
             self._active_server = server_name
             self._active_server_addr = server_addr
+            self._active_algorithm = algorithm
 
     async def record_upstream_connect(self, server_name: str) -> None:
-        """Record an upstream server connection."""
+        """Record an upstream server connection (active session established)."""
         async with self._get_lock():
             stats = self._get_server_stats(server_name)
-            stats.connections += 1
+            stats.active_connections += 1
 
-    async def record_upstream_reconnect(self, server_name: str) -> None:
-        """Record an upstream server reconnection."""
+    async def record_upstream_disconnect(self, server_name: str) -> None:
+        """Record an upstream server disconnection (session ended)."""
         async with self._get_lock():
             stats = self._get_server_stats(server_name)
-            stats.reconnections += 1
+            if stats.active_connections > 0:
+                stats.active_connections -= 1
 
     async def record_share_accepted(self, server_name: str) -> None:
         """Record an accepted share."""
@@ -383,20 +414,19 @@ class ProxyStats:
 
         # Copy stats under lock to avoid race conditions
         async with self._get_lock():
-            current_miners = self.current_miners
-            total_connections = self.total_miner_connections
-            total_disconnections = self.total_miner_disconnections
+            unique_workers = len(set(self._active_workers.values()))
             active_server = self._active_server
             active_server_addr = self._active_server_addr
+            active_algorithm = self._active_algorithm
             previous_server = self._previous_server
             previous_server_addr = self._previous_server_addr
+            previous_algorithm = self._previous_algorithm
             last_switch_time = self._last_switch_time
             server_configs = list(self._server_configs)
             server_stats_copy = {
                 name: ServerStats(
                     name=stats.name,
-                    connections=stats.connections,
-                    reconnections=stats.reconnections,
+                    active_connections=stats.active_connections,
                     accepted_shares=stats.accepted_shares,
                     rejected_shares=stats.rejected_shares,
                     rejection_reasons=dict(stats.rejection_reasons),
@@ -408,69 +438,72 @@ class ProxyStats:
         logger.info(f"PROXY STATISTICS (uptime: {uptime})")
         logger.info("=" * 60)
 
-        # Server configuration
-        if server_configs:
-            logger.info("Servers:")
-            for cfg in server_configs:
-                logger.info(
-                    f"  - {cfg.name} ({cfg.address}) "
-                    f"Schedule: {cfg.schedule_start}-{cfg.schedule_end} "
-                    f"Username: {cfg.username}"
-                )
+        # Group server configs by algorithm
+        algorithms: Dict[str, List[ServerConfigInfo]] = {}
+        for cfg in server_configs:
+            if cfg.algorithm not in algorithms:
+                algorithms[cfg.algorithm] = []
+            algorithms[cfg.algorithm].append(cfg)
 
-        # Miner stats
-        logger.info(
-            f"Miners: {current_miners} active | "
-            f"{total_connections} total connections | "
-            f"{total_disconnections} disconnections"
-        )
-
-        # Server routing info
-        if active_server:
-            # Format server name with address if available
-            active_str = f"{active_server} ({active_server_addr})" if active_server_addr else active_server
-            if previous_server and last_switch_time:
-                prev_str = f"{previous_server} ({previous_server_addr})" if previous_server_addr else previous_server
-                switch_time_str = last_switch_time.strftime("%Y-%m-%d %H:%M:%S%z")
-                logger.info(f"Active server: {active_str}")
-                logger.info(f"Previous server: {prev_str}")
-                logger.info(f"Last switch: {switch_time_str}")
-            else:
-                logger.info(f"Active server: {active_str} (no switches yet)")
-
-        # Per-server stats
-        if not server_stats_copy:
-            logger.info("No server statistics yet")
-        else:
-            for name, stats in server_stats_copy.items():
+        # Display stats organized by algorithm
+        first_algo = True
+        for algo, algo_configs in algorithms.items():
+            if not first_algo:
                 logger.info("-" * 40)
-                # Show (active) indicator for currently active server
-                active_indicator = " (active)" if name == active_server else ""
-                logger.info(f"Server: {name}{active_indicator}")
+            first_algo = False
+            logger.info(f"Algorithm: {algo}")
+
+            # Worker count for the active algorithm
+            if algo == active_algorithm:
+                logger.info(f"  Workers: {unique_workers} active")
+
+            # Active/previous server info for this algorithm
+            if active_algorithm == algo and active_server:
+                active_str = f"{active_server} ({active_server_addr})" if active_server_addr else active_server
+                if previous_server and last_switch_time and previous_algorithm == algo:
+                    prev_str = f"{previous_server} ({previous_server_addr})" if previous_server_addr else previous_server
+                    switch_time_str = last_switch_time.strftime("%Y-%m-%d %H:%M:%S%z")
+                    logger.info(f"  Active server: {active_str}")
+                    logger.info(f"  Previous server: {prev_str}")
+                    logger.info(f"  Last switch: {switch_time_str}")
+                else:
+                    logger.info(f"  Active server: {active_str}")
+
+            # List servers with stats for this algorithm
+            logger.info("  Servers:")
+            for cfg in algo_configs:
+                active_indicator = " (active)" if cfg.name == active_server else ""
                 logger.info(
-                    f"  Connections: {stats.connections} | "
-                    f"Reconnections: {stats.reconnections}"
+                    f"    - {cfg.name} ({cfg.address}) "
+                    f"Schedule: {cfg.schedule_start}-{cfg.schedule_end}{active_indicator}"
                 )
 
-                if stats.total_shares > 0:
-                    logger.info(
-                        f"  Shares: {stats.accepted_shares} accepted / "
-                        f"{stats.rejected_shares} rejected "
-                        f"({stats.accept_rate:.1f}% / {stats.reject_rate:.1f}%)"
-                    )
+                # Show stats for this server
+                stats = server_stats_copy.get(cfg.name)
+                if stats:
+                    # Only show connection count for active server
+                    if cfg.name == active_server:
+                        logger.info(f"      Connections: {stats.active_connections}")
 
-                    # Log rejection reasons if any
-                    if stats.rejection_reasons:
-                        reasons_str = ", ".join(
-                            f'"{reason}": {count}'
-                            for reason, count in sorted(
-                                stats.rejection_reasons.items(),
-                                key=lambda x: -x[1]
-                            )
+                    if stats.total_shares > 0:
+                        logger.info(
+                            f"      Shares: {stats.accepted_shares} accepted / "
+                            f"{stats.rejected_shares} rejected "
+                            f"({stats.accept_rate:.1f}% / {stats.reject_rate:.1f}%)"
                         )
-                        logger.info(f"  Rejection reasons: {reasons_str}")
-                else:
-                    logger.info("  Shares: none submitted yet")
+
+                        # Log rejection reasons if any
+                        if stats.rejection_reasons:
+                            reasons_str = ", ".join(
+                                f'"{reason}": {count}'
+                                for reason, count in sorted(
+                                    stats.rejection_reasons.items(),
+                                    key=lambda x: -x[1]
+                                )
+                            )
+                            logger.info(f"      Rejection reasons: {reasons_str}")
+                    else:
+                        logger.info("      Shares: none submitted yet")
 
         logger.info("=" * 60)
 

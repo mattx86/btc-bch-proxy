@@ -336,7 +336,7 @@ class TimeBasedRouter:
             initial_server = self.get_current_server()
             self._current_server = initial_server
             stats = ProxyStats.get_instance()
-            await stats.set_active_server(initial_server, get_server_addr(initial_server))
+            await stats.set_active_server(initial_server, get_server_addr(initial_server), self.algorithm)
             logger.info(f"[{self.algorithm}] Initial active server: {initial_server}")
         except RuntimeError as e:
             logger.error(f"[{self.algorithm}] Failed to determine initial server: {e}")
@@ -359,7 +359,7 @@ class TimeBasedRouter:
                     self._current_server = current_server
                     # Update stats with active server
                     stats = ProxyStats.get_instance()
-                    await stats.set_active_server(current_server, get_server_addr(current_server))
+                    await stats.set_active_server(current_server, get_server_addr(current_server), self.algorithm)
                     await self.notify_switch(current_server)
 
                 # Calculate sleep time until next switch

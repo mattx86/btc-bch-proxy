@@ -425,12 +425,13 @@ class StratumProxyServer:
                     end_str = "--:--"
 
                 configs.append(ServerConfigInfo(
-                    name=f"{server.name} ({algo})",
+                    name=server.name,
                     host=server.host,
                     port=server.port,
                     username=server.username,
                     schedule_start=start_str,
                     schedule_end=end_str,
+                    algorithm=algo,
                 ))
 
         stats = ProxyStats.get_instance()

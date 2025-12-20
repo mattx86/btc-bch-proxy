@@ -716,7 +716,7 @@ class MinerSession:
             except asyncio.TimeoutError:
                 # Long timeout without any data from miner - likely dead connection
                 timeout_mins = self.config.proxy.global_.miner_read_timeout // 60
-                logger.warning(f"[{self.session_id}] Miner connection timeout ({timeout_mins} min no data)")
+                logger.warning(f"{self._log_prefix} Miner connection timeout ({timeout_mins} min no data)")
                 break
             except asyncio.CancelledError:
                 break
@@ -897,9 +897,9 @@ class MinerSession:
         Args:
             msg: Parsed stratum message.
         """
-        logger.debug(f"[{self.session_id}] Handling miner message: {type(msg).__name__}")
+        logger.debug(f"{self._log_prefix} Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
-            logger.info(f"[{self.session_id}] Miner request: {msg.method}")
+            logger.info(f"{self._log_prefix} Miner request: {msg.method}")
             if msg.method == StratumMethods.MINING_CONFIGURE:
                 await self._handle_configure(msg)
             elif msg.method == StratumMethods.MINING_SUBSCRIBE:
@@ -923,7 +923,7 @@ class MinerSession:
                 await self._send_to_miner(
                     self._protocol.build_response(msg.id, True)
                 )
-                logger.debug(f"[{self.session_id}] Acknowledged mining.extranonce.subscribe")
+                logger.debug(f"{self._log_prefix} Acknowledged mining.extranonce.subscribe")
             else:
                 # Forward other requests to upstream
                 await self._forward_to_upstream(msg)
@@ -1013,6 +1013,11 @@ class MinerSession:
 
         logger.info(f"{self._log_prefix} Miner authorized")
 
+        # Record worker for stats tracking
+        if self.worker_name:
+            stats = ProxyStats.get_instance()
+            await stats.record_worker_authorized(self.session_id, self.worker_name)
+
         # Always accept authorization (we use our own credentials for upstream)
         await self._send_to_miner(
             self._protocol.build_response(msg.id, True)
@@ -1072,7 +1077,7 @@ class MinerSession:
                 jobs_sent += 1
 
         if jobs_sent > 0:
-            logger.info(f"[{self.session_id}] Sent {jobs_sent} queued job(s) to miner")
+            logger.info(f"{self._log_prefix} Sent {jobs_sent} queued job(s) to miner")
 
         # Clear the queue
         self._pending_notifications.clear()
@@ -1689,7 +1694,7 @@ class MinerSession:
             nonce = msg.params[4]
         except (TypeError, ValueError, IndexError) as e:
             error = [20, f"Failed to parse params: {type(e).__name__}: {e}", None]
-            logger.error(f"[{self.session_id}] {error[1]}")
+            logger.error(f"{self._log_prefix} {error[1]}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -1707,7 +1712,7 @@ class MinerSession:
         ]:
             if field_val is not None and not isinstance(field_val, (str, int)):
                 error = [20, f"Invalid type for {field_name}: expected string or int", None]
-                logger.warning(f"[{self.session_id}] {error[1]}")
+                logger.warning(f"{self._log_prefix} {error[1]}")
                 await self._send_to_miner(
                     self._protocol.build_response(msg.id, False, error),
                     priority=MessagePriority.HIGH,
@@ -1733,7 +1738,7 @@ class MinerSession:
         for field_name, field_value, max_len in hex_fields:
             if not _is_valid_hex(field_value, max_len):
                 error = [20, f"Invalid {field_name}: not valid hexadecimal", None]
-                logger.warning(f"[{self.session_id}] {error[1]}: {field_value!r}")
+                logger.warning(f"{self._log_prefix} {error[1]}: {field_value!r}")
                 await self._send_to_miner(
                     self._protocol.build_response(msg.id, False, error),
                     priority=MessagePriority.HIGH,
@@ -1837,7 +1842,7 @@ class MinerSession:
             elapsed = time.time() - start_time
             if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
                 logger.warning(
-                    f"[{self.session_id}] Share submit exceeded max time "
+                    f"{self._log_prefix} Share submit exceeded max time "
                     f"({SHARE_SUBMIT_MAX_TOTAL_TIME}s), giving up"
                 )
                 error = [20, "Share submit timeout", None]
@@ -1851,7 +1856,7 @@ class MinerSession:
             if not current_upstream or not current_upstream.connected:
                 if attempt < max_retries - 1:
                     logger.warning(
-                        f"[{self.session_id}] Upstream not connected, reconnecting before retry..."
+                        f"{self._log_prefix} Upstream not connected, reconnecting..."
                     )
                     await self._reconnect_upstream()
                     current_upstream = self._upstream  # Re-capture after reconnect
@@ -1902,7 +1907,7 @@ class MinerSession:
             if retryable and attempt < max_retries - 1:
                 retry_reason = _get_error_message(error)
                 logger.warning(
-                    f"[{self.session_id}] Share submit failed ({retry_reason}), "
+                    f"{self._log_prefix} Share submit failed ({retry_reason}), "
                     f"retrying ({attempt + 1}/{max_retries})..."
                 )
                 await asyncio.sleep(retry_delay)
@@ -1977,7 +1982,7 @@ class MinerSession:
         # Basic validation: need at least worker_name and job_id
         if len(msg.params) < 2:
             error = [20, "Invalid submit parameters: need at least worker and job_id", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {msg.params}")
+            logger.warning(f"{self._log_prefix} {error[1]}: {msg.params}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -1988,7 +1993,7 @@ class MinerSession:
         job_id = msg.params[1]
 
         logger.debug(
-            f"[{self.session_id}] Non-SHA256 share submit ({self.algorithm}): "
+            f"{self._log_prefix} Non-SHA256 share submit: "
             f"job={job_id}, params_count={len(msg.params)}"
         )
 
@@ -2019,15 +2024,11 @@ class MinerSession:
         # Record stats
         stats = ProxyStats.get_instance()
         if accepted:
-            logger.info(
-                f"[{self.session_id}] Share accepted ({self.algorithm}): job={job_id}"
-            )
+            logger.info(f"{self._log_prefix} Share accepted: job={job_id}")
             fire_and_forget(stats.record_share_accepted(self._current_server))
         else:
             reason = _get_error_message(error)
-            logger.warning(
-                f"[{self.session_id}] Share rejected ({self.algorithm}): {reason}"
-            )
+            logger.warning(f"{self._log_prefix} Share rejected: {reason}")
             fire_and_forget(stats.record_share_rejected(self._current_server, reason))
 
         await self._send_to_miner(
@@ -2053,7 +2054,7 @@ class MinerSession:
         # Validate params is a list/tuple
         if not isinstance(msg.params, (list, tuple)):
             error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
-            logger.error(f"[{self.session_id}] {error[1]}")
+            logger.error(f"{self._log_prefix} {error[1]}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2070,7 +2071,7 @@ class MinerSession:
         # We need to transform the miner's format to the pool's format.
         if len(msg.params) < 4:
             error = [20, "Invalid submit parameters: need job_id, counter, proof, and nonce", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {msg.params}")
+            logger.warning(f"{self._log_prefix} {error[1]}: {msg.params}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2081,7 +2082,7 @@ class MinerSession:
         for i, field_name in enumerate(["job_id", "counter", "proof", "nonce"]):
             if not isinstance(msg.params[i], (str, int)):
                 error = [20, f"Invalid type for {field_name}: expected string or int", None]
-                logger.warning(f"[{self.session_id}] {error[1]}")
+                logger.warning(f"{self._log_prefix} {error[1]}")
                 await self._send_to_miner(
                     self._protocol.build_response(msg.id, False, error),
                     priority=MessagePriority.HIGH,
@@ -2098,7 +2099,7 @@ class MinerSession:
         # counter: 16 hex chars, nonce: 8 hex chars
         if not _is_valid_hex(miner_counter, 16):
             error = [20, f"Invalid counter: not valid 16-char hex", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {miner_counter!r}")
+            logger.warning(f"{self._log_prefix} {error[1]}: {miner_counter!r}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2107,7 +2108,7 @@ class MinerSession:
 
         if not _is_valid_hex(miner_nonce, 8):
             error = [20, f"Invalid nonce: not valid 8-char hex", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {miner_nonce!r}")
+            logger.warning(f"{self._log_prefix} {error[1]}: {miner_nonce!r}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2117,7 +2118,7 @@ class MinerSession:
         # proof should be bech32-like (ALEO address format starting with "ab1")
         if not miner_proof.startswith("ab1") or len(miner_proof) < 10:
             error = [20, f"Invalid proof: expected ALEO address format", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {miner_proof[:20]!r}...")
+            logger.warning(f"{self._log_prefix} {error[1]}: {miner_proof[:20]!r}...")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2207,8 +2208,8 @@ class MinerSession:
         # This differs from Bitcoin stratum which prepends worker_name
         pool_params = list(msg.params)
 
-        logger.info(
-            f"{self._log_prefix} Submitting share: job={miner_job_id}, "
+        logger.debug(
+            f"{self._log_prefix} Share submit: job={miner_job_id}, "
             f"counter={miner_counter}, nonce={miner_nonce}"
         )
 
@@ -2224,7 +2225,7 @@ class MinerSession:
             elapsed = time.time() - start_time
             if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
                 logger.warning(
-                    f"[{self.session_id}] Share submit exceeded max time "
+                    f"{self._log_prefix} Share submit exceeded max time "
                     f"({SHARE_SUBMIT_MAX_TOTAL_TIME}s), giving up"
                 )
                 error = [20, "Share submit timeout", None]
@@ -2237,7 +2238,7 @@ class MinerSession:
             if not current_upstream or not current_upstream.connected:
                 if attempt < max_retries - 1:
                     logger.warning(
-                        f"[{self.session_id}] Upstream not connected, reconnecting..."
+                        f"{self._log_prefix} Upstream not connected, reconnecting..."
                     )
                     await self._reconnect_upstream()
                     current_upstream = self._upstream
@@ -2258,7 +2259,7 @@ class MinerSession:
             # This is critical for ALEO pools that send new jobs with share responses
             if bundled_notifications:
                 logger.info(
-                    f"[{self.session_id}] Processing {len(bundled_notifications)} "
+                    f"{self._log_prefix} Processing {len(bundled_notifications)} "
                     f"notifications bundled with share response"
                 )
                 for notification in bundled_notifications:
@@ -2275,7 +2276,7 @@ class MinerSession:
 
             if retryable and attempt < max_retries - 1:
                 logger.warning(
-                    f"[{self.session_id}] Share submit failed ({error_msg}), "
+                    f"{self._log_prefix} Share submit failed ({error_msg}), "
                     f"retrying ({attempt + 1}/{max_retries})..."
                 )
                 await asyncio.sleep(retry_delay)
@@ -2338,7 +2339,7 @@ class MinerSession:
         # Validate params is a list/tuple
         if not isinstance(msg.params, (list, tuple)):
             error = [20, f"Invalid params type: {type(msg.params).__name__}", None]
-            logger.error(f"[{self.session_id}] {error[1]}")
+            logger.error(f"{self._log_prefix} {error[1]}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2349,7 +2350,7 @@ class MinerSession:
         # Require at least worker_name, job_id, and nonce
         if len(msg.params) < 3:
             error = [20, "Invalid submit parameters: need worker, job_id, and nonce", None]
-            logger.warning(f"[{self.session_id}] {error[1]}: {msg.params}")
+            logger.warning(f"{self._log_prefix} {error[1]}: {msg.params}")
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, False, error),
                 priority=MessagePriority.HIGH,
@@ -2361,7 +2362,7 @@ class MinerSession:
         nonce = str(msg.params[2])
 
         logger.debug(
-            f"[{self.session_id}] RandomX share submit: job={job_id}, params_count={len(msg.params)}"
+            f"{self._log_prefix} Share submit: job={job_id}, params_count={len(msg.params)}"
         )
 
         # Check job source to determine which pool should receive this share
@@ -2437,7 +2438,7 @@ class MinerSession:
             elapsed = time.time() - start_time
             if elapsed > SHARE_SUBMIT_MAX_TOTAL_TIME:
                 logger.warning(
-                    f"[{self.session_id}] Share submit exceeded max time "
+                    f"{self._log_prefix} Share submit exceeded max time "
                     f"({SHARE_SUBMIT_MAX_TOTAL_TIME}s), giving up"
                 )
                 error = [20, "Share submit timeout", None]
@@ -2450,7 +2451,7 @@ class MinerSession:
             if not current_upstream or not current_upstream.connected:
                 if attempt < max_retries - 1:
                     logger.warning(
-                        f"[{self.session_id}] Upstream not connected, reconnecting before retry..."
+                        f"{self._log_prefix} Upstream not connected, reconnecting..."
                     )
                     await self._reconnect_upstream()
                     current_upstream = self._upstream
@@ -2497,7 +2498,7 @@ class MinerSession:
             if retryable and attempt < max_retries - 1:
                 retry_reason = _get_error_message(error)
                 logger.warning(
-                    f"[{self.session_id}] Share submit failed ({retry_reason}), "
+                    f"{self._log_prefix} Share submit failed ({retry_reason}), "
                     f"retrying ({attempt + 1}/{max_retries})..."
                 )
                 await asyncio.sleep(retry_delay)
@@ -2582,12 +2583,12 @@ class MinerSession:
                         # Still track job for validation
                         self._validator.add_job_from_notify(msg.params, self._current_server)
                         reason = "authorization" if not self.worker_name else "switch difficulty"
-                        logger.debug(f"[{self.session_id}] Job queued until {reason}")
+                        logger.debug(f"{self._log_prefix} Job queued until {reason}")
                     else:
                         data = StratumProtocol.encode_message(msg)
                         await self._send_to_miner(data)
                         self._validator.add_job_from_notify(msg.params, self._current_server)
-                        logger.debug(f"[{self.session_id}] Job notification forwarded")
+                        logger.debug(f"{self._log_prefix} Job notification forwarded")
                 elif msg.method == StratumMethods.MINING_SET_DIFFICULTY:
                     # Handle difficulty - queue until authorization so we can apply override
                     if msg.params and len(msg.params) > 0:
@@ -2617,7 +2618,7 @@ class MinerSession:
                                 # Miner is authorized - apply override if configured
                                 await self._send_difficulty_to_miner(pool_difficulty)
                         except (ValueError, TypeError):
-                            logger.warning(f"[{self.session_id}] Invalid difficulty value: {msg.params}")
+                            logger.warning(f"{self._log_prefix} Invalid difficulty value: {msg.params}")
                 else:
                     # MINING_SET_EXTRANONCE - forward as-is
                     data = StratumProtocol.encode_message(msg)

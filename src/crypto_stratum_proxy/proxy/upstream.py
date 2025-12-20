@@ -318,13 +318,10 @@ class UpstreamConnection:
                 from crypto_stratum_proxy.proxy.keepalive import enable_tcp_keepalive
                 enable_tcp_keepalive(self._writer, self.global_config, f"upstream:{self.name}")
 
-            # Record connection stats
+            # Record active connection in stats
             stats = ProxyStats.get_instance()
-            if self._has_connected_before:
-                fire_and_forget(stats.record_upstream_reconnect(self.name))
-            else:
-                fire_and_forget(stats.record_upstream_connect(self.name))
-                self._has_connected_before = True
+            fire_and_forget(stats.record_upstream_connect(self.name))
+            self._has_connected_before = True
 
             logger.info(f"Connected to upstream {self.name}")
             return True
@@ -365,6 +362,7 @@ class UpstreamConnection:
 
     async def disconnect(self) -> None:
         """Close the connection to the upstream server."""
+        was_connected = self._connected
         if self._writer:
             try:
                 self._writer.close()
@@ -418,6 +416,11 @@ class UpstreamConnection:
         # Clear pending shares tracking (under lock)
         async with self._pending_shares_lock:
             self._pending_shares.clear()
+
+        # Record disconnect in stats (only if we were previously connected)
+        if was_connected:
+            stats = ProxyStats.get_instance()
+            fire_and_forget(stats.record_upstream_disconnect(self.name))
 
         logger.info(f"Disconnected from upstream {self.name}")
 
