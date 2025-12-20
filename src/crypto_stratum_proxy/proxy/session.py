@@ -884,6 +884,12 @@ class MinerSession:
                     await self._handle_submit_generic(msg)
             elif msg.method == StratumMethods.MINING_SUGGEST_DIFFICULTY:
                 await self._handle_suggest_difficulty(msg)
+            elif msg.method == "mining.extranonce.subscribe":
+                # Acknowledge extranonce subscription - we support dynamic extranonce
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, True)
+                )
+                logger.debug(f"[{self.session_id}] Acknowledged mining.extranonce.subscribe")
             else:
                 # Forward other requests to upstream
                 await self._forward_to_upstream(msg)
@@ -2046,8 +2052,8 @@ class MinerSession:
                 f"[{self.session_id}] Routing zkSNARK share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            # Transform to pool format: [worker_name, job_id, nonce, proof]
-            grace_pool_params = [worker_name, miner_job_id, miner_nonce, miner_proof]
+            # Transform to pool format: [worker_name] + miner_params
+            grace_pool_params = [worker_name] + list(msg.params)
             accepted, error = await self._old_upstream.submit_share_raw(grace_pool_params)
             stats = ProxyStats.get_instance()
             if accepted:
@@ -2094,13 +2100,14 @@ class MinerSession:
             return
 
         # Transform miner format to pool format:
-        # Miner: [job_id, counter, proof, nonce]
-        # Pool:  [worker_name, job_id, nonce, proof]
-        pool_params = [worker_name, miner_job_id, miner_nonce, miner_proof]
+        # Miner sends: [job_id, counter, commitment, nonce]
+        # Pool expects: [worker_name, job_id, counter] (per ALEO stratum spec)
+        # But this pool might expect the full params, so try: [worker_name] + miner_params
+        pool_params = [worker_name] + list(msg.params)
 
         logger.info(
             f"[{self.session_id}] Submitting zkSNARK share: job_id={miner_job_id}, "
-            f"nonce={miner_nonce}"
+            f"pool_params={pool_params}"
         )
 
         # Submit to upstream with retry logic for transient failures
