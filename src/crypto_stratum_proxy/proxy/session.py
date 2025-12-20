@@ -2020,7 +2020,7 @@ class MinerSession:
         miner_nonce = str(msg.params[3])    # Nonce
 
         # Use the authorized worker name, not from params
-        worker_name = self._worker_name or "unknown"
+        worker_name = self.worker_name or "unknown"
 
         logger.debug(
             f"[{self.session_id}] zkSNARK share submit: pool_job={miner_job_id}, "
