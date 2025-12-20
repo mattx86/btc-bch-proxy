@@ -2045,11 +2045,52 @@ class MinerSession:
             )
             return
 
+        # Validate types before conversion (prevents injection via objects with __str__)
+        for i, field_name in enumerate(["job_id", "counter", "proof", "nonce"]):
+            if not isinstance(msg.params[i], (str, int)):
+                error = [20, f"Invalid type for {field_name}: expected string or int", None]
+                logger.warning(f"[{self.session_id}] {error[1]}")
+                await self._send_to_miner(
+                    self._protocol.build_response(msg.id, False, error),
+                    priority=MessagePriority.HIGH,
+                )
+                return
+
         # Parse miner's format
         miner_job_id = str(msg.params[0])  # Pool's job_id
-        miner_counter = str(msg.params[1])  # Extra nonce/counter (not used by pool)
-        miner_proof = str(msg.params[2])    # Proof/commitment
+        miner_counter = str(msg.params[1])  # Extra nonce/counter
+        miner_proof = str(msg.params[2])    # Proof/commitment (bech32-like)
         miner_nonce = str(msg.params[3])    # Nonce
+
+        # Validate field formats
+        # counter: 16 hex chars, nonce: 8 hex chars
+        if not _is_valid_hex(miner_counter, 16):
+            error = [20, f"Invalid counter: not valid 16-char hex", None]
+            logger.warning(f"[{self.session_id}] {error[1]}: {miner_counter!r}")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        if not _is_valid_hex(miner_nonce, 8):
+            error = [20, f"Invalid nonce: not valid 8-char hex", None]
+            logger.warning(f"[{self.session_id}] {error[1]}: {miner_nonce!r}")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
+
+        # proof should be bech32-like (ALEO address format starting with "ab1")
+        if not miner_proof.startswith("ab1") or len(miner_proof) < 10:
+            error = [20, f"Invalid proof: expected ALEO address format", None]
+            logger.warning(f"[{self.session_id}] {error[1]}: {miner_proof[:20]!r}...")
+            await self._send_to_miner(
+                self._protocol.build_response(msg.id, False, error),
+                priority=MessagePriority.HIGH,
+            )
+            return
 
         # Use the authorized worker name, not from params
         worker_name = self.worker_name or "unknown"
