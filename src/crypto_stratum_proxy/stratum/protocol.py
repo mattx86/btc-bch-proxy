@@ -124,11 +124,11 @@ class StratumProtocol:
         # DoS protection: limit result field size
         result = self._limit_result_size(result)
 
-        # Normalize params - can be list (standard stratum) or dict (Monero stratum)
+        # Normalize params - can be list (standard stratum) or dict (RandomX stratum)
         if not isinstance(params, list):
             if isinstance(params, dict):
                 # Check if dict has numeric keys (legacy format to convert to list)
-                # or named keys (Monero stratum - preserve as dict)
+                # or named keys (RandomX stratum - preserve as dict)
                 try:
                     # Try to parse all keys as integers
                     max_key = max(int(k) for k in params.keys()) + 1
@@ -159,7 +159,7 @@ class StratumProtocol:
                     else:
                         params = [params.get(str(i), params.get(i)) for i in range(max_key)]
                 except (ValueError, TypeError):
-                    # Keys aren't numeric - this is Monero stratum format
+                    # Keys aren't numeric - this is RandomX stratum format
                     # Preserve the dict as-is (e.g., {"login": ..., "pass": ..., "agent": ...})
                     pass  # Keep params as dict
             else:

@@ -494,10 +494,10 @@ class MinerSession:
             # Attempt full handshake: connect -> configure -> subscribe/login -> authorize
             connected = await new_upstream.connect()
             if connected:
-                # For RandomX/Monero, use login (combines subscribe+authorize)
+                # For RandomX, use login (combines subscribe+authorize)
                 if self.algorithm == "randomx":
-                    # Monero pools use login instead of subscribe+authorize
-                    success, initial_job = await new_upstream.login_monero(
+                    # RandomX pools use login instead of subscribe+authorize
+                    success, initial_job = await new_upstream.login_randomx(
                         worker_name=self.worker_name,
                     )
                     if success:
@@ -630,7 +630,7 @@ class MinerSession:
             elapsed = time.time() - start_time
             logger.info(f"{self._log_prefix} Connected to upstream (after {int(elapsed)}s)")
 
-            # Note: For RandomX/Monero, the initial job from login response is NOT sent here.
+            # Note: For RandomX, the initial job from login response is NOT sent here.
             # It will be sent when the miner subscribes (in _handle_subscribe), because
             # we can't send jobs until the miner has completed the subscription handshake.
 
@@ -924,9 +924,9 @@ class MinerSession:
         logger.debug(f"{self._log_prefix} Handling miner message: {type(msg).__name__}")
         if isinstance(msg, StratumRequest):
             logger.info(f"{self._log_prefix} Miner request: {msg.method}")
-            # Handle Monero 'login' for RandomX miners (XMRig uses this instead of subscribe)
+            # Handle RandomX 'login' for RandomX miners (XMRig uses this instead of subscribe)
             if msg.method == "login" and self.algorithm == "randomx":
-                await self._handle_monero_login(msg)
+                await self._handle_randomx_login(msg)
             elif msg.method == StratumMethods.MINING_CONFIGURE:
                 await self._handle_configure(msg)
             elif msg.method == StratumMethods.MINING_SUBSCRIBE:
@@ -934,8 +934,8 @@ class MinerSession:
             elif msg.method == StratumMethods.MINING_AUTHORIZE:
                 await self._handle_authorize(msg)
             elif msg.method == "submit" and self.algorithm == "randomx":
-                # Handle Monero 'submit' (XMRig uses this instead of mining.submit)
-                await self._handle_monero_submit(msg)
+                # Handle RandomX 'submit' (XMRig uses this instead of mining.submit)
+                await self._handle_randomx_submit(msg)
             elif msg.method == StratumMethods.MINING_SUBMIT:
                 if self.algorithm == "sha256":
                     await self._handle_submit_sha256(msg)
@@ -955,7 +955,7 @@ class MinerSession:
                 )
                 logger.debug(f"{self._log_prefix} Acknowledged mining.extranonce.subscribe")
             elif msg.method == "keepalived" and self.algorithm == "randomx":
-                # Monero keepalive - respond with status OK
+                # RandomX keepalive - respond with status OK
                 result = {"status": "OK"}
                 await self._send_to_miner(
                     self._protocol.build_response(msg.id, result)
@@ -1008,10 +1008,10 @@ class MinerSession:
             if self._upstream.extranonce2_size is not None:
                 self._validator.set_extranonce2_size(self._upstream.extranonce2_size)
 
-            # For RandomX/Monero, extranonce values aren't used - provide placeholders
-            # Monero pools use the 'login' method which doesn't return extranonce values
+            # For RandomX, extranonce values aren't used - provide placeholders
+            # RandomX pools use the 'login' method which doesn't return extranonce values
             if self.algorithm == "randomx":
-                # Monero miners don't use extranonce, but we need to respond
+                # RandomX miners don't use extranonce, but we need to respond
                 # with valid-looking values for protocol compatibility
                 extranonce1 = ""
                 extranonce2_size = 0
@@ -1036,13 +1036,13 @@ class MinerSession:
 
             # Forward any notifications received during upstream handshake
             # These must be sent AFTER the subscribe response
-            # For RandomX, also check for initial Monero job
+            # For RandomX, also check for initial job from login
             if self.algorithm == "randomx":
-                # Get initial job from Monero login if available
-                initial_job = self._upstream.get_monero_initial_job()
+                # Get initial job from RandomX login if available
+                initial_job = self._upstream.get_randomx_initial_job()
                 if initial_job:
-                    self._validator.add_job_from_monero(initial_job, self._current_server)
-                    await self._send_monero_job_to_miner(initial_job)
+                    self._validator.add_job_from_randomx(initial_job, self._current_server)
+                    await self._send_randomx_job_to_miner(initial_job)
             else:
                 pending = await self._upstream.get_pending_notifications()
                 if pending:
@@ -2036,7 +2036,7 @@ class MinerSession:
 
         Examples:
         - zkSNARK/ALEO: [worker_name, job_id, nonce, commitment, solution]
-        - RandomX/Monero: [worker_name, job_id, nonce, result]
+        - RandomX: [worker_name, job_id, nonce, result]
         """
         # Basic validation: need at least worker_name and job_id
         if len(msg.params) < 2:
@@ -2378,9 +2378,9 @@ class MinerSession:
 
     async def _handle_submit_randomx(self, msg: StratumRequest) -> None:
         """
-        Handle mining.submit for RandomX/Monero algorithm.
+        Handle mining.submit for RandomX algorithm.
 
-        Monero submit format: [worker_name, job_id, nonce, result]
+        RandomX submit format: [worker_name, job_id, nonce, result]
         - worker_name: Worker identifier
         - job_id: Job from mining.notify
         - nonce: Found nonce (hex, 8 chars / 4 bytes)
@@ -2405,8 +2405,8 @@ class MinerSession:
             )
             return
 
-        # Monero submit params: [worker_name, job_id, nonce, result]
-        # Require all 4 parameters for Monero pools
+        # RandomX submit params: [worker_name, job_id, nonce, result]
+        # Require all 4 parameters for RandomX pools
         if len(msg.params) < 4:
             error = [20, "Invalid submit parameters: need worker, job_id, nonce, and result", None]
             logger.warning(f"{self._log_prefix} {error[1]}: {msg.params}")
@@ -2440,8 +2440,8 @@ class MinerSession:
                 f"{self._log_prefix} Routing share to source pool "
                 f"({self._old_upstream_server_name}): job={job_id}"
             )
-            # Use Monero submit format for old pool as well
-            accepted, error, _ = await self._old_upstream.submit_share_monero(
+            # Use RandomX submit format for old pool as well
+            accepted, error, _ = await self._old_upstream.submit_share_randomx(
                 job_id, nonce, result_hash
             )
             # Note: We ignore notifications from old pool - they're not relevant for the new pool
@@ -2525,8 +2525,8 @@ class MinerSession:
                     error = [20, "Upstream not connected", None]
                     break
 
-            # Use Monero submit format: {id: session_id, job_id, nonce, result}
-            accepted, error, bundled_notifications = await current_upstream.submit_share_monero(
+            # Use RandomX submit format: {id: session_id, job_id, nonce, result}
+            accepted, error, bundled_notifications = await current_upstream.submit_share_randomx(
                 job_id, nonce, result_hash
             )
 
@@ -2600,9 +2600,9 @@ class MinerSession:
             priority=MessagePriority.HIGH,
         )
 
-    async def _handle_monero_login(self, msg: StratumRequest) -> None:
+    async def _handle_randomx_login(self, msg: StratumRequest) -> None:
         """
-        Handle Monero 'login' from miner (XMRig uses this instead of subscribe+authorize).
+        Handle RandomX 'login' from miner (XMRig uses this instead of subscribe+authorize).
 
         Login params is a dict with: login, pass, agent, algo, rigid
         We respond with: {id: session_id, job: {...}, status: "OK"}
@@ -2611,7 +2611,7 @@ class MinerSession:
             msg: The login request from miner.
         """
         logger.debug(
-            f"{self._log_prefix} Monero login params type={type(msg.params).__name__}, "
+            f"{self._log_prefix} RandomX login params type={type(msg.params).__name__}, "
             f"value={str(msg.params)[:200]}"
         )
 
@@ -2650,7 +2650,7 @@ class MinerSession:
         # Update validator's log prefix with full context
         self._validator.set_log_prefix(self._log_prefix)
 
-        logger.info(f"{self._log_prefix} Miner logged in (Monero protocol)")
+        logger.info(f"{self._log_prefix} Miner logged in (RandomX protocol)")
 
         # Record worker for stats tracking
         if self.worker_name:
@@ -2664,13 +2664,13 @@ class MinerSession:
         # Get initial job from upstream
         initial_job = None
         if self._upstream:
-            initial_job = self._upstream.get_monero_initial_job()
+            initial_job = self._upstream.get_randomx_initial_job()
             if initial_job:
-                self._validator.add_job_from_monero(initial_job, self._current_server)
+                self._validator.add_job_from_randomx(initial_job, self._current_server)
 
-        # Build Monero login response
-        # Use the upstream's Monero session ID for the response
-        session_id = self._upstream.monero_session_id if self._upstream else self.session_id
+        # Build RandomX login response
+        # Use the upstream's RandomX session ID for the response
+        session_id = self._upstream.randomx_session_id if self._upstream else self.session_id
 
         result = {
             "id": session_id,
@@ -2686,9 +2686,9 @@ class MinerSession:
 
         logger.debug(f"{self._log_prefix} Sent login response with job")
 
-    async def _handle_monero_submit(self, msg: StratumRequest) -> None:
+    async def _handle_randomx_submit(self, msg: StratumRequest) -> None:
         """
-        Handle Monero 'submit' from miner (XMRig uses this instead of mining.submit).
+        Handle RandomX 'submit' from miner (XMRig uses this instead of mining.submit).
 
         Submit params is a dict with: id, job_id, nonce, result
         We respond with: {status: "OK"} on success or error
@@ -2729,7 +2729,7 @@ class MinerSession:
             )
             return
 
-        logger.debug(f"{self._log_prefix} Monero submit: job={job_id}, nonce={nonce}")
+        logger.debug(f"{self._log_prefix} RandomX submit: job={job_id}, nonce={nonce}")
 
         # Record share for rate monitoring
         self._record_share_for_rate_monitoring()
@@ -2758,7 +2758,7 @@ class MinerSession:
             )
             return
 
-        accepted, upstream_error, bundled_notifications = await current_upstream.submit_share_monero(
+        accepted, upstream_error, bundled_notifications = await current_upstream.submit_share_randomx(
             job_id, nonce, result_hash
         )
 
@@ -2775,7 +2775,7 @@ class MinerSession:
             self._validator.record_accepted_randomx_share(job_id, nonce)
             self._update_adaptive_buffer(increase=False)
 
-            # Respond with Monero success format
+            # Respond with RandomX success format
             result = {"status": "OK"}
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, result),
@@ -2791,18 +2791,18 @@ class MinerSession:
             if reason and "duplicate" in reason.lower():
                 self._validator.record_accepted_randomx_share(job_id, nonce)
 
-            # Respond with Monero error format
+            # Respond with RandomX error format
             error = {"code": -1, "message": reason}
             await self._send_to_miner(
                 self._protocol.build_response(msg.id, None, error),
                 priority=MessagePriority.HIGH,
             )
 
-    async def _handle_monero_job_notification(self, msg: StratumNotification) -> None:
+    async def _handle_randomx_job_notification(self, msg: StratumNotification) -> None:
         """
-        Handle a Monero 'job' notification from the pool.
+        Handle a RandomX 'job' notification from the pool.
 
-        Monero pools send job notifications with a different format than standard stratum.
+        RandomX pools send job notifications with a different format than standard stratum.
         The job data is in msg.params as a dict with: blob, job_id, target, seed_hash, algo, etc.
 
         Args:
@@ -2817,7 +2817,7 @@ class MinerSession:
             logger.warning(f"{self._log_prefix} Empty job notification")
             return
 
-        # Monero job params can be a dict (common) or occasionally a list
+        # RandomX job params can be a dict (common) or occasionally a list
         job_data = msg.params
         if isinstance(msg.params, list) and len(msg.params) > 0:
             # Some pools send job as first element of list
@@ -2833,28 +2833,28 @@ class MinerSession:
             return
 
         logger.debug(
-            f"{self._log_prefix} Monero job: id={job_id}, algo={job_data.get('algo', 'rx/0')}"
+            f"{self._log_prefix} RandomX job: id={job_id}, algo={job_data.get('algo', 'rx/0')}"
         )
 
         # Add job to validator for tracking
-        self._validator.add_job_from_monero(job_data, self._current_server)
+        self._validator.add_job_from_randomx(job_data, self._current_server)
 
         # Forward job to miner
-        await self._send_monero_job_to_miner(job_data)
+        await self._send_randomx_job_to_miner(job_data)
 
-    async def _send_monero_job_to_miner(self, job_data: dict) -> None:
+    async def _send_randomx_job_to_miner(self, job_data: dict) -> None:
         """
-        Send a Monero job to the miner in Monero 'job' notification format.
+        Send a RandomX job to the miner in RandomX 'job' notification format.
 
-        XMRig and other Monero miners expect 'job' notifications with dict params,
+        XMRig and other RandomX miners expect 'job' notifications with dict params,
         not standard stratum 'mining.notify' with list params.
 
         Args:
-            job_data: Monero job dict from pool (passed through as-is).
+            job_data: RandomX job dict from pool (passed through as-is).
         """
         job_id = job_data.get("job_id", "")
 
-        # Send job notification in Monero format (method="job", params=dict)
+        # Send job notification in RandomX format (method="job", params=dict)
         notification = StratumNotification(
             method="job",
             params=job_data,  # Pass the job dict directly
@@ -2886,9 +2886,9 @@ class MinerSession:
             msg: Parsed stratum message.
         """
         if isinstance(msg, StratumNotification):
-            # Handle Monero 'job' notifications for RandomX
+            # Handle RandomX 'job' notifications for RandomX
             if msg.method == "job" and self.algorithm == "randomx":
-                await self._handle_monero_job_notification(msg)
+                await self._handle_randomx_job_notification(msg)
                 return
 
             # Forward standard stratum notifications to miner

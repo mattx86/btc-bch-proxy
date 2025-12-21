@@ -39,7 +39,7 @@ class JobInfo:
     block_header_root: Optional[str] = None
     hashed_beacons_root: Optional[str] = None
 
-    # RandomX/Monero specific fields (optional)
+    # RandomX specific fields (optional)
     blob: Optional[str] = None  # Block template blob (hex)
     target_hex: Optional[str] = None  # Mining target (hex string)
     seed_hash: Optional[str] = None  # RandomX seed hash
@@ -75,7 +75,7 @@ class SimpleShareKey:
     """
     Unique identifier for a simple share submission (job_id + nonce).
 
-    Used by zkSNARK/ALEO and RandomX/Monero algorithms which only use
+    Used by zkSNARK/ALEO and RandomX algorithms which only use
     job_id and nonce to identify a share (unlike SHA-256 which also
     includes extranonce2, ntime, and version_bits).
     """
@@ -399,9 +399,9 @@ class ShareValidator:
 
     def _add_randomx_job(self, params: list, source_server: Optional[str] = None) -> None:
         """
-        Parse RandomX (Monero-style) mining.notify params.
+        Parse RandomX mining.notify params.
 
-        Monero stratum format varies by pool but commonly:
+        RandomX stratum format varies by pool but commonly:
         - [job_id, blob, target] - minimal format
         - [job_id, blob, target, height] - with height
         - [job_id, blob, target, height, seed_hash] - with RandomX seed
@@ -448,11 +448,11 @@ class ShareValidator:
         except (ValueError, TypeError) as e:
             logger.warning(f"[{self.session_id}] Error parsing RandomX job params: {e}")
 
-    def add_job_from_monero(self, job_data: dict, source_server: Optional[str] = None) -> None:
+    def add_job_from_randomx(self, job_data: dict, source_server: Optional[str] = None) -> None:
         """
-        Parse and add a job from Monero pool 'job' notification.
+        Parse and add a job from RandomX pool 'job' notification.
 
-        Monero job format is a dict with:
+        RandomX job format is a dict with:
         - job_id: Job identifier
         - blob: Block template blob (hex)
         - target: Mining target (hex string)
@@ -461,17 +461,17 @@ class ShareValidator:
         - algo: Algorithm identifier (optional, e.g., "rx/0")
 
         Args:
-            job_data: Dict containing Monero job fields.
+            job_data: Dict containing RandomX job fields.
             source_server: Optional server name that issued this job.
         """
         if not isinstance(job_data, dict):
-            logger.warning(f"[{self.session_id}] Invalid Monero job data type: {type(job_data)}")
+            logger.warning(f"[{self.session_id}] Invalid RandomX job data type: {type(job_data)}")
             return
 
         try:
             job_id = str(job_data.get("job_id", ""))
             if not job_id:
-                logger.warning(f"[{self.session_id}] Monero job missing job_id")
+                logger.warning(f"[{self.session_id}] RandomX job missing job_id")
                 return
 
             blob = str(job_data.get("blob", ""))
@@ -502,11 +502,11 @@ class ShareValidator:
             self.add_job(job_info, source_server)
 
             logger.debug(
-                f"[{self.session_id}] Added Monero job: id={job_id}, "
+                f"[{self.session_id}] Added RandomX job: id={job_id}, "
                 f"algo={job_data.get('algo', 'rx/0')}, clean={clean_jobs}"
             )
         except Exception as e:
-            logger.warning(f"[{self.session_id}] Error parsing Monero job: {e}")
+            logger.warning(f"[{self.session_id}] Error parsing RandomX job: {e}")
 
     def _add_generic_job(self, params: list, source_server: Optional[str] = None) -> None:
         """
@@ -807,7 +807,7 @@ class ShareValidator:
         nonce: str,
     ) -> tuple[bool, Optional[str]]:
         """
-        Validate a RandomX/Monero share before submission.
+        Validate a RandomX share before submission.
 
         Args:
             job_id: Job ID.
@@ -843,7 +843,7 @@ class ShareValidator:
         nonce: str,
     ) -> None:
         """
-        Record a RandomX/Monero share that was accepted by the upstream pool.
+        Record a RandomX share that was accepted by the upstream pool.
 
         Args:
             job_id: Job ID.

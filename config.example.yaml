@@ -67,7 +67,7 @@ proxy:
     bind_host: "0.0.0.0"
     bind_port: 3333
 
-  # RandomX proxy (Monero)
+  # RandomX proxy (Monero, Minotari/XTM, Wownero, etc.)
   randomx:
     enabled: false
     bind_host: "0.0.0.0"
@@ -112,7 +112,7 @@ servers:
       start: "12:00"
       end: "24:00"
 
-  # RandomX servers (Monero) - enable proxy.randomx to use
+  # RandomX servers (Monero, Minotari/XTM, Wownero, etc.) - enable proxy.randomx to use
   # randomx:
   #   # xmr1 for morning/night hours (00:00 to 11:59)
   #   - name: "xmr1"

@@ -113,10 +113,10 @@ class UpstreamConnection:
         self.version_rolling_supported: bool = False
         self.version_rolling_mask: Optional[str] = None
 
-        # Monero stratum session ID (returned by login, used for submits)
-        self.monero_session_id: Optional[str] = None
-        # First job received with Monero login response
-        self._monero_initial_job: Optional[dict] = None
+        # RandomX stratum session ID (returned by login, used for submits)
+        self.randomx_session_id: Optional[str] = None
+        # First job received with RandomX login response
+        self._randomx_initial_job: Optional[dict] = None
 
         # Request tracking
         self._request_id = 0
@@ -679,16 +679,16 @@ class UpstreamConnection:
             logger.error(f"Authorize error for {self.name}: {e}")
             return False
 
-    async def login_monero(
+    async def login_randomx(
         self,
         worker_name: Optional[str] = None,
         user_agent: Optional[str] = None,
         algorithms: Optional[list[str]] = None,
     ) -> tuple[bool, Optional[dict]]:
         """
-        Send Monero stratum login to the pool (replaces subscribe+authorize).
+        Send RandomX stratum login to the pool (replaces subscribe+authorize).
 
-        Monero pools use a single 'login' method that combines authentication
+        RandomX pools use a single 'login' method that combines authentication
         and subscription, returning the first job in the response.
 
         Args:
@@ -738,64 +738,64 @@ class UpstreamConnection:
             response = await self._send_request(req_id, "login", params)
 
             if response.is_error:
-                logger.error(f"Monero login failed for {self.name}: {response.error}")
+                logger.error(f"RandomX login failed for {self.name}: {response.error}")
                 return False, None
 
             # Parse login response
             # Format: {"id": "session_id", "job": {...}, "status": "OK"}
             result = response.result
             if not isinstance(result, dict):
-                logger.error(f"Invalid Monero login response from {self.name}: {result}")
+                logger.error(f"Invalid RandomX login response from {self.name}: {result}")
                 return False, None
 
             # Extract session ID
             session_id = result.get("id")
             if not session_id:
-                logger.error(f"Monero login missing session ID from {self.name}")
+                logger.error(f"RandomX login missing session ID from {self.name}")
                 return False, None
 
-            self.monero_session_id = str(session_id)
+            self.randomx_session_id = str(session_id)
 
             # Extract first job
             job = result.get("job")
             if job and isinstance(job, dict):
-                self._monero_initial_job = job
+                self._randomx_initial_job = job
                 logger.info(
-                    f"{prefix}Monero login to {self.name}: session={self.monero_session_id}, "
+                    f"{prefix}RandomX login to {self.name}: session={self.randomx_session_id}, "
                     f"job_id={job.get('job_id')}, algo={job.get('algo', 'rx/0')}"
                 )
             else:
                 logger.info(
-                    f"{prefix}Monero login to {self.name}: session={self.monero_session_id} (no initial job)"
+                    f"{prefix}RandomX login to {self.name}: session={self.randomx_session_id} (no initial job)"
                 )
 
-            # Mark as subscribed and authorized (Monero login does both)
+            # Mark as subscribed and authorized (RandomX login does both)
             self._subscribed = True
             self._authorized = True
 
             return True, job
 
         except asyncio.TimeoutError:
-            logger.error(f"Monero login timeout for {self.name}")
+            logger.error(f"RandomX login timeout for {self.name}")
             return False, None
         except Exception as e:
-            logger.error(f"Monero login error for {self.name}: {e}")
+            logger.error(f"RandomX login error for {self.name}: {e}")
             return False, None
 
-    def get_monero_initial_job(self) -> Optional[dict]:
-        """Get and clear the initial job received with Monero login."""
-        job = self._monero_initial_job
-        self._monero_initial_job = None
+    def get_randomx_initial_job(self) -> Optional[dict]:
+        """Get and clear the initial job received with RandomX login."""
+        job = self._randomx_initial_job
+        self._randomx_initial_job = None
         return job
 
-    async def submit_share_monero(
+    async def submit_share_randomx(
         self,
         job_id: str,
         nonce: str,
         result_hash: str,
     ) -> tuple[bool, Optional[list], list]:
         """
-        Submit a share using Monero stratum format.
+        Submit a share using RandomX stratum format.
 
         Args:
             job_id: Job ID from the job notification.
@@ -808,12 +808,12 @@ class UpstreamConnection:
         if not self._connected or not self._authorized:
             return False, [20, "Not connected or authorized", None], []
 
-        if not self.monero_session_id:
-            return False, [20, "No Monero session ID", None], []
+        if not self.randomx_session_id:
+            return False, [20, "No RandomX session ID", None], []
 
         req_id = await self._next_id()
         params = {
-            "id": self.monero_session_id,
+            "id": self.randomx_session_id,
             "job_id": job_id,
             "nonce": nonce,
             "result": result_hash,
@@ -831,7 +831,7 @@ class UpstreamConnection:
             if response.is_error:
                 return False, response.error, notifications
 
-            # Monero pools return {"status": "OK"} on success
+            # RandomX pools return {"status": "OK"} on success
             result = response.result
             if isinstance(result, dict):
                 status = result.get("status", "").upper()
@@ -846,10 +846,10 @@ class UpstreamConnection:
                 return False, [20, f"Unexpected result: {result}", None], notifications
 
         except asyncio.TimeoutError:
-            logger.warning(f"Monero share submit timeout for {self.name}")
+            logger.warning(f"RandomX share submit timeout for {self.name}")
             return False, [20, "Timeout", None], []
         except Exception as e:
-            logger.error(f"Monero share submit error for {self.name}: {e}")
+            logger.error(f"RandomX share submit error for {self.name}: {e}")
             return False, [20, str(e), None], []
         finally:
             async with self._pending_shares_lock:
