@@ -317,7 +317,12 @@ class MinerSession:
         # Relay tasks (initialized here, populated in run())
         self._relay_tasks: list[asyncio.Task] = []
 
-        logger.info(f"[{self.session_id}] New miner session from {self.client_addr}")
+        # Get initial server for logging (router determines which server based on schedule)
+        initial_server = self.router.get_current_server()
+        logger.info(
+            f"[{self.session_id}] [{self.algorithm}] [{initial_server}] "
+            f"New miner session from {self.client_addr}"
+        )
 
     @property
     def is_active(self) -> bool:
@@ -490,6 +495,16 @@ class MinerSession:
             new_upstream = UpstreamConnection(
                 server_config, self.config.proxy.global_, self.session_id
             )
+
+            # Set log prefix early so handshake logs include full context
+            # Build prefix with target server (not _current_server which is old/None)
+            prefix_parts = [f"[{self.session_id}]"]
+            if self.algorithm:
+                prefix_parts.append(f"[{self.algorithm}]")
+            prefix_parts.append(f"[{server_name}]")
+            if self.worker_name:
+                prefix_parts.append(f"[{self.worker_name}]")
+            new_upstream.set_log_prefix(" ".join(prefix_parts))
 
             # Attempt full handshake: connect -> configure -> subscribe/login -> authorize
             connected = await new_upstream.connect()
@@ -981,13 +996,13 @@ class MinerSession:
                     result["version-rolling"] = True
                     result["version-rolling.mask"] = self._upstream.version_rolling_mask
                     logger.info(
-                        f"[{self.session_id}] Version-rolling enabled with mask "
+                        f"{self._log_prefix} Version-rolling enabled with mask "
                         f"{self._upstream.version_rolling_mask} (from pool)"
                     )
                 else:
                     # Pool doesn't support version-rolling
                     logger.info(
-                        f"[{self.session_id}] Version-rolling requested but pool doesn't support it"
+                        f"{self._log_prefix} Version-rolling requested but pool doesn't support it"
                     )
 
         await self._send_to_miner(
